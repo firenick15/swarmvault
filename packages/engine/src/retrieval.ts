@@ -14,7 +14,13 @@ export function resolveRetrievalConfig(config: VaultConfig): RetrievalConfig {
     hybrid: config.retrieval?.hybrid ?? config.search?.hybrid ?? true,
     rerank: config.retrieval?.rerank ?? config.search?.rerank ?? false,
     embeddingProvider: config.retrieval?.embeddingProvider ?? config.tasks.embeddingProvider,
-    maxIndexedRows: config.retrieval?.maxIndexedRows
+    maxIndexedRows: config.retrieval?.maxIndexedRows,
+    chunking: {
+      enabled: config.retrieval?.chunking?.enabled ?? true,
+      maxChars: config.retrieval?.chunking?.maxChars ?? 1600,
+      overlapChars: config.retrieval?.chunking?.overlapChars ?? 160
+    },
+    debug: config.retrieval?.debug ?? false
   };
 }
 
@@ -53,13 +59,13 @@ export async function writeRetrievalManifest(rootDir: string, graph: GraphArtifa
 }
 
 export async function rebuildRetrievalIndex(rootDir: string): Promise<RetrievalStatus> {
-  const { paths } = await loadVaultConfig(rootDir);
+  const { config, paths } = await loadVaultConfig(rootDir);
   const graph = await readJsonFile<GraphArtifact>(paths.graphPath);
   if (!graph) {
     throw new Error("Graph artifact not found. Run `swarmvault compile` before rebuilding retrieval.");
   }
   await applyStandardRelationOverrides(paths.wikiDir, graph.pages);
-  await rebuildSearchIndex(paths.searchDbPath, graph.pages, paths.wikiDir);
+  await rebuildSearchIndex(paths.searchDbPath, graph.pages, paths.wikiDir, { chunking: config.retrieval?.chunking });
   await writeRetrievalManifest(rootDir, graph);
   return getRetrievalStatus(rootDir);
 }

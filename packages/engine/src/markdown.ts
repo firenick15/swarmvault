@@ -28,7 +28,7 @@ import type {
   SourceManifest,
   VaultConfig
 } from "./types.js";
-import { normalizeWhitespace, slugify, uniqueBy } from "./utils.js";
+import { normalizeWhitespace, slugify, slugifyKnowledgeLabel, uniqueBy } from "./utils.js";
 
 export interface ManagedPageMetadata {
   status: PageStatus;
@@ -313,8 +313,8 @@ export function buildSourcePage(
     ...moduleNodeIds
   ];
   const backlinks = [
-    ...analysis.concepts.map((item) => `concept:${slugify(item.name)}`),
-    ...analysis.entities.map((item) => `entity:${slugify(item.name)}`),
+    ...analysis.concepts.map((item) => `concept:${slugifyKnowledgeLabel(item.name)}`),
+    ...analysis.entities.map((item) => `entity:${slugifyKnowledgeLabel(item.name)}`),
     ...(modulePage ? [modulePage.id] : []),
     ...relatedOutputs.map((page) => page.id)
   ];
@@ -421,7 +421,8 @@ export function buildSourcePage(
       "",
       ...(analysis.concepts.length
         ? analysis.concepts.map(
-            (item) => `- [[${pagePathFor("concept", slugify(item.name)).replace(/\.md$/, "")}|${item.name}]]: ${item.description}`
+            (item) =>
+              `- [[${pagePathFor("concept", slugifyKnowledgeLabel(item.name)).replace(/\.md$/, "")}|${item.name}]]: ${item.description}`
           )
         : ["- None detected."]),
       "",
@@ -429,7 +430,8 @@ export function buildSourcePage(
       "",
       ...(analysis.entities.length
         ? analysis.entities.map(
-            (item) => `- [[${pagePathFor("entity", slugify(item.name)).replace(/\.md$/, "")}|${item.name}]]: ${item.description}`
+            (item) =>
+              `- [[${pagePathFor("entity", slugifyKnowledgeLabel(item.name)).replace(/\.md$/, "")}|${item.name}]]: ${item.description}`
           )
         : ["- None detected."]),
       "",
@@ -675,7 +677,7 @@ export function buildAggregatePage(
   decorations?: GeneratedPageDecorations,
   existingContent?: string | null
 ): { page: GraphPage; content: string } {
-  const slug = slugify(name);
+  const slug = slugifyKnowledgeLabel(name);
   const pageId = `${kind}:${slug}`;
   const sourceIds = sourceAnalyses.map((item) => item.sourceId);
   const otherPages = [...sourceAnalyses.map((item) => `source:${item.sourceId}`), ...relatedOutputs.map((page) => page.id)];

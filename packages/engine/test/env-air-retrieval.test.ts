@@ -65,8 +65,99 @@ describe("environment air retrieval", () => {
     expect(tokens).toContain("环境空气");
     expect(tokens).toContain("pm2.5");
 
-    const refs = extractStandardReferences("参照 HJ/T 193-2005 和 DB11/T 1234-2024");
-    expect(refs.map((ref) => ref.normalized)).toEqual(["HJ/T 193-2005", "DB11/T 1234-2024"]);
+    const refs = extractStandardReferences("参照 HJ/T 193-2005、HJ 633—2012 和 DB11/T 1234-2024");
+    expect(refs.map((ref) => ref.normalized)).toEqual(["HJ/T 193-2005", "HJ 633-2012", "DB11/T 1234-2024"]);
+  });
+
+  it("keeps explicit historical standard references ahead of current replacements", async () => {
+    const { wikiDir, dbPath } = await createTempWorkspace();
+    const oldPage = graphPage("source:hj633", "HJ 633-2012 环境空气质量指数技术规定", "sources/hj633.md");
+    const newPage = graphPage("source:hj664", "HJ 664-2013 环境空气质量监测点位布设技术规范", "sources/hj664.md");
+    await writePage(
+      wikiDir,
+      oldPage.path,
+      {
+        authority_layer: "core",
+        legal_status: "superseded",
+        document_role: "technical_regulation",
+        standard_code: "HJ 633-2012"
+      },
+      "# HJ 633-2012\n\n环境空气质量指数 AQI 日报和实时报技术规定，后续存在替代和演化关系。"
+    );
+    await writePage(
+      wikiDir,
+      newPage.path,
+      {
+        authority_layer: "core",
+        legal_status: "current_effective",
+        document_role: "technical_regulation",
+        standard_code: "HJ 664-2013"
+      },
+      "# HJ 664-2013\n\n现行环境空气质量监测点位布设技术规范。"
+    );
+    await rebuildSearchIndex(dbPath, [oldPage, newPage], wikiDir);
+
+    const results = searchPages(dbPath, "HJ 633—2012 是否现行有效？", {
+      limit: 5,
+      authorityLayer: ["core", "evolution", "method"],
+      includeSuperseded: true
+    });
+
+    expect(results[0]?.pageId).toBe("source:hj633");
+    expect(results[0]?.retrievalStage).toBe("standard_exact");
+  });
+
+  it("expands pollutant-limit questions to the ambient air quality standard and returns chunk evidence", async () => {
+    const { wikiDir, dbPath } = await createTempWorkspace();
+    const standardPage = graphPage("source:gb3095", "GB 3095-2012 环境空气质量标准", "sources/gb3095.md");
+    const methodPage = graphPage("source:hj194", "HJ 194 环境空气质量手工监测技术规范", "sources/hj194.md");
+    await writePage(
+      wikiDir,
+      standardPage.path,
+      {
+        authority_layer: "core",
+        legal_status: "current_effective",
+        document_role: "standard",
+        standard_code: "GB 3095-2012",
+        pollutants: ["PM2.5", "PM10", "O3"]
+      },
+      [
+        "# GB 3095-2012",
+        "",
+        "环境空气功能区分为一类区和二类区。",
+        "",
+        "## 表 1 环境空气污染物基本项目浓度限值",
+        "",
+        "| 污染物 | 平均时间 | 一级浓度限值 | 二级浓度限值 |",
+        "|---|---|---:|---:|",
+        "| PM2.5 | 年平均 | 15 | 35 |",
+        "| PM2.5 | 24小时平均 | 35 | 75 |"
+      ].join("\n")
+    );
+    await writePage(
+      wikiDir,
+      methodPage.path,
+      {
+        authority_layer: "method",
+        legal_status: "current_effective",
+        document_role: "monitoring_method",
+        standard_code: "HJ 194-2017",
+        pollutants: ["PM2.5"]
+      },
+      "# HJ 194\n\n手工监测采样和质量保证要求。"
+    );
+    await rebuildSearchIndex(dbPath, [standardPage, methodPage], wikiDir);
+
+    const results = searchPages(dbPath, "PM2.5 年平均一级和二级限值是多少？", {
+      limit: 5,
+      authorityLayer: ["core", "method"],
+      includeDrafts: false,
+      includeSuperseded: false
+    });
+
+    expect(results[0]?.pageId).toBe("source:gb3095");
+    expect(results[0]?.chunkId).toBeTruthy();
+    expect(results[0]?.chunkKind).toBe("table");
   });
 
   it("retrieves Chinese monitoring-method questions without malformed FTS failures", async () => {

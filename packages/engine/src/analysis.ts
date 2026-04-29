@@ -24,7 +24,16 @@ import type {
   SourceManifest,
   SourceRationale
 } from "./types.js";
-import { firstSentences, normalizeWhitespace, readJsonFile, sha256, slugify, truncate, uniqueBy, writeJsonFile } from "./utils.js";
+import {
+  firstSentences,
+  normalizeWhitespace,
+  readJsonFile,
+  sha256,
+  slugifyKnowledgeLabel,
+  truncate,
+  uniqueBy,
+  writeJsonFile
+} from "./utils.js";
 
 const ANALYSIS_FORMAT_VERSION = 9;
 
@@ -444,12 +453,12 @@ function heuristicAnalysis(manifest: SourceManifest, text: string, schemaHash: s
   const analysisText = normalizeEnvAirText(textForHeuristicAnalysis(manifest, text));
   const normalized = normalizeWhitespace(analysisText);
   const concepts = filterDomainTermCandidates(extractTopTerms(normalized, 10), 6).map((term) => ({
-    id: `concept:${slugify(term)}`,
+    id: `concept:${slugifyKnowledgeLabel(term)}`,
     name: term,
     description: `Frequently referenced concept in ${manifest.title}.`
   }));
   const entities = filterDomainTermCandidates(extractEntities(analysisText, 10), 6).map((term) => ({
-    id: `entity:${slugify(term)}`,
+    id: `entity:${slugifyKnowledgeLabel(term)}`,
     name: term,
     description: `Named entity mentioned in ${manifest.title}.`
   }));
@@ -559,12 +568,12 @@ async function providerAnalysis(
     title: parsed.title,
     summary: parsed.summary,
     concepts: normalizedConcepts.map((name) => ({
-      id: `concept:${slugify(name)}`,
+      id: `concept:${slugifyKnowledgeLabel(name)}`,
       name,
       description: parsed.concepts.find((item) => item.name === name)?.description ?? ""
     })),
     entities: normalizedEntities.map((name) => ({
-      id: `entity:${slugify(name)}`,
+      id: `entity:${slugifyKnowledgeLabel(name)}`,
       name,
       description: parsed.entities.find((item) => item.name === name)?.description ?? ""
     })),
@@ -607,12 +616,12 @@ function analysisFromVisionExtraction(
     title: extraction.vision.title?.trim() || manifest.title,
     summary: extraction.vision.summary,
     concepts: extraction.vision.concepts.map((term) => ({
-      id: `concept:${slugify(term.name)}`,
+      id: `concept:${slugifyKnowledgeLabel(term.name)}`,
       name: term.name,
       description: term.description
     })),
     entities: extraction.vision.entities.map((term) => ({
-      id: `entity:${slugify(term.name)}`,
+      id: `entity:${slugifyKnowledgeLabel(term.name)}`,
       name: term.name,
       description: term.description
     })),

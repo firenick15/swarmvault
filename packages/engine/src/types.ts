@@ -405,6 +405,12 @@ export interface VaultConfig {
     rerank?: boolean;
     embeddingProvider?: string;
     maxIndexedRows?: number;
+    chunking?: {
+      enabled?: boolean;
+      maxChars?: number;
+      overlapChars?: number;
+    };
+    debug?: boolean;
   };
   analysis?: {
     failurePolicy?: "fail" | "warn";
@@ -1526,6 +1532,13 @@ export interface SearchResult {
   region?: string;
   standardCode?: string;
   pollutants?: string[];
+  chunkId?: string;
+  chunkOrdinal?: number;
+  chunkHeading?: string;
+  chunkKind?: "paragraph" | "table" | "formula" | "heading";
+  chunkLocation?: string;
+  retrievalStage?: "standard_exact" | "fts" | "chunk_fts" | "like" | "semantic" | "rerank";
+  rankingSignals?: string[];
 }
 
 export interface RetrievalConfig {
@@ -1535,6 +1548,12 @@ export interface RetrievalConfig {
   rerank: boolean;
   embeddingProvider?: string;
   maxIndexedRows?: number;
+  chunking: {
+    enabled: boolean;
+    maxChars: number;
+    overlapChars: number;
+  };
+  debug: boolean;
 }
 
 export interface RetrievalManifest {
@@ -1601,6 +1620,10 @@ export interface RetrievalDebugEvidenceItem {
   citation: string;
   pageId?: string;
   sourceId?: string;
+  chunkId?: string;
+  chunkHeading?: string;
+  chunkKind?: "paragraph" | "table" | "formula" | "heading";
+  chunkLocation?: string;
   title: string;
   authorityLayer?: string;
   legalStatus?: string;
@@ -1613,9 +1636,27 @@ export interface RetrievalDebugEvidenceItem {
 export interface RetrievalDebugInfo {
   query: string;
   searchOptions: Record<string, unknown>;
+  queryPlan?: QueryRetrievalPlan;
   evidenceItems: RetrievalDebugEvidenceItem[];
   usedEvidenceIds: string[];
   warnings: string[];
+}
+
+export interface QueryRetrievalPlan {
+  normalizedQuery: string;
+  intent?: QueryOptions["intent"];
+  scope?: QueryOptions["scope"];
+  standardRefs: string[];
+  expandedTerms: string[];
+  pinnedStandards: string[];
+  rankingSignals: string[];
+  recommendedNextTool: RecommendedNextTool;
+  stages: Array<{
+    name: string;
+    status: "planned" | "used" | "skipped";
+    reason?: string;
+    resultCount?: number;
+  }>;
 }
 
 export interface QueryResult {
@@ -1637,6 +1678,9 @@ export interface QueryResult {
   groundingWarnings?: string[];
   invalidCitations?: string[];
   recommendedNextTool?: RecommendedNextTool;
+  answerBasis?: "current_effective" | "historical_or_evolution" | "local_adaptation" | "evidence_explanation" | "data_required";
+  currentStatus?: string;
+  dataToolHints?: string[];
   retrievalDebug?: RetrievalDebugInfo;
 }
 

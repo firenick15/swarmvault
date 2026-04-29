@@ -9,8 +9,26 @@ export interface StandardReference {
 
 export type RecommendedNextTool = "knowledge_base" | "environment_data_mcp" | "both";
 
+export interface EnvAirQueryPlan {
+  normalizedQuery: string;
+  standardRefs: StandardReference[];
+  expandedTerms: string[];
+  pinnedStandards: string[];
+  rankingSignals: string[];
+  currentBasisIntent: boolean;
+  dataToolHints: string[];
+  stages: Array<{
+    name: string;
+    status: "planned" | "used" | "skipped";
+    reason?: string;
+    resultCount?: number;
+  }>;
+}
+
 const STANDARD_REFERENCE_PATTERN =
-  /\b(?<family>GB\/T|GB|HJ\/T|HJ|DB[0-9]{2}\/T|DB[0-9]{2})\s*(?:[- ]|\/)?\s*(?<number>[0-9]{2,6})(?:\s*(?:[- ]|:)\s*(?<year>[0-9]{2,4}))?\b/gi;
+  /\b(?<family>GB\/T|GB|HJ\/T|HJ|DB[0-9]{2}\/T|DB[0-9]{2})\s*(?:[-‐‑‒–—― ]|\/)?\s*(?<number>[0-9]{2,6})(?:\s*(?:[-‐‑‒–—―:：])\s*(?<year>[0-9]{2,4}))?\b/giu;
+
+const STANDARD_DASH_PATTERN = /[-‐‑‒–—―]/g;
 
 const ENV_AIR_TERMS = [
   "环境空气",
@@ -103,6 +121,11 @@ const DATA_TOOL_HINTS = [
 
 const KNOWLEDGE_HINTS = ["标准", "规范", "指南", "依据", "限值", "要求", "方法", "解释", "编制说明", "法律", "办法"];
 
+const CURRENT_BASIS_HINTS = ["现行", "按什么执行", "执行依据", "限值", "标准", "依据", "current basis", "what standard"];
+const LIMIT_HINTS = ["限值", "浓度限值", "一级", "二级", "年平均", "日平均", "小时平均", "日最大", "8小时", "达标", "超标", "评价"];
+const AQI_HINTS = ["AQI", "IAQI", "空气质量指数", "日报", "实时报", "日报和实时报", "日报技术规定"];
+const MONITORING_METHOD_HINTS = ["监测方法", "采样", "分析方法", "测定", "检出限", "公式", "校准", "质控", "质量控制"];
+
 function normalizeSpace(value: string): string {
   return value.replace(/\s+/g, " ").trim();
 }
@@ -116,6 +139,13 @@ function normalizeYear(value: string | undefined): string | undefined {
     return undefined;
   }
   return value.length === 2 ? `20${value}` : value;
+}
+
+export function compactStandardCode(value: string): string {
+  return normalizeSpace(value)
+    .toUpperCase()
+    .replace(STANDARD_DASH_PATTERN, "-")
+    .replace(/[\s/-]/g, "");
 }
 
 export function normalizePollutantName(value: string): string {
@@ -140,7 +170,7 @@ export function extractStandardReferences(text: string): StandardReference[] {
       continue;
     }
     const normalized = year ? `${family} ${number}-${year}` : `${family} ${number}`;
-    const compact = normalized.replace(/[\s/-]/g, "").toUpperCase();
+    const compact = compactStandardCode(normalized);
     const key = compact;
     if (seen.has(key)) {
       continue;
@@ -161,6 +191,11 @@ export function extractStandardReferences(text: string): StandardReference[] {
 export function normalizeStandardCode(value: string): string {
   const first = extractStandardReferences(value)[0];
   return first?.normalized ?? normalizeSpace(value).toUpperCase();
+}
+
+export function inferCurrentBasisIntent(query: string): boolean {
+  const compact = query.toLowerCase().replace(/\s+/g, "");
+  return CURRENT_BASIS_HINTS.some((hint) => compact.includes(hint.toLowerCase().replace(/\s+/g, "")));
 }
 
 export function standardSearchTokens(references: StandardReference[]): string[] {
@@ -218,6 +253,77 @@ export function searchLikeTerms(query: string): string[] {
   return uniqueCompact([...refTerms, ...envTerms, ...cjkTerms, ...asciiTerms]).slice(0, 24);
 }
 
+function includesAnyTerm(text: string, terms: string[]): boolean {
+  const compact = text.toLowerCase().replace(/\s+/g, "");
+  return terms.some((term) => compact.includes(term.toLowerCase().replace(/\s+/g, "")));
+}
+
+function pollutantFocus(query: string): string[] {
+  const compact = query.toLowerCase().replace(/\s+/g, "");
+  const pollutants: string[] = [];
+  for (const [canonical, aliases] of Object.entries(TERM_ALIASES)) {
+    if (aliases.some((alias) => compact.includes(alias.toLowerCase().replace(/\s+/g, "")))) {
+      pollutants.push(canonical);
+    }
+  }
+  return uniqueCompact(pollutants);
+}
+
+export function buildEnvAirQueryPlan(query: string): EnvAirQueryPlan {
+  const normalizedQuery = query
+    .replace(STANDARD_DASH_PATTERN, "-")
+    .replace(/\bpm\s*2\s*\.?\s*5\b/gi, "PM2.5")
+    .replace(/\bpm\s*1\s*0\b/gi, "PM10")
+    .trim();
+  const standardRefs = extractStandardReferences(normalizedQuery);
+  const pollutants = pollutantFocus(normalizedQuery);
+  const expandedTerms: string[] = [];
+  const pinnedStandards: string[] = [];
+  const rankingSignals: string[] = [];
+
+  if (standardRefs.length) {
+    pinnedStandards.push(...standardRefs.map((ref) => ref.normalized));
+    rankingSignals.push("explicit_standard_reference");
+  }
+
+  if (
+    includesAnyTerm(normalizedQuery, LIMIT_HINTS) &&
+    pollutants.some((item) => ["PM2.5", "PM10", "O3", "SO2", "NO2", "CO"].includes(item))
+  ) {
+    expandedTerms.push("GB 3095", "GB 3095-2012", "环境空气质量标准", "环境空气质量标准限值", "一级", "二级");
+    pinnedStandards.push("GB 3095");
+    rankingSignals.push("ambient_air_quality_limit_question");
+  }
+
+  if (includesAnyTerm(normalizedQuery, AQI_HINTS)) {
+    expandedTerms.push("HJ 633", "HJ 633-2012", "HJ 664", "环境空气质量指数", "空气质量日报", "空气质量实时报");
+    pinnedStandards.push("HJ 633");
+    rankingSignals.push("aqi_reporting_question");
+  }
+
+  if (includesAnyTerm(normalizedQuery, MONITORING_METHOD_HINTS)) {
+    expandedTerms.push("环境空气监测方法", "环境空气质量监测规范", "采样", "质量保证", "质量控制");
+    rankingSignals.push("monitoring_method_question");
+  }
+
+  if (normalizedQuery.includes("HJ 482") || normalizedQuery.includes("HJ482") || normalizedQuery.includes("副玫瑰苯胺")) {
+    expandedTerms.push("HJ 482", "HJ 482-2009", "修改单", "甲醛吸收", "副玫瑰苯胺分光光度法");
+    pinnedStandards.push("HJ 482");
+    rankingSignals.push("hj482_amendment_question");
+  }
+
+  return {
+    normalizedQuery,
+    standardRefs,
+    expandedTerms: uniqueCompact(expandedTerms),
+    pinnedStandards: uniqueCompact(pinnedStandards),
+    rankingSignals: uniqueCompact(rankingSignals),
+    currentBasisIntent: inferCurrentBasisIntent(normalizedQuery),
+    dataToolHints: buildEnvironmentDataToolHints(normalizedQuery),
+    stages: []
+  };
+}
+
 export function classifyRecommendedNextTool(question: string): RecommendedNextTool {
   const compact = question.toLowerCase().replace(/\s+/g, "");
   const wantsData = DATA_TOOL_HINTS.some((hint) => compact.includes(hint.toLowerCase().replace(/\s+/g, "")));
@@ -231,6 +337,21 @@ export function classifyRecommendedNextTool(question: string): RecommendedNextTo
     return "environment_data_mcp";
   }
   return "knowledge_base";
+}
+
+export function buildEnvironmentDataToolHints(question: string): string[] {
+  const compact = question.toLowerCase().replace(/\s+/g, "");
+  const hints: string[] = [];
+  if (["今天", "昨日", "昨天", "本月", "今年", "小时值", "日均值", "月均值", "年均值"].some((term) => compact.includes(term))) {
+    hints.push("需要调用环境数据 MCP 查询对应时间范围的监测浓度或统计值。");
+  }
+  if (["超标", "达标", "排名", "同比", "环比", "污染过程", "浓度"].some((term) => compact.includes(term))) {
+    hints.push("知识库只能提供评价依据和计算口径，是否超标或排名需要环境数据 MCP 返回实际数据后判断。");
+  }
+  if (["站点", "城市", "区域", "省", "市"].some((term) => compact.includes(term))) {
+    hints.push("需要在环境数据 MCP 参数中明确地区、城市、站点或行政区范围。");
+  }
+  return uniqueCompact(hints);
 }
 
 export function authorityLayerRank(value: string | undefined): number {

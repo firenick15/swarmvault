@@ -12,6 +12,20 @@ export function slugify(value: string): string {
   );
 }
 
+export function slugifyKnowledgeLabel(value: string): string {
+  const normalized = value
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/['"]/g, "")
+    .replace(/[^\p{Letter}\p{Number}]+/gu, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80);
+  if (normalized) {
+    return normalized;
+  }
+  return `item-${sha256(value).slice(0, 12)}`;
+}
+
 export function sha256(value: string | Uint8Array): string {
   return crypto.createHash("sha256").update(value).digest("hex");
 }

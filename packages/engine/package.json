@@ -42,7 +42,7 @@
   "scripts": {
     "build": "node ./scripts/build.mjs",
     "pretest": "tsup --config tsup.hooks.config.ts",
-    "test": "SWARMVAULT_ALLOW_PRIVATE_URLS=1 vitest run",
+    "test": "node ./scripts/test.mjs",
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "node ../../scripts/check-release-sync.mjs && node ../../scripts/check-published-manifests.mjs"
   },

@@ -15,10 +15,14 @@ export {
 } from "./context-packs.js";
 export {
   authorityLayerRank,
+  buildEnvAirQueryPlan,
   buildEnvAirSearchText,
+  buildEnvironmentDataToolHints,
   classifyRecommendedNextTool,
+  compactStandardCode,
   envAirSearchTerms,
   extractStandardReferences,
+  inferCurrentBasisIntent,
   normalizePollutantName,
   normalizeStandardCode,
   searchLikeTerms,
@@ -119,6 +123,7 @@ export {
 } from "./retrieval.js";
 export { listSchedules, runSchedule, serveSchedules } from "./schedule.js";
 export { loadVaultSchema, loadVaultSchemas } from "./schema.js";
+export { rebuildSearchIndex, searchPages } from "./search.js";
 export {
   addManagedSource,
   deleteManagedSource,
@@ -133,6 +138,7 @@ export {
 export { estimatePageTokens, estimateTokens, trimToTokenBudget } from "./token-estimation.js";
 export { contentTokens, searchTokens, tokenize } from "./tokenize.js";
 export type * from "./types.js";
+export { slugifyKnowledgeLabel } from "./utils.js";
 export {
   acceptApproval,
   archiveCandidate,

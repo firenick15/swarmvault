@@ -3,6 +3,7 @@ import path from "node:path";
 import matter from "gray-matter";
 import { z } from "zod";
 import { loadVaultConfig } from "./config.js";
+import { extractStandardReferences } from "./domain/env-air.js";
 import { normalizeFindingSeverity } from "./findings.js";
 import { listManifests } from "./ingest.js";
 import { runConfiguredRoles, summarizeRoleQuestions } from "./orchestration.js";
@@ -42,6 +43,88 @@ type DeepLintContextPage = {
   sourceIds: string[];
   excerpt: string;
 };
+
+function isUnknown(value: unknown): boolean {
+  return typeof value !== "string" || !value.trim() || value.trim() === "unknown";
+}
+
+async function deterministicEnvAirFindings(rootDir: string, graph: GraphArtifact): Promise<LintFinding[]> {
+  const { paths } = await loadVaultConfig(rootDir);
+  const findings: LintFinding[] = [];
+  const pages = graph.pages.filter(
+    (page) => page.kind === "source" || page.kind === "module" || page.kind === "concept" || page.kind === "entity"
+  );
+  for (const page of pages) {
+    const absolutePath = path.join(paths.wikiDir, page.path);
+    const raw = await fs.readFile(absolutePath, "utf8").catch(() => "");
+    if (!raw) {
+      continue;
+    }
+    const parsed = matter(raw);
+    const title = typeof parsed.data.title === "string" ? parsed.data.title : page.title;
+    if ((page.kind === "concept" || page.kind === "entity") && /^(item|8)$/i.test(path.basename(page.path, ".md"))) {
+      findings.push({
+        severity: "warning",
+        code: "knowledge_slug_collision",
+        message: `${page.kind} page ${page.title} still uses a collapsed slug (${path.basename(page.path, ".md")}).`,
+        pagePath: absolutePath,
+        relatedPageIds: [page.id]
+      });
+    }
+    if (page.kind !== "source" && page.kind !== "module") {
+      continue;
+    }
+    const combined = `${title}\n${parsed.content}`;
+    const refs = extractStandardReferences(combined);
+    const looksLikeStandard = refs.length > 0 || /(标准|规范|技术规定|监测方法|修改单|征求意见稿|编制说明)/.test(combined.slice(0, 1200));
+    if (!looksLikeStandard) {
+      continue;
+    }
+    const relatedSourceIds = page.sourceIds;
+    if (refs.length > 0 && isUnknown(parsed.data.standard_code)) {
+      findings.push({
+        severity: "warning",
+        code: "standard_code_missing",
+        message: `Standard-like source ${title} contains standard references but has no parsed standard_code.`,
+        pagePath: absolutePath,
+        relatedSourceIds,
+        relatedPageIds: [page.id],
+        suggestedQuery: `标准编号 ${refs[0]?.normalized ?? title} 在知识库中如何解析？`
+      });
+    }
+    if (/(修改单|amendment)/i.test(combined.slice(0, 2000)) && parsed.data.document_role !== "amendment") {
+      findings.push({
+        severity: "warning",
+        code: "amendment_without_role",
+        message: `Source ${title} looks like an amendment but document_role is not amendment.`,
+        pagePath: absolutePath,
+        relatedSourceIds,
+        relatedPageIds: [page.id]
+      });
+    }
+    if ((parsed.data.authority_layer === "core" || parsed.data.authority_layer === "method") && isUnknown(parsed.data.legal_status)) {
+      findings.push({
+        severity: "warning",
+        code: "core_status_unknown",
+        message: `Core/method source ${title} has unknown legal_status.`,
+        pagePath: absolutePath,
+        relatedSourceIds,
+        relatedPageIds: [page.id]
+      });
+    }
+    if ((parsed.data.authority_layer === "core" || parsed.data.authority_layer === "method") && isUnknown(parsed.data.document_role)) {
+      findings.push({
+        severity: "warning",
+        code: "core_role_unknown",
+        message: `Core/method source ${title} has unknown document_role.`,
+        pagePath: absolutePath,
+        relatedSourceIds,
+        relatedPageIds: [page.id]
+      });
+    }
+  }
+  return uniqueBy(findings, (item) => `${item.code}:${item.pagePath ?? ""}:${item.message}`);
+}
 
 function graphContextSummary(graph: GraphArtifact) {
   const communities = (graph.communities ?? []).map((community) => ({
@@ -184,10 +267,11 @@ export async function runDeepLint(
   const provider = await getProviderForTask(rootDir, "lintProvider");
   const manifests = await listManifests(rootDir);
   const contextPages = await loadContextPages(rootDir, graph);
+  const deterministicFindings = await deterministicEnvAirFindings(rootDir, graph);
 
   let findings: LintFinding[];
   if (provider.type === "heuristic") {
-    findings = heuristicDeepFindings(contextPages, structuralFindings, graph);
+    findings = [...deterministicFindings, ...heuristicDeepFindings(contextPages, structuralFindings, graph)];
   } else {
     const graphSummary = graphContextSummary(graph);
     const response = await provider.generateStructured(
@@ -241,14 +325,17 @@ export async function runDeepLint(
       deepLintResponseSchema
     );
 
-    findings = response.findings.map((item) => ({
-      severity: normalizeFindingSeverity(item.severity),
-      code: item.code,
-      message: item.message,
-      relatedSourceIds: item.relatedSourceIds,
-      relatedPageIds: item.relatedPageIds,
-      suggestedQuery: item.suggestedQuery
-    }));
+    findings = [
+      ...deterministicFindings,
+      ...response.findings.map((item) => ({
+        severity: normalizeFindingSeverity(item.severity),
+        code: item.code,
+        message: item.message,
+        relatedSourceIds: item.relatedSourceIds,
+        relatedPageIds: item.relatedPageIds,
+        suggestedQuery: item.suggestedQuery
+      }))
+    ];
   }
 
   if (!options.web) {

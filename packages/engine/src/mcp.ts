@@ -255,7 +255,8 @@ export async function createMcpServer(rootDir: string): Promise<McpServer> {
   server.registerTool(
     "query_vault",
     {
-      description: "Ask a question against the compiled vault and optionally save the answer.",
+      description:
+        "Ask a question against the compiled vault. For environmental air work, returns grounded citations, answer basis, current-status hints, retrieval diagnostics when requested, and suggestions for when the environment data MCP should be called.",
       inputSchema: {
         question: z.string().min(1).describe("Question to ask the vault"),
         save: z.boolean().optional().describe("Persist the answer to wiki/outputs"),

@@ -25,7 +25,7 @@ import { conflictConfidence, edgeConfidence, nodeConfidence } from "./confidence
 import { defaultVaultSchema, initWorkspace, loadVaultConfig, PRIMARY_SCHEMA_FILENAME } from "./config.js";
 import { runConsolidation } from "./consolidate.js";
 import { runDeepLint } from "./deep-lint.js";
-import { classifyRecommendedNextTool } from "./domain/env-air.js";
+import { buildEnvAirQueryPlan, buildEnvironmentDataToolHints, classifyRecommendedNextTool } from "./domain/env-air.js";
 import { applyStandardRelationOverrides } from "./domain/standard-relations.js";
 import { embeddingSimilarityEdges, filterGraphBySourceClass, semanticGraphMatches, semanticPageSearch } from "./embeddings.js";
 import { markSuperseded, resolveDecayConfig, runDecayPass } from "./freshness.js";
@@ -177,6 +177,9 @@ type QueryExecutionResult = {
   groundingWarnings?: string[];
   invalidCitations?: string[];
   recommendedNextTool?: QueryResult["recommendedNextTool"];
+  answerBasis?: QueryResult["answerBasis"];
+  currentStatus?: string;
+  dataToolHints?: string[];
   retrievalDebug?: RetrievalDebugInfo;
 };
 
@@ -3370,7 +3373,7 @@ async function syncVaultArtifacts(
     candidateHistory
   } satisfies CompileState);
   await applyStandardRelationOverrides(paths.wikiDir, allPages);
-  await rebuildSearchIndex(paths.searchDbPath, allPages, paths.wikiDir);
+  await rebuildSearchIndex(paths.searchDbPath, allPages, paths.wikiDir, { chunking: config.retrieval?.chunking });
   await writeRetrievalManifest(rootDir, graph);
 
   return {
@@ -3602,7 +3605,7 @@ async function refreshIndexesAndSearch(rootDir: string, pages: GraphPage[]): Pro
   );
 
   await applyStandardRelationOverrides(paths.wikiDir, pagesWithGraph);
-  await rebuildSearchIndex(paths.searchDbPath, pagesWithGraph, paths.wikiDir);
+  await rebuildSearchIndex(paths.searchDbPath, pagesWithGraph, paths.wikiDir, { chunking: config.retrieval?.chunking });
   if (currentGraph) {
     await writeRetrievalManifest(rootDir, {
       ...currentGraph,
@@ -3838,6 +3841,41 @@ function buildQuerySearchOptions(queryOptions?: QueryOptions): SearchQueryOption
   return searchOptions;
 }
 
+function inferAnswerBasis(
+  options: QueryOptions | undefined,
+  recommendedNextTool: QueryResult["recommendedNextTool"]
+): QueryResult["answerBasis"] {
+  if (recommendedNextTool === "environment_data_mcp") {
+    return "data_required";
+  }
+  switch (options?.intent) {
+    case "current_basis":
+      return "current_effective";
+    case "evolution":
+      return "historical_or_evolution";
+    case "local":
+      return "local_adaptation";
+    case "statistics":
+    case "research":
+    case "explanation":
+    case "report_writing":
+      return "evidence_explanation";
+    default:
+      return options?.requireCurrentBasis ? "current_effective" : "evidence_explanation";
+  }
+}
+
+function summarizeCurrentStatus(evidenceItems: EvidenceItem[]): string | undefined {
+  const statuses = uniqueBy(
+    evidenceItems.map((item) => [item.standardCode, item.legalStatus].filter(Boolean).join("=")).filter(Boolean),
+    (item) => item
+  );
+  if (!statuses.length) {
+    return undefined;
+  }
+  return statuses.slice(0, 5).join("; ");
+}
+
 function formatEvidenceSet(evidenceItems: EvidenceItem[]): string {
   if (!evidenceItems.length) {
     return "No evidence was retrieved from the vault or web search.";
@@ -3852,6 +3890,10 @@ function formatEvidenceSet(evidenceItems: EvidenceItem[]): string {
         item.documentRole ? `document_role=${item.documentRole}` : undefined,
         item.standardCode ? `standard_code=${item.standardCode}` : undefined,
         item.region ? `region=${item.region}` : undefined,
+        item.chunkId ? `chunk_id=${item.chunkId}` : undefined,
+        item.chunkHeading ? `chunk_heading=${item.chunkHeading}` : undefined,
+        item.chunkKind ? `chunk_kind=${item.chunkKind}` : undefined,
+        item.chunkLocation ? `chunk_location=${item.chunkLocation}` : undefined,
         "",
         item.excerpt
       ]
@@ -3882,7 +3924,7 @@ function strictExactQueryTerms(question: string): string[] {
 
 function evidenceContainsExactTerms(evidenceItems: EvidenceItem[], terms: string[]): string[] {
   const haystack = evidenceItems
-    .map((item) => [item.title, item.standardCode, item.citation, item.excerpt].filter(Boolean).join(" "))
+    .map((item) => [item.title, item.standardCode, item.citation, item.chunkId, item.chunkHeading, item.excerpt].filter(Boolean).join(" "))
     .join("\n")
     .toLowerCase()
     .replace(/[^a-z0-9]/g, "");
@@ -3897,11 +3939,22 @@ function evaluateGrounding(input: { evidenceItems: EvidenceItem[]; answer: strin
   groundingWarnings: string[];
 } {
   const evidenceById = new Map(input.evidenceItems.map((item) => [item.id, item]));
+  const evidenceAliases = new Map<string, string>();
+  for (const item of input.evidenceItems) {
+    const aliases = [item.id, item.citation, item.pageId, item.sourceId, item.chunkId].filter((alias): alias is string => Boolean(alias));
+    for (const alias of aliases) {
+      evidenceAliases.set(alias, item.id);
+    }
+  }
   const structuredIds = input.structured?.usedEvidenceIds ?? [];
   const inlineIds = parseEvidenceIds(input.answer);
   const proposedIds = uniqueBy([...structuredIds, ...inlineIds], (item) => item);
-  const invalidCitations = proposedIds.filter((id) => !evidenceById.has(id));
-  const usedEvidenceIds = proposedIds.filter((id) => evidenceById.has(id));
+  const resolvedIds = uniqueBy(
+    proposedIds.map((id) => evidenceAliases.get(id) ?? id),
+    (item) => item
+  );
+  const invalidCitations = proposedIds.filter((id) => !evidenceAliases.has(id) && !evidenceById.has(id));
+  const usedEvidenceIds = resolvedIds.filter((id) => evidenceById.has(id));
   const groundingWarnings: string[] = [];
 
   if (!input.evidenceItems.length) {
@@ -3973,9 +4026,56 @@ async function executeQuery(
   );
   const searchOptions = buildQuerySearchOptions(options.queryOptions);
   const recommendedNextTool = classifyRecommendedNextTool(question);
+  const dataToolHints = buildEnvironmentDataToolHints(question);
+  const queryPlan = buildEnvAirQueryPlan(question);
+  if (queryPlan.standardRefs.length > 0) {
+    delete searchOptions.authorityLayer;
+    delete searchOptions.documentRole;
+    delete searchOptions.legalStatus;
+    searchOptions.includeSuperseded = true;
+  }
   const searchResults = await searchVault(rootDir, question, searchOptions);
+  queryPlan.stages.push(
+    {
+      name: "standard_exact",
+      status: queryPlan.standardRefs.length || queryPlan.pinnedStandards.length ? "used" : "skipped",
+      reason: queryPlan.standardRefs.length ? "explicit or domain-pinned standard references" : "no standard reference inferred",
+      resultCount: searchResults.filter((result) => result.retrievalStage === "standard_exact").length
+    },
+    {
+      name: "chunk_fts",
+      status: searchResults.some((result) => result.retrievalStage === "chunk_fts") ? "used" : "planned",
+      resultCount: searchResults.filter((result) => result.retrievalStage === "chunk_fts").length
+    },
+    {
+      name: "page_retrieval",
+      status: searchResults.length ? "used" : "skipped",
+      resultCount: searchResults.length
+    }
+  );
+  const retrievalPlan: NonNullable<RetrievalDebugInfo["queryPlan"]> = {
+    normalizedQuery: queryPlan.normalizedQuery,
+    intent: options.queryOptions?.intent,
+    scope: options.queryOptions?.scope,
+    standardRefs: queryPlan.standardRefs.map((ref) => ref.normalized),
+    expandedTerms: queryPlan.expandedTerms,
+    pinnedStandards: queryPlan.pinnedStandards,
+    rankingSignals: queryPlan.rankingSignals,
+    recommendedNextTool,
+    stages: queryPlan.stages
+  };
   const excerpts = await Promise.all(
     searchResults.map(async (result) => {
+      if (result.chunkId && result.snippet.trim()) {
+        const chunkMeta = [
+          result.chunkHeading ? `Chunk heading: ${result.chunkHeading}` : undefined,
+          result.chunkKind ? `Chunk kind: ${result.chunkKind}` : undefined,
+          result.chunkLocation ? `Chunk location: ${result.chunkLocation}` : undefined
+        ]
+          .filter((item): item is string => Boolean(item))
+          .join("\n");
+        return [`# ${result.title}`, chunkMeta, result.snippet].filter(Boolean).join("\n");
+      }
       const absolutePath = path.join(paths.wikiDir, result.path);
       try {
         const content = await fs.readFile(absolutePath, "utf8");
@@ -4031,16 +4131,20 @@ async function executeQuery(
     evidenceItems.push({
       id: `E${evidenceItems.length + 1}`,
       kind: "source",
-      citation: sourceId ?? result.pageId,
+      citation: sourceId ? (result.chunkId ? `${sourceId}#${result.chunkId}` : sourceId) : result.pageId,
       pageId: result.pageId,
       sourceId,
+      chunkId: result.chunkId,
+      chunkHeading: result.chunkHeading,
+      chunkKind: result.chunkKind,
+      chunkLocation: result.chunkLocation,
       title: result.title,
       authorityLayer: result.authorityLayer,
       legalStatus: result.legalStatus,
       documentRole: result.documentRole,
       standardCode: result.standardCode,
       region: result.region,
-      excerpt: truncate(normalizeWhitespace(excerpts[index] ?? result.snippet), 1200)
+      excerpt: truncate(normalizeWhitespace(excerpts[index] ?? result.snippet), 1800)
     });
   });
   webResults.forEach((result) => {
@@ -4074,10 +4178,14 @@ async function executeQuery(
       groundingWarnings: ["no_retrieved_evidence"],
       invalidCitations: [],
       recommendedNextTool,
+      answerBasis: inferAnswerBasis(options.queryOptions, recommendedNextTool),
+      currentStatus: undefined,
+      dataToolHints,
       retrievalDebug: options.queryOptions?.debugContext
         ? {
             query: question,
             searchOptions: searchOptions as unknown as Record<string, unknown>,
+            queryPlan: retrievalPlan,
             evidenceItems,
             usedEvidenceIds: [],
             warnings: ["no_retrieved_evidence"]
@@ -4101,10 +4209,14 @@ async function executeQuery(
       groundingWarnings: [warning],
       invalidCitations: [],
       recommendedNextTool,
+      answerBasis: inferAnswerBasis(options.queryOptions, recommendedNextTool),
+      currentStatus: summarizeCurrentStatus(evidenceItems),
+      dataToolHints,
       retrievalDebug: options.queryOptions?.debugContext
         ? {
             query: question,
             searchOptions: searchOptions as unknown as Record<string, unknown>,
+            queryPlan: retrievalPlan,
             evidenceItems,
             usedEvidenceIds: [],
             warnings: [warning]
@@ -4132,9 +4244,12 @@ async function executeQuery(
     const system = buildSchemaPrompt(
       querySchema,
       [
+        `Current date: ${new Date().toISOString().slice(0, 10)}.`,
         "You answer for environmental air pollution regulatory and technical work.",
         "Use only the provided evidence set. Cite evidence item IDs like [E1] for every substantive claim.",
+        "Evidence items may include chunk_id, chunk_heading, chunk_kind, and chunk_location; prefer table/formula chunks for limits, formulas, and numeric requirements.",
         "Distinguish mandatory/current-effective standards from recommended guides, drafts, explanations, and historical versions.",
+        "When a user asks about a named historical standard, explain that standard and its replacement status instead of answering only with the current replacement.",
         "For current-basis questions, prioritize current effective standards and explicitly mark drafts/history as non-binding.",
         "For local questions, state jurisdiction boundaries and do not generalize local口径 to other regions.",
         "If monitor data, rankings, concentration calculations,同比/环比, or process analysis are needed, say the environment_data_mcp tool should be used.",
@@ -4198,10 +4313,14 @@ async function executeQuery(
     groundingWarnings,
     invalidCitations: grounding.invalidCitations,
     recommendedNextTool: structuredAnswer?.recommendedNextTool ?? recommendedNextTool,
+    answerBasis: inferAnswerBasis(options.queryOptions, structuredAnswer?.recommendedNextTool ?? recommendedNextTool),
+    currentStatus: summarizeCurrentStatus(evidenceItems),
+    dataToolHints,
     retrievalDebug: options.queryOptions?.debugContext
       ? {
           query: question,
           searchOptions: searchOptions as unknown as Record<string, unknown>,
+          queryPlan: retrievalPlan,
           evidenceItems,
           usedEvidenceIds: grounding.usedEvidenceIds,
           warnings: groundingWarnings
@@ -6075,6 +6194,7 @@ export async function queryVault(rootDir: string, options: QueryOptions): Promis
       `citations=${query.citations.join(",") || "none"}`,
       `evidenceState=${query.evidenceState ?? "unknown"}`,
       `recommendedNextTool=${query.recommendedNextTool ?? "knowledge_base"}`,
+      `answerBasis=${query.answerBasis ?? "unknown"}`,
       `saved=${Boolean(savedPath)}`,
       `staged=${Boolean(stagedPath)}`,
       `format=${outputFormat}`,
@@ -6109,6 +6229,9 @@ export async function queryVault(rootDir: string, options: QueryOptions): Promis
     groundingWarnings: query.groundingWarnings,
     invalidCitations: query.invalidCitations,
     recommendedNextTool: query.recommendedNextTool,
+    answerBasis: query.answerBasis,
+    currentStatus: query.currentStatus,
+    dataToolHints: query.dataToolHints,
     retrievalDebug: query.retrievalDebug
   };
 }
@@ -6452,7 +6575,23 @@ async function rerankSearchResults(rootDir: string, query: string, results: Sear
         reranked.push(results[i]);
       }
     }
-    return reranked.slice(0, limit);
+    const llmPosition = new Map(reranked.map((result, index) => [result.pageId, index] as const));
+    return results
+      .map((result, originalIndex) => {
+        const rerankIndex = llmPosition.get(result.pageId) ?? originalIndex;
+        const retrievalWeight = originalIndex < 3 ? 0.75 : originalIndex < 10 ? 0.6 : 0.4;
+        const llmWeight = 1 - retrievalWeight;
+        const exactBoost = result.retrievalStage === "standard_exact" ? 0.25 : 0;
+        const blendedScore = retrievalWeight * (1 / (originalIndex + 1)) + llmWeight * (1 / (rerankIndex + 1)) + exactBoost;
+        return {
+          ...result,
+          rank: -blendedScore,
+          retrievalStage: result.retrievalStage === "standard_exact" ? result.retrievalStage : ("rerank" as const),
+          rankingSignals: uniqueBy([...(result.rankingSignals ?? []), "position_aware_llm_rerank"], (item) => item)
+        };
+      })
+      .sort((left, right) => left.rank - right.rank)
+      .slice(0, limit);
   } catch {
     return results.slice(0, limit);
   }

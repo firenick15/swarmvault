@@ -237,7 +237,15 @@ const vaultConfigSchema = z.object({
       hybrid: z.boolean().optional(),
       rerank: z.boolean().optional(),
       embeddingProvider: z.string().min(1).optional(),
-      maxIndexedRows: z.number().int().positive().optional()
+      maxIndexedRows: z.number().int().positive().optional(),
+      chunking: z
+        .object({
+          enabled: z.boolean().optional(),
+          maxChars: z.number().int().positive().optional(),
+          overlapChars: z.number().int().min(0).optional()
+        })
+        .optional(),
+      debug: z.boolean().optional()
     })
     .optional(),
   analysis: z
@@ -484,7 +492,13 @@ export function defaultVaultConfig(profile: VaultProfileConfig = defaultVaultPro
       backend: "sqlite",
       shardSize: 25000,
       hybrid: true,
-      rerank: false
+      rerank: false,
+      chunking: {
+        enabled: true,
+        maxChars: 1600,
+        overlapChars: 160
+      },
+      debug: false
     },
     analysis: {
       failurePolicy: "warn",
