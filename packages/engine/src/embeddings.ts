@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import matter from "gray-matter";
 import { loadVaultConfig } from "./config.js";
 import { createProvider } from "./providers/registry.js";
 import type {
@@ -54,6 +55,19 @@ function appendIfMissing(parts: string[], value: string | undefined): void {
   }
 }
 
+function embeddingTextFromPage(raw: string): string {
+  try {
+    const parsed = matter(raw);
+    const content = parsed.content?.trim();
+    if (content) {
+      return content;
+    }
+  } catch {
+    // Fall through to the raw content when frontmatter parsing fails.
+  }
+  return raw;
+}
+
 async function loadPageContents(rootDir: string, graph: GraphArtifact): Promise<Map<string, string>> {
   const { paths } = await loadVaultConfig(rootDir);
   const contents = new Map<string, string>();
@@ -66,7 +80,7 @@ async function loadPageContents(rootDir: string, graph: GraphArtifact): Promise<
         return "";
       });
       if (content) {
-        contents.set(page.id, content);
+        contents.set(page.id, embeddingTextFromPage(content));
       }
     })
   );

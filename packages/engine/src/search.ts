@@ -1,7 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import matter from "gray-matter";
-import { tokenize } from "./tokenize.js";
+import { buildEnvAirSearchText, extractStandardReferences, normalizeStandardCode, searchLikeTerms } from "./domain/env-air.js";
+import { searchTokens } from "./tokenize.js";
 import type { GraphPage, PageKind, PageStatus, SearchResult, SourceCaptureType, SourceClass, SourceManifest } from "./types.js";
 import { ensureDir } from "./utils.js";
 
@@ -11,6 +12,14 @@ export interface SearchPageFilters {
   project?: string;
   sourceType?: string;
   sourceClass?: string;
+  authorityLayer?: string | string[];
+  legalStatus?: string | string[];
+  documentRole?: string | string[];
+  jurisdiction?: string;
+  region?: string;
+  pollutant?: string;
+  includeDrafts?: boolean;
+  includeSuperseded?: boolean;
 }
 
 export interface SearchQueryOptions extends SearchPageFilters {
@@ -65,8 +74,12 @@ function getDatabaseSync(): DatabaseSyncCtor {
   return builtin.DatabaseSync;
 }
 
+function quoteFtsToken(token: string): string {
+  return `"${token.replace(/"/g, '""')}"`;
+}
+
 function toFtsQuery(query: string): string {
-  return tokenize(query).join(" OR ");
+  return searchTokens(query).map(quoteFtsToken).join(" OR ");
 }
 
 function normalizeKind(value: unknown): PageKind | undefined {
@@ -103,6 +116,28 @@ function normalizeSourceClass(value: unknown): SourceClass | undefined {
   return value === "first_party" || value === "third_party" || value === "resource" || value === "generated" ? value : undefined;
 }
 
+function normalizedStandardQuery(query: string): string {
+  return query
+    .replace(/\bgb\s*\/\s*t\s*[- ]?([0-9]{2,6})(?:\s*[- ]\s*([0-9]{2,4}))?\b/gi, (_match, number, year) =>
+      year ? `GB/T ${number}-${year}` : `GB/T ${number}`
+    )
+    .replace(/\bgb\s*[- ]?([0-9]{3,5})\b/gi, "gb $1")
+    .replace(/\bhj\s*\/\s*t\s*[- ]?([0-9]{2,6})(?:\s*[- ]\s*([0-9]{2,4}))?\b/gi, (_match, number, year) =>
+      year ? `HJ/T ${number}-${year}` : `HJ/T ${number}`
+    )
+    .replace(/\bhj\s*[- ]?([0-9]{3,5})\b/gi, "hj $1")
+    .replace(/\bdb\s*([0-9]{2})\s*\/?\s*t?\s*[- ]?([0-9]{2,6})(?:\s*[- ]\s*([0-9]{2,4}))?\b/gi, (_match, region, number, year) =>
+      year ? `DB${region}/T ${number}-${year}` : `DB${region}/T ${number}`
+    )
+    .replace(/\bpm\s*2\s*\.?\s*5\b/gi, "pm2.5")
+    .replace(/\bpm\s*1\s*0\b/gi, "pm10")
+    .trim();
+}
+
+function inferCurrentBasisIntent(query: string): boolean {
+  return /(现行|按什么执行|执行依据|限值|标准|依据|current\s+basis|what\s+standard)/i.test(query);
+}
+
 export async function rebuildSearchIndex(dbPath: string, pages: GraphPage[], wikiDir: string): Promise<void> {
   await ensureDir(path.dirname(dbPath));
   const DatabaseSync = getDatabaseSync();
@@ -120,12 +155,24 @@ export async function rebuildSearchIndex(dbPath: string, pages: GraphPage[], wik
       status TEXT NOT NULL,
       source_type TEXT NOT NULL,
       source_class TEXT NOT NULL,
+      authority_layer TEXT NOT NULL,
+      legal_status TEXT NOT NULL,
+      document_role TEXT NOT NULL,
+      jurisdiction TEXT NOT NULL,
+      region TEXT NOT NULL,
+      standard_code TEXT NOT NULL,
+      standard_code_normalized TEXT NOT NULL,
+      standard_family TEXT NOT NULL,
+      standard_year TEXT NOT NULL,
+      pollutants TEXT NOT NULL,
+      search_terms TEXT NOT NULL,
       project_ids TEXT NOT NULL,
       project_key TEXT NOT NULL
     );
     CREATE VIRTUAL TABLE IF NOT EXISTS page_search USING fts5(
       title,
       body,
+      search_terms,
       content='pages',
       content_rowid='rowid'
     );
@@ -134,7 +181,7 @@ export async function rebuildSearchIndex(dbPath: string, pages: GraphPage[], wik
   `);
 
   const insertPage = db.prepare(
-    "INSERT INTO pages (id, path, title, body, kind, status, source_type, source_class, project_ids, project_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    "INSERT INTO pages (id, path, title, body, kind, status, source_type, source_class, authority_layer, legal_status, document_role, jurisdiction, region, standard_code, standard_code_normalized, standard_family, standard_year, pollutants, search_terms, project_ids, project_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
   );
   const rootDir = path.dirname(wikiDir);
 
@@ -163,6 +210,18 @@ export async function rebuildSearchIndex(dbPath: string, pages: GraphPage[], wik
         // Leave the page searchable via its generated markdown alone when source excerpts are unavailable.
       }
     }
+    const standardCode = typeof parsed.data.standard_code === "string" ? parsed.data.standard_code : "";
+    const standards = extractStandardReferences([page.title, standardCode, body].join("\n"));
+    const firstStandard = standards[0];
+    const pollutants = Array.isArray(parsed.data.pollutants)
+      ? (parsed.data.pollutants as unknown[]).filter((item): item is string => typeof item === "string")
+      : typeof parsed.data.pollutants === "string"
+        ? parsed.data.pollutants
+            .split("|")
+            .map((item) => item.trim())
+            .filter(Boolean)
+        : [];
+    const searchTerms = buildEnvAirSearchText({ title: page.title, body, standardCode, pollutants });
     insertPage.run(
       page.id,
       page.path,
@@ -172,12 +231,23 @@ export async function rebuildSearchIndex(dbPath: string, pages: GraphPage[], wik
       page.status,
       typeof parsed.data.source_type === "string" ? parsed.data.source_type : "",
       typeof parsed.data.source_class === "string" ? parsed.data.source_class : "",
+      typeof parsed.data.authority_layer === "string" ? parsed.data.authority_layer : "",
+      typeof parsed.data.legal_status === "string" ? parsed.data.legal_status : "",
+      typeof parsed.data.document_role === "string" ? parsed.data.document_role : "",
+      typeof parsed.data.jurisdiction === "string" ? parsed.data.jurisdiction : "",
+      typeof parsed.data.region === "string" ? parsed.data.region : "",
+      standardCode,
+      standardCode ? normalizeStandardCode(standardCode) : (firstStandard?.normalized ?? ""),
+      firstStandard?.family ?? "",
+      firstStandard?.year ?? "",
+      pollutants.join("|"),
+      searchTerms,
       JSON.stringify(page.projectIds),
       page.projectIds.map((projectId) => `|${projectId}|`).join("")
     );
   }
 
-  db.exec("INSERT INTO page_search (rowid, title, body) SELECT rowid, title, body FROM pages;");
+  db.exec("INSERT INTO page_search (rowid, title, body, search_terms) SELECT rowid, title, body, search_terms FROM pages;");
   db.close();
 }
 
@@ -230,79 +300,217 @@ export function mergeSearchResults(
 
 export function searchPages(dbPath: string, query: string, limitOrOptions: number | SearchQueryOptions = 5): SearchResult[] {
   const options = typeof limitOrOptions === "number" ? { limit: limitOrOptions } : limitOrOptions;
-  const ftsQuery = toFtsQuery(query);
-  if (!ftsQuery) {
+  const normalizedQuery = normalizedStandardQuery(query);
+  const ftsQuery = toFtsQuery(normalizedQuery);
+  const likeTerms = searchLikeTerms(normalizedQuery);
+  if (!ftsQuery && likeTerms.length === 0) {
     return [];
   }
+  const currentBasisIntent = inferCurrentBasisIntent(normalizedQuery);
+  const explicitStandard = extractStandardReferences(normalizedQuery)[0];
+  const explicitStandardCompact = explicitStandard?.compact ?? "";
+  const explicitStandardFamily = explicitStandard?.family ?? "";
   const DatabaseSync = getDatabaseSync();
   const db = withSuppressedSqliteExperimentalWarning(() => new DatabaseSync(dbPath, { readOnly: true }));
-  const clauses = ["page_search MATCH ?"];
-  const params: Array<number | string> = [ftsQuery];
+  const limit = options.limit ?? 5;
+  const seen = new Set<string>();
+  const rows: Array<Record<string, unknown>> = [];
 
-  if (options.kind && options.kind !== "all") {
-    clauses.push("pages.kind = ?");
-    params.push(options.kind);
+  function selectedColumns(rankExpression: string, snippetExpression: string): string {
+    return `
+      SELECT
+        pages.id AS pageId,
+        pages.path AS path,
+        pages.title AS title,
+        pages.kind AS kind,
+        pages.status AS status,
+        pages.source_type AS sourceType,
+        pages.source_class AS sourceClass,
+        pages.authority_layer AS authorityLayer,
+        pages.legal_status AS legalStatus,
+        pages.document_role AS documentRole,
+        pages.jurisdiction AS jurisdiction,
+        pages.region AS region,
+        pages.standard_code AS standardCode,
+        pages.pollutants AS pollutants,
+        pages.project_ids AS projectIds,
+        ${snippetExpression} AS snippet,
+        ${rankExpression} AS rank
+    `;
   }
-  if (options.status && options.status !== "all") {
-    clauses.push("pages.status = ?");
-    params.push(options.status);
+
+  function addScalarOrListFilter(
+    clauses: string[],
+    params: Array<number | string>,
+    column: string,
+    value: string | string[] | undefined
+  ): void {
+    const values = (Array.isArray(value) ? value : value ? [value] : []).filter((item) => item && item !== "all");
+    if (!values.length) {
+      return;
+    }
+    if (values.length === 1) {
+      clauses.push(`${column} = ?`);
+      params.push(values[0]);
+      return;
+    }
+    clauses.push(`${column} IN (${values.map(() => "?").join(", ")})`);
+    params.push(...values);
   }
-  if (options.project && options.project !== "all") {
-    if (options.project === "unassigned") {
-      clauses.push("pages.project_key = ''");
-    } else {
-      clauses.push("pages.project_key LIKE ?");
-      params.push(`%|${options.project}|%`);
+
+  function buildFilterClauses(params: Array<number | string>): string[] {
+    const clauses: string[] = [];
+    addScalarOrListFilter(clauses, params, "pages.kind", options.kind);
+    addScalarOrListFilter(clauses, params, "pages.status", options.status);
+    if (options.project && options.project !== "all") {
+      if (options.project === "unassigned") {
+        clauses.push("pages.project_key = ''");
+      } else {
+        clauses.push("pages.project_key LIKE ?");
+        params.push(`%|${options.project}|%`);
+      }
+    }
+    addScalarOrListFilter(clauses, params, "pages.source_type", options.sourceType);
+    addScalarOrListFilter(clauses, params, "pages.source_class", options.sourceClass);
+    addScalarOrListFilter(clauses, params, "pages.authority_layer", options.authorityLayer);
+    addScalarOrListFilter(clauses, params, "pages.legal_status", options.legalStatus);
+    addScalarOrListFilter(clauses, params, "pages.document_role", options.documentRole);
+    addScalarOrListFilter(clauses, params, "pages.jurisdiction", options.jurisdiction);
+    if (options.region && options.region !== "all") {
+      clauses.push("pages.region LIKE ?");
+      params.push(`%${options.region}%`);
+    }
+    if (options.pollutant && options.pollutant !== "all") {
+      clauses.push("LOWER(pages.pollutants) LIKE ?");
+      params.push(`%${options.pollutant.toLowerCase()}%`);
+    }
+    if (options.includeDrafts !== true) {
+      clauses.push("(pages.legal_status <> 'draft_consultation' OR pages.legal_status = '')");
+    }
+    if (options.includeSuperseded !== true) {
+      clauses.push("(pages.legal_status <> 'superseded' OR pages.legal_status = '')");
+    }
+    return clauses;
+  }
+
+  function standardCodeExpr(column: string): string {
+    return `UPPER(REPLACE(REPLACE(REPLACE(${column}, ' ', ''), '-', ''), '/', ''))`;
+  }
+
+  function orderBy(): string {
+    return `
+      ORDER BY
+        CASE
+          WHEN ${currentBasisIntent ? 1 : 0} = 1 AND pages.legal_status = 'current_effective' THEN 0
+          WHEN ${currentBasisIntent ? 1 : 0} = 1 AND pages.authority_layer IN ('core', 'method', 'local') THEN 1
+          WHEN ${currentBasisIntent ? 1 : 0} = 1 THEN 2
+          ELSE 0
+        END,
+        CASE
+          WHEN ? <> '' AND (${standardCodeExpr("pages.standard_code_normalized")} = ? OR ${standardCodeExpr("pages.standard_code")} = ?) THEN 0
+          WHEN ? <> '' AND pages.standard_family = ? THEN 1
+          WHEN ? <> '' THEN 2
+          ELSE 0
+        END,
+        CASE pages.status
+          WHEN 'active' THEN 0
+          WHEN 'draft' THEN 1
+          WHEN 'candidate' THEN 2
+          ELSE 3
+        END,
+        CASE pages.kind
+          WHEN 'source' THEN 0
+          WHEN 'module' THEN 1
+          WHEN 'output' THEN 2
+          WHEN 'insight' THEN 3
+          WHEN 'graph_report' THEN 4
+          WHEN 'community_summary' THEN 5
+          WHEN 'concept' THEN 6
+          WHEN 'entity' THEN 7
+          ELSE 8
+        END,
+        rank
+    `;
+  }
+
+  function appendOrderParams(params: Array<number | string>): void {
+    params.push(
+      explicitStandardCompact,
+      explicitStandardCompact,
+      explicitStandardCompact,
+      explicitStandardFamily,
+      explicitStandardFamily,
+      explicitStandardCompact
+    );
+  }
+
+  function appendRows(nextRows: Array<Record<string, unknown>>): void {
+    for (const row of nextRows) {
+      const pageId = String(row.pageId ?? "");
+      if (!pageId || seen.has(pageId)) {
+        continue;
+      }
+      seen.add(pageId);
+      rows.push(row);
+      if (rows.length >= limit) {
+        break;
+      }
     }
   }
-  if (options.sourceType && options.sourceType !== "all") {
-    clauses.push("pages.source_type = ?");
-    params.push(options.sourceType);
-  }
-  if (options.sourceClass && options.sourceClass !== "all") {
-    clauses.push("pages.source_class = ?");
-    params.push(options.sourceClass);
+
+  try {
+    if (ftsQuery) {
+      try {
+        const params: Array<number | string> = [ftsQuery];
+        const clauses = ["page_search MATCH ?", ...buildFilterClauses(params)];
+        appendOrderParams(params);
+        params.push(limit);
+        const statement = db.prepare(`
+          ${selectedColumns("bm25(page_search)", "snippet(page_search, 1, '[', ']', '...', 16)")}
+          FROM page_search
+          JOIN pages ON pages.rowid = page_search.rowid
+          WHERE ${clauses.join(" AND ")}
+          ${orderBy()}
+          LIMIT ?
+        `);
+        appendRows(statement.all(...params) as Array<Record<string, unknown>>);
+      } catch {
+        // Fall back to LIKE retrieval below. This keeps malformed FTS input or
+        // tokenizer edge cases from taking down agent-facing queries.
+      }
+    }
+
+    if (rows.length < limit && likeTerms.length) {
+      const params: Array<number | string> = [];
+      const clauses = buildFilterClauses(params);
+      const likeClauses: string[] = [];
+      for (const term of likeTerms) {
+        const pattern = `%${term.toLowerCase()}%`;
+        likeClauses.push(
+          "(LOWER(pages.title) LIKE ? OR LOWER(pages.body) LIKE ? OR LOWER(pages.search_terms) LIKE ? OR LOWER(pages.standard_code_normalized) LIKE ?)"
+        );
+        params.push(pattern, pattern, pattern, pattern);
+      }
+      clauses.push(`(${likeClauses.join(" OR ")})`);
+      if (seen.size) {
+        clauses.push(`pages.id NOT IN (${[...seen].map(() => "?").join(", ")})`);
+        params.push(...[...seen]);
+      }
+      appendOrderParams(params);
+      params.push(limit - rows.length);
+      const statement = db.prepare(`
+        ${selectedColumns("0", "substr(pages.body, 1, 240)")}
+        FROM pages
+        WHERE ${clauses.join(" AND ")}
+        ${orderBy()}
+        LIMIT ?
+      `);
+      appendRows(statement.all(...params) as Array<Record<string, unknown>>);
+    }
+  } finally {
+    db.close();
   }
 
-  const statement = db.prepare(`
-    SELECT
-      pages.id AS pageId,
-      pages.path AS path,
-      pages.title AS title,
-      pages.kind AS kind,
-      pages.status AS status,
-      pages.source_type AS sourceType,
-      pages.source_class AS sourceClass,
-      pages.project_ids AS projectIds,
-      snippet(page_search, 1, '[', ']', '...', 16) AS snippet,
-      bm25(page_search) AS rank
-    FROM page_search
-    JOIN pages ON pages.rowid = page_search.rowid
-    WHERE ${clauses.join(" AND ")}
-    ORDER BY
-      CASE pages.status
-        WHEN 'active' THEN 0
-        WHEN 'draft' THEN 1
-        WHEN 'candidate' THEN 2
-        ELSE 3
-      END,
-      CASE pages.kind
-        WHEN 'source' THEN 0
-        WHEN 'module' THEN 1
-        WHEN 'output' THEN 2
-        WHEN 'insight' THEN 3
-        WHEN 'graph_report' THEN 4
-        WHEN 'community_summary' THEN 5
-        WHEN 'concept' THEN 6
-        WHEN 'entity' THEN 7
-        ELSE 8
-      END,
-      rank
-    LIMIT ?
-  `);
-  params.push(options.limit ?? 5);
-  const rows = statement.all(...params) as Array<Record<string, unknown>>;
-  db.close();
   return rows.map((row) => ({
     projectIds: (() => {
       const raw = String(row.projectIds ?? "[]");
@@ -320,6 +528,16 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
     status: normalizeStatus(row.status),
     sourceType: normalizeSourceType(row.sourceType),
     sourceClass: normalizeSourceClass(row.sourceClass),
+    authorityLayer: String(row.authorityLayer ?? "") || undefined,
+    legalStatus: String(row.legalStatus ?? "") || undefined,
+    documentRole: String(row.documentRole ?? "") || undefined,
+    jurisdiction: String(row.jurisdiction ?? "") || undefined,
+    region: String(row.region ?? "") || undefined,
+    standardCode: String(row.standardCode ?? "") || undefined,
+    pollutants: String(row.pollutants ?? "")
+      .split("|")
+      .map((item) => item.trim())
+      .filter(Boolean),
     snippet: String(row.snippet ?? ""),
     rank: Number(row.rank ?? 0)
   }));

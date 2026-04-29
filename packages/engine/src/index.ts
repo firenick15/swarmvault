@@ -14,6 +14,18 @@ export {
   renderContextPackMarkdown
 } from "./context-packs.js";
 export {
+  authorityLayerRank,
+  buildEnvAirSearchText,
+  classifyRecommendedNextTool,
+  envAirSearchTerms,
+  extractStandardReferences,
+  normalizePollutantName,
+  normalizeStandardCode,
+  searchLikeTerms,
+  standardSearchTokens
+} from "./domain/env-air.js";
+export { applyStandardRelationOverrides } from "./domain/standard-relations.js";
+export {
   applyDecayToPages,
   computeDecayScore,
   DEFAULT_HALF_LIFE_DAYS,
@@ -119,6 +131,7 @@ export {
   reviewSourceScope
 } from "./sources.js";
 export { estimatePageTokens, estimateTokens, trimToTokenBudget } from "./token-estimation.js";
+export { contentTokens, searchTokens, tokenize } from "./tokenize.js";
 export type * from "./types.js";
 export {
   acceptApproval,
@@ -142,6 +155,7 @@ export {
   pathGraphVault,
   previewCandidatePromotions,
   promoteCandidate,
+  providerSmokeTest,
   queryGraphVault,
   queryVault,
   readApproval,

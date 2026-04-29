@@ -10,7 +10,7 @@ import type {
   ProviderCapability,
   ProviderType
 } from "../types.js";
-import { extractJson } from "../utils.js";
+import { extractJson, truncate } from "../utils.js";
 import { BaseProviderAdapter } from "./base.js";
 
 export interface OpenAiCompatibleOptions {
@@ -19,6 +19,10 @@ export interface OpenAiCompatibleOptions {
   headers?: Record<string, string>;
   apiStyle?: "responses" | "chat";
   capabilities: ProviderCapability[];
+  structuredOutputMode?: "json_schema" | "json_object" | "prompt_json";
+  maxRetries?: number;
+  timeoutMs?: number;
+  debugProviderErrors?: boolean;
 }
 
 function buildAuthHeaders(apiKey?: string): Record<string, string> {
@@ -141,11 +145,19 @@ function buildStructuredFormat(schema: z.ZodTypeAny) {
   };
 }
 
+function truncateErrorBody(value: string): string {
+  return truncate(value.replace(/\s+/g, " ").trim(), 360);
+}
+
 export class OpenAiCompatibleProviderAdapter extends BaseProviderAdapter {
   private readonly baseUrl: string;
   private readonly apiKey?: string;
   private readonly headers?: Record<string, string>;
   private readonly apiStyle: "responses" | "chat";
+  private readonly structuredOutputMode: "json_schema" | "json_object" | "prompt_json";
+  private readonly maxRetries: number;
+  private readonly timeoutMs: number;
+  private readonly debugProviderErrors: boolean;
 
   public constructor(id: string, type: ProviderType, model: string, options: OpenAiCompatibleOptions) {
     super(id, type, model, options.capabilities);
@@ -153,6 +165,10 @@ export class OpenAiCompatibleProviderAdapter extends BaseProviderAdapter {
     this.apiKey = options.apiKey;
     this.headers = options.headers;
     this.apiStyle = options.apiStyle ?? "responses";
+    this.structuredOutputMode = options.structuredOutputMode ?? (type === "openai" ? "json_schema" : "json_object");
+    this.maxRetries = Math.max(0, options.maxRetries ?? 1);
+    this.timeoutMs = Math.max(1_000, options.timeoutMs ?? 120_000);
+    this.debugProviderErrors = options.debugProviderErrors ?? true;
   }
 
   public async generateText(request: GenerationRequest): Promise<GenerationResponse> {
@@ -163,27 +179,87 @@ export class OpenAiCompatibleProviderAdapter extends BaseProviderAdapter {
   }
 
   public async generateStructured<T>(request: GenerationRequest, schema: z.ZodType<T>): Promise<T> {
-    if (this.type !== "openai") {
-      return super.generateStructured(request, schema);
-    }
-
     const structuredFormat = buildStructuredFormat(schema);
-    const text =
-      this.apiStyle === "chat"
-        ? await this.generateStructuredViaChatCompletions(
-            {
-              ...request
-            },
-            structuredFormat
-          )
-        : await this.generateStructuredViaResponses(
-            {
-              ...request
-            },
-            structuredFormat
-          );
+    const readStructured = async (repair = false): Promise<string> => {
+      const repairHint = repair ? "\n\nYour previous response was not valid JSON. Return ONLY valid JSON matching the schema." : "";
+      const schemaPrompt = `JSON schema:\n${JSON.stringify(structuredFormat.schema)}`;
+      const mergedSystem = [request.system, this.structuredOutputMode === "json_schema" ? "" : schemaPrompt].filter(Boolean).join("\n\n");
+      const mergedRequest: GenerationRequest = {
+        ...request,
+        system: mergedSystem || undefined,
+        prompt: `${request.prompt}${repairHint}`
+      };
 
-    return schema.parse(stripNullObjectProperties(JSON.parse(extractJson(text))));
+      if (this.apiStyle === "chat") {
+        return this.generateStructuredViaChatCompletions(mergedRequest, structuredFormat, this.structuredOutputMode);
+      }
+      return this.generateStructuredViaResponses(mergedRequest, structuredFormat, this.structuredOutputMode);
+    };
+
+    try {
+      const text = await readStructured(false);
+      return schema.parse(stripNullObjectProperties(JSON.parse(extractJson(text))));
+    } catch (error) {
+      const text = await readStructured(true);
+      try {
+        return schema.parse(stripNullObjectProperties(JSON.parse(extractJson(text))));
+      } catch {
+        throw error;
+      }
+    }
+  }
+
+  private async requestJson(endpoint: string, body: unknown, init?: { formData?: FormData }): Promise<unknown> {
+    const url = `${this.baseUrl}${endpoint}`;
+    const attempts = this.maxRetries + 1;
+    let lastError: Error | null = null;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
+      try {
+        const response = await fetch(url, {
+          method: "POST",
+          headers: init?.formData
+            ? {
+                ...buildAuthHeaders(this.apiKey),
+                ...this.headers
+              }
+            : {
+                "content-type": "application/json",
+                ...buildAuthHeaders(this.apiKey),
+                ...this.headers
+              },
+          body: init?.formData ? init.formData : JSON.stringify(body),
+          signal: controller.signal
+        });
+        if (!response.ok) {
+          const errorBody = await response.text().catch(() => "");
+          const summary = this.debugProviderErrors && errorBody ? ` body=${truncateErrorBody(errorBody)}` : "";
+          const message = `Provider ${this.id} failed: ${response.status} ${response.statusText}${summary}`;
+          const retriable = response.status === 429 || response.status >= 500;
+          if (attempt < attempts - 1 && retriable) {
+            lastError = new Error(message);
+            continue;
+          }
+          throw new Error(message);
+        }
+        return await response.json();
+      } catch (error) {
+        const message =
+          error instanceof Error && error.name === "AbortError"
+            ? `Provider ${this.id} timed out after ${this.timeoutMs}ms.`
+            : error instanceof Error
+              ? error.message
+              : String(error);
+        lastError = new Error(message);
+        if (attempt >= attempts - 1) {
+          throw lastError;
+        }
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
+    throw lastError ?? new Error(`Provider ${this.id} failed.`);
   }
 
   public async embedTexts(texts: string[]): Promise<number[][]> {
@@ -191,24 +267,10 @@ export class OpenAiCompatibleProviderAdapter extends BaseProviderAdapter {
       return [];
     }
 
-    const response = await fetch(`${this.baseUrl}/embeddings`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        ...buildAuthHeaders(this.apiKey),
-        ...this.headers
-      },
-      body: JSON.stringify({
-        model: this.model,
-        input: texts
-      })
-    });
-
-    if (!response.ok) {
-      throw new Error(`Provider ${this.id} failed: ${response.status} ${response.statusText}`);
-    }
-
-    const payload = (await response.json()) as {
+    const payload = (await this.requestJson("/embeddings", {
+      model: this.model,
+      input: texts
+    })) as {
       data?: Array<{ embedding?: number[] }>;
     };
     const vectors = payload.data?.map((item) => item.embedding ?? []) ?? [];
@@ -220,34 +282,20 @@ export class OpenAiCompatibleProviderAdapter extends BaseProviderAdapter {
 
   public async generateImage(request: ImageGenerationRequest): Promise<ImageGenerationResponse> {
     const encodedAttachments = await this.encodeAttachments(request.attachments);
-    const response = await fetch(`${this.baseUrl}/images/generations`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        ...buildAuthHeaders(this.apiKey),
-        ...this.headers
-      },
-      body: JSON.stringify({
-        model: this.model,
-        prompt: request.prompt,
-        size:
-          request.width && request.height
-            ? `${Math.max(256, Math.round(request.width))}x${Math.max(256, Math.round(request.height))}`
-            : undefined,
-        response_format: "b64_json",
-        ...(encodedAttachments.length
-          ? {
-              input_image: encodedAttachments.map((item) => `data:${item.mimeType};base64,${item.base64}`)
-            }
-          : {})
-      })
-    });
-
-    if (!response.ok) {
-      throw new Error(`Provider ${this.id} failed: ${response.status} ${response.statusText}`);
-    }
-
-    const payload = (await response.json()) as {
+    const payload = (await this.requestJson("/images/generations", {
+      model: this.model,
+      prompt: request.prompt,
+      size:
+        request.width && request.height
+          ? `${Math.max(256, Math.round(request.width))}x${Math.max(256, Math.round(request.height))}`
+          : undefined,
+      response_format: "b64_json",
+      ...(encodedAttachments.length
+        ? {
+            input_image: encodedAttachments.map((item) => `data:${item.mimeType};base64,${item.base64}`)
+          }
+        : {})
+    })) as {
       data?: Array<{ b64_json?: string; revised_prompt?: string }>;
     };
     const image = payload.data?.[0];
@@ -279,20 +327,7 @@ export class OpenAiCompatibleProviderAdapter extends BaseProviderAdapter {
       formData.append("prompt", request.corpusHint);
     }
 
-    const response = await fetch(`${this.baseUrl}/audio/transcriptions`, {
-      method: "POST",
-      headers: {
-        ...buildAuthHeaders(this.apiKey),
-        ...this.headers
-      },
-      body: formData
-    });
-
-    if (!response.ok) {
-      throw new Error(`Provider ${this.id} audio transcription failed: ${response.status} ${response.statusText}`);
-    }
-
-    const payload = (await response.json()) as {
+    const payload = (await this.requestJson("/audio/transcriptions", {}, { formData })) as {
       text?: string;
       duration?: number;
       language?: string;
@@ -322,26 +357,12 @@ export class OpenAiCompatibleProviderAdapter extends BaseProviderAdapter {
         ]
       : request.prompt;
 
-    const response = await fetch(`${this.baseUrl}/responses`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        ...buildAuthHeaders(this.apiKey),
-        ...this.headers
-      },
-      body: JSON.stringify({
-        model: this.model,
-        input,
-        instructions: request.system,
-        max_output_tokens: request.maxOutputTokens
-      })
-    });
-
-    if (!response.ok) {
-      throw new Error(`Provider ${this.id} failed: ${response.status} ${response.statusText}`);
-    }
-
-    const payload = (await response.json()) as ResponsesApiPayload;
+    const payload = (await this.requestJson("/responses", {
+      model: this.model,
+      input,
+      instructions: request.system,
+      max_output_tokens: request.maxOutputTokens
+    })) as ResponsesApiPayload;
     return {
       text: extractResponsesText(payload),
       usage: payload.usage ? { inputTokens: payload.usage.input_tokens, outputTokens: payload.usage.output_tokens } : undefined
@@ -350,7 +371,8 @@ export class OpenAiCompatibleProviderAdapter extends BaseProviderAdapter {
 
   private async generateStructuredViaResponses(
     request: GenerationRequest,
-    format: ReturnType<typeof buildStructuredFormat>
+    format: ReturnType<typeof buildStructuredFormat>,
+    mode: "json_schema" | "json_object" | "prompt_json"
   ): Promise<string> {
     const encodedAttachments = await this.encodeAttachments(request.attachments);
     const input = encodedAttachments.length
@@ -368,29 +390,19 @@ export class OpenAiCompatibleProviderAdapter extends BaseProviderAdapter {
         ]
       : request.prompt;
 
-    const response = await fetch(`${this.baseUrl}/responses`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        ...buildAuthHeaders(this.apiKey),
-        ...this.headers
-      },
-      body: JSON.stringify({
-        model: this.model,
-        input,
-        instructions: request.system,
-        max_output_tokens: request.maxOutputTokens,
-        text: {
-          format
-        }
-      })
-    });
-
-    if (!response.ok) {
-      throw new Error(`Provider ${this.id} failed: ${response.status} ${response.statusText}`);
-    }
-
-    const payload = (await response.json()) as ResponsesApiPayload;
+    const payload = (await this.requestJson("/responses", {
+      model: this.model,
+      input,
+      instructions: request.system,
+      max_output_tokens: request.maxOutputTokens,
+      ...(mode === "json_schema"
+        ? {
+            text: {
+              format
+            }
+          }
+        : {})
+    })) as ResponsesApiPayload;
     return extractResponsesText(payload);
   }
 
@@ -410,25 +422,11 @@ export class OpenAiCompatibleProviderAdapter extends BaseProviderAdapter {
 
     const messages = [...(request.system ? [{ role: "system", content: request.system }] : []), { role: "user", content }];
 
-    const response = await fetch(`${this.baseUrl}/chat/completions`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        ...buildAuthHeaders(this.apiKey),
-        ...this.headers
-      },
-      body: JSON.stringify({
-        model: this.model,
-        messages,
-        max_tokens: request.maxOutputTokens
-      })
-    });
-
-    if (!response.ok) {
-      throw new Error(`Provider ${this.id} failed: ${response.status} ${response.statusText}`);
-    }
-
-    const payload = (await response.json()) as {
+    const payload = (await this.requestJson("/chat/completions", {
+      model: this.model,
+      messages,
+      max_tokens: request.maxOutputTokens
+    })) as {
       choices?: Array<{ message?: { content?: string | Array<{ type?: string; text?: string }> } }>;
       usage?: { prompt_tokens?: number; completion_tokens?: number };
     };
@@ -442,7 +440,8 @@ export class OpenAiCompatibleProviderAdapter extends BaseProviderAdapter {
 
   private async generateStructuredViaChatCompletions(
     request: GenerationRequest,
-    format: ReturnType<typeof buildStructuredFormat>
+    format: ReturnType<typeof buildStructuredFormat>,
+    mode: "json_schema" | "json_object" | "prompt_json"
   ): Promise<string> {
     const encodedAttachments = await this.encodeAttachments(request.attachments);
     const content = encodedAttachments.length
@@ -459,29 +458,25 @@ export class OpenAiCompatibleProviderAdapter extends BaseProviderAdapter {
 
     const messages = [...(request.system ? [{ role: "system", content: request.system }] : []), { role: "user", content }];
 
-    const response = await fetch(`${this.baseUrl}/chat/completions`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        ...buildAuthHeaders(this.apiKey),
-        ...this.headers
-      },
-      body: JSON.stringify({
-        model: this.model,
-        messages,
-        max_tokens: request.maxOutputTokens,
-        response_format: {
-          type: "json_schema",
-          json_schema: format
-        }
-      })
-    });
-
-    if (!response.ok) {
-      throw new Error(`Provider ${this.id} failed: ${response.status} ${response.statusText}`);
-    }
-
-    const payload = (await response.json()) as {
+    const payload = (await this.requestJson("/chat/completions", {
+      model: this.model,
+      messages,
+      max_tokens: request.maxOutputTokens,
+      ...(mode === "json_schema"
+        ? {
+            response_format: {
+              type: "json_schema",
+              json_schema: format
+            }
+          }
+        : mode === "json_object"
+          ? {
+              response_format: {
+                type: "json_object"
+              }
+            }
+          : {})
+    })) as {
       choices?: Array<{ message?: { content?: string | Array<{ type?: string; text?: string }> } }>;
     };
     const contentValue = payload.choices?.[0]?.message?.content;

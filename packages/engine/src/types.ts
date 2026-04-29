@@ -237,11 +237,17 @@ export interface ProviderConfig {
   type: ProviderType;
   model: string;
   baseUrl?: string;
+  apiKey?: string;
   apiKeyEnv?: string;
+  apiKeyFile?: string;
   headers?: Record<string, string>;
   module?: string;
   capabilities?: ProviderCapability[];
   apiStyle?: "responses" | "chat";
+  structuredOutputMode?: "json_schema" | "json_object" | "prompt_json";
+  maxRetries?: number;
+  timeoutMs?: number;
+  debugProviderErrors?: boolean;
   /** local-whisper: override the binary discovery search. */
   binaryPath?: string;
   /** local-whisper: explicit path to the ggml model file. */
@@ -367,6 +373,18 @@ export interface VaultConfig {
     rerank?: boolean;
     embeddingProvider?: string;
     maxIndexedRows?: number;
+  };
+  analysis?: {
+    failurePolicy?: "fail" | "warn";
+    maxFallbackRatio?: number;
+  };
+  domain?: {
+    profileId?: string;
+    profilePath?: string;
+    metadataSchemaPath?: string;
+    termsPath?: string;
+    rankingPath?: string;
+    promptsDir?: string;
   };
   webSearch?: {
     providers: Record<string, WebSearchProviderConfig>;
@@ -845,9 +863,68 @@ export interface SourceAnalysis {
   claims: SourceClaim[];
   questions: string[];
   tags: string[];
+  domain?: DomainMetadata;
+  analysisMode?: "provider" | "heuristic" | "vision" | "code" | "empty";
+  providerId?: string;
+  providerModel?: string;
+  warnings?: string[];
   rationales: SourceRationale[];
   code?: CodeAnalysis;
   producedAt: string;
+}
+
+export type AuthorityLayer = "core" | "method" | "evidence" | "evolution" | "local" | "international" | "project" | "unknown";
+export type LegalForce = "mandatory" | "recommended" | "explanatory" | "statistical" | "research" | "draft" | "superseded" | "unknown";
+export type DocumentRole =
+  | "law"
+  | "regulation"
+  | "policy"
+  | "standard"
+  | "monitoring_method"
+  | "qa_qc"
+  | "emission_standard"
+  | "technical_guide"
+  | "statistics"
+  | "official_explanation"
+  | "whitepaper"
+  | "research_literature"
+  | "draft"
+  | "compilation_explanation"
+  | "amendment"
+  | "local_reference"
+  | "international_reference"
+  | "unknown";
+export type LegalStatus =
+  | "current_effective"
+  | "issued_not_yet_effective"
+  | "draft_consultation"
+  | "superseded"
+  | "amended"
+  | "explanation_only"
+  | "unknown";
+export type MetadataSource = "sidecar" | "rule" | "llm" | "mixed";
+export type MetadataVerificationState = "unreviewed" | "rule_verified" | "human_verified";
+
+export interface DomainMetadata {
+  authorityLayer: AuthorityLayer;
+  legalForce: LegalForce;
+  documentRole: DocumentRole;
+  legalStatus: LegalStatus;
+  jurisdiction: "national" | "province" | "city" | "international" | "unknown";
+  region?: string;
+  standardCode?: string;
+  publishDate?: string;
+  effectiveDate?: string;
+  replaces?: string[];
+  replacedBy?: string[];
+  pollutants?: string[];
+  useFor?: string[];
+  doNotUseFor?: string[];
+  confidence?: number;
+  notes?: string[];
+  metadataSource?: MetadataSource;
+  verificationState?: MetadataVerificationState;
+  llmUncertainFields?: string[];
 }
 
 export interface GraphNode {
@@ -1339,6 +1416,10 @@ export interface CompileOptions {
   approve?: boolean;
   codeOnly?: boolean;
   maxTokens?: number;
+  failOnFallback?: boolean;
+  forceAnalysis?: boolean;
+  topicSynthesis?: boolean;
+  topicReview?: boolean;
 }
 
 export interface InitOptions {
@@ -1371,6 +1452,28 @@ export interface CompileResult {
     pagesKept: number;
     pagesDropped: number;
   };
+  analysisStats?: {
+    total: number;
+    provider: number;
+    heuristic: number;
+    vision: number;
+    code: number;
+    empty: number;
+    fallbackCount: number;
+    fallbackRatio: number;
+    failedSourceIds: string[];
+  };
+}
+
+export interface ProviderSmokeTestResult {
+  providerId: string;
+  providerType: ProviderType;
+  providerModel: string;
+  textOk: boolean;
+  structuredOk: boolean;
+  textPreview?: string;
+  structuredPreview?: unknown;
+  errors: string[];
 }
 
 export interface SearchResult {
@@ -1384,6 +1487,13 @@ export interface SearchResult {
   projectIds: string[];
   sourceType?: SourceCaptureType;
   sourceClass?: SourceClass;
+  authorityLayer?: string;
+  legalStatus?: string;
+  documentRole?: string;
+  jurisdiction?: string;
+  region?: string;
+  standardCode?: string;
+  pollutants?: string[];
 }
 
 export interface RetrievalConfig {
@@ -1436,6 +1546,44 @@ export interface QueryOptions {
   review?: boolean;
   gapFill?: boolean;
   memoryTaskId?: string;
+  intent?: "current_basis" | "explanation" | "evolution" | "local" | "statistics" | "report_writing" | "research";
+  region?: string;
+  pollutants?: string[];
+  includeDrafts?: boolean;
+  includeSuperseded?: boolean;
+  requireCurrentBasis?: boolean;
+  scope?: "public_only" | "tenant_only" | "project_only" | "mixed_public_private";
+  tenantId?: string;
+  projectId?: string;
+  evidenceMode?: "strict" | "balanced" | "exploratory";
+  strictGrounding?: boolean;
+  debugContext?: boolean;
+}
+
+export type EvidenceState = "grounded" | "partial" | "insufficient";
+export type RecommendedNextTool = "knowledge_base" | "environment_data_mcp" | "both";
+
+export interface RetrievalDebugEvidenceItem {
+  id: string;
+  kind: "source" | "web";
+  citation: string;
+  pageId?: string;
+  sourceId?: string;
+  title: string;
+  authorityLayer?: string;
+  legalStatus?: string;
+  documentRole?: string;
+  standardCode?: string;
+  region?: string;
+  excerpt: string;
+}
+
+export interface RetrievalDebugInfo {
+  query: string;
+  searchOptions: Record<string, unknown>;
+  evidenceItems: RetrievalDebugEvidenceItem[];
+  usedEvidenceIds: string[];
+  warnings: string[];
 }
 
 export interface QueryResult {
@@ -1453,6 +1601,11 @@ export interface QueryResult {
   approvalId?: string;
   approvalDir?: string;
   outputAssets: OutputAsset[];
+  evidenceState?: EvidenceState;
+  groundingWarnings?: string[];
+  invalidCitations?: string[];
+  recommendedNextTool?: RecommendedNextTool;
+  retrievalDebug?: RetrievalDebugInfo;
 }
 
 export interface LintFinding {

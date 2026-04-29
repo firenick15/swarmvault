@@ -64,6 +64,7 @@ import {
   pathGraphVault,
   previewCandidatePromotions,
   promoteCandidate,
+  providerSmokeTest,
   pushGraphNeo4j,
   queryGraphVault,
   queryVault,
@@ -821,31 +822,45 @@ program
   .option("--approve", "Stage a review bundle without applying active page changes", false)
   .option("--commit", "Auto-commit wiki and state changes after compile")
   .option("--max-tokens <n>", "Cap wiki output by trimming lower-priority pages")
-  .action(async (options: { approve?: boolean; commit?: boolean; maxTokens?: string }) => {
-    const maxTokens = options.maxTokens ? parsePositiveInt(options.maxTokens, 0) || undefined : undefined;
-    const result = await compileVault(process.cwd(), { approve: options.approve ?? false, maxTokens });
-    if (isJson()) {
-      emitJson(result);
-    } else {
-      if (result.staged) {
-        log(`Staged ${result.changedPages.length} change(s) for review at ${result.approvalDir}.`);
-      } else {
-        log(`Compiled ${result.sourceCount} source(s), ${result.pageCount} page(s). Changed: ${result.changedPages.length}.`);
-      }
-      if (result.tokenStats) {
-        log(
-          `Token budget: ~${result.tokenStats.estimatedTokens} tokens, kept ${result.tokenStats.pagesKept} pages, dropped ${result.tokenStats.pagesDropped}.`
-        );
-      }
-    }
-    if (options.commit) {
-      const msg = await autoCommitWikiChanges(process.cwd(), "compile", `${result.sourceCount} sources, ${result.pageCount} pages`, {
-        force: true
+  .option("--fail-on-fallback", "Fail compile when provider analysis falls back to heuristics", false)
+  .option("--force-analysis", "Re-run source analysis for all sources regardless of cache", false)
+  .action(
+    async (options: { approve?: boolean; commit?: boolean; maxTokens?: string; failOnFallback?: boolean; forceAnalysis?: boolean }) => {
+      const maxTokens = options.maxTokens ? parsePositiveInt(options.maxTokens, 0) || undefined : undefined;
+      const result = await compileVault(process.cwd(), {
+        approve: options.approve ?? false,
+        maxTokens,
+        failOnFallback: options.failOnFallback ?? false,
+        forceAnalysis: options.forceAnalysis ?? false
       });
-      if (msg && !isJson()) log(`Committed: ${msg}`);
+      if (isJson()) {
+        emitJson(result);
+      } else {
+        if (result.staged) {
+          log(`Staged ${result.changedPages.length} change(s) for review at ${result.approvalDir}.`);
+        } else {
+          log(`Compiled ${result.sourceCount} source(s), ${result.pageCount} page(s). Changed: ${result.changedPages.length}.`);
+        }
+        if (result.tokenStats) {
+          log(
+            `Token budget: ~${result.tokenStats.estimatedTokens} tokens, kept ${result.tokenStats.pagesKept} pages, dropped ${result.tokenStats.pagesDropped}.`
+          );
+        }
+        if (result.analysisStats) {
+          log(
+            `Analysis: total=${result.analysisStats.total}, provider=${result.analysisStats.provider}, heuristic=${result.analysisStats.heuristic}, fallback=${result.analysisStats.fallbackCount} (${(result.analysisStats.fallbackRatio * 100).toFixed(2)}%).`
+          );
+        }
+      }
+      if (options.commit) {
+        const msg = await autoCommitWikiChanges(process.cwd(), "compile", `${result.sourceCount} sources, ${result.pageCount} pages`, {
+          force: true
+        });
+        if (msg && !isJson()) log(`Committed: ${msg}`);
+      }
+      await maybeEmitHeuristicNotice(["compile"]);
     }
-    await maybeEmitHeuristicNotice(["compile"]);
-  });
+  );
 
 program
   .command("consolidate")
@@ -874,6 +889,18 @@ program
   .option("--gap-fill", "Pull external web-search evidence when the local wiki has gaps (requires webSearch.tasks.queryProvider).")
   .option("--task <id>", "Attach this query output to an agent task")
   .option("--memory <id>", "Compatibility alias for --task")
+  .option("--intent <intent>", "Query intent (current_basis|explanation|evolution|local|statistics|report_writing|research)")
+  .option("--region <region>", "Region/city/province for local applicability filtering")
+  .option("--pollutant <name>", "Primary pollutant focus (for example PM2.5, O3)")
+  .option("--include-drafts", "Include draft consultation materials in retrieval", false)
+  .option("--include-superseded", "Include superseded materials in retrieval", false)
+  .option("--require-current-basis", "Require current effective basis materials", false)
+  .option("--evidence-mode <mode>", "Grounding mode (strict|balanced|exploratory)")
+  .option("--strict-grounding", "Only answer when retrieved evidence is sufficient", false)
+  .option("--debug-context", "Return retrieval evidence and grounding diagnostics in JSON output", false)
+  .option("--scope <scope>", "Access scope (public_only|tenant_only|project_only|mixed_public_private)")
+  .option("--tenant-id <id>", "Tenant id for scoped retrieval")
+  .option("--project-id <id>", "Project id for scoped retrieval")
   .addOption(
     new Option("--format <format>", "Output format").choices(["markdown", "report", "slides", "chart", "image"]).default("markdown")
   )
@@ -887,6 +914,18 @@ program
         task?: string;
         memory?: string;
         format?: "markdown" | "report" | "slides" | "chart" | "image";
+        intent?: "current_basis" | "explanation" | "evolution" | "local" | "statistics" | "report_writing" | "research";
+        region?: string;
+        pollutant?: string;
+        includeDrafts?: boolean;
+        includeSuperseded?: boolean;
+        requireCurrentBasis?: boolean;
+        evidenceMode?: "strict" | "balanced" | "exploratory";
+        strictGrounding?: boolean;
+        debugContext?: boolean;
+        scope?: "public_only" | "tenant_only" | "project_only" | "mixed_public_private";
+        tenantId?: string;
+        projectId?: string;
       }
     ) => {
       const result = await queryVault(process.cwd(), {
@@ -894,12 +933,30 @@ program
         save: options.save ?? true,
         format: options.format,
         gapFill: options.gapFill ?? false,
-        memoryTaskId: options.task ?? options.memory
+        memoryTaskId: options.task ?? options.memory,
+        intent: options.intent,
+        region: options.region,
+        pollutants: options.pollutant ? [options.pollutant] : undefined,
+        includeDrafts: options.includeDrafts ?? false,
+        includeSuperseded: options.includeSuperseded ?? false,
+        requireCurrentBasis: options.requireCurrentBasis ?? false,
+        evidenceMode: options.evidenceMode,
+        strictGrounding: options.strictGrounding ?? false,
+        debugContext: options.debugContext ?? false,
+        scope: options.scope,
+        tenantId: options.tenantId,
+        projectId: options.projectId
       });
       if (isJson()) {
         emitJson(result);
       } else {
         log(result.answer);
+        if (result.evidenceState) {
+          log(`Evidence: ${result.evidenceState}${result.recommendedNextTool ? `; next=${result.recommendedNextTool}` : ""}`);
+        }
+        if (result.groundingWarnings?.length) {
+          log(`Warnings: ${result.groundingWarnings.join("; ")}`);
+        }
         if (result.savedPath) {
           log(`Saved to ${result.savedPath}`);
         }
@@ -1926,6 +1983,29 @@ provider
       log(`Set tasks.audioProvider = "local-whisper".`);
     } else if (registration.previousAudioProvider && registration.previousAudioProvider !== "local-whisper") {
       log(`Left tasks.audioProvider = "${registration.previousAudioProvider}" untouched (use --set-audio-provider to override).`);
+    }
+  });
+
+provider
+  .command("test")
+  .description("Run a smoke test for a configured provider id (text + structured).")
+  .argument("<provider-id>", "Provider id from swarmvault.config.json")
+  .action(async (providerId: string) => {
+    const result = await providerSmokeTest(process.cwd(), providerId);
+    if (isJson()) {
+      emitJson(result);
+      return;
+    }
+    log(`Provider ${result.providerId} (${result.providerType}/${result.providerModel})`);
+    log(`- text: ${result.textOk ? "ok" : "failed"}`);
+    log(`- structured: ${result.structuredOk ? "ok" : "failed"}`);
+    if (result.textPreview) {
+      log(`- text preview: ${result.textPreview}`);
+    }
+    if (result.errors.length) {
+      for (const error of result.errors) {
+        log(`- error: ${error}`);
+      }
     }
   });
 

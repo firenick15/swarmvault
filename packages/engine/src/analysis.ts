@@ -2,6 +2,7 @@ import path from "node:path";
 import nlp from "compromise";
 import { z } from "zod";
 import { analyzeCodeSource } from "./code-analysis.js";
+import { extractStandardReferences } from "./domain/env-air.js";
 import { readExtractionArtifact } from "./ingest.js";
 import {
   extractRationaleFromMarkdown,
@@ -13,6 +14,7 @@ import {
 import type { VaultSchema } from "./schema.js";
 import { contentTokens } from "./tokenize.js";
 import type {
+  DomainMetadata,
   Polarity,
   ProviderAdapter,
   ResolvedPaths,
@@ -24,7 +26,71 @@ import type {
 } from "./types.js";
 import { firstSentences, normalizeWhitespace, readJsonFile, sha256, slugify, truncate, uniqueBy, writeJsonFile } from "./utils.js";
 
-const ANALYSIS_FORMAT_VERSION = 8;
+const ANALYSIS_FORMAT_VERSION = 9;
+
+const domainMetadataSchema = z
+  .object({
+    authorityLayer: z.enum(["core", "method", "evidence", "evolution", "local", "international", "project", "unknown"]).default("unknown"),
+    legalForce: z
+      .enum(["mandatory", "recommended", "explanatory", "statistical", "research", "draft", "superseded", "unknown"])
+      .default("unknown"),
+    documentRole: z
+      .enum([
+        "law",
+        "regulation",
+        "policy",
+        "standard",
+        "monitoring_method",
+        "qa_qc",
+        "emission_standard",
+        "technical_guide",
+        "statistics",
+        "official_explanation",
+        "whitepaper",
+        "research_literature",
+        "draft",
+        "compilation_explanation",
+        "amendment",
+        "local_reference",
+        "international_reference",
+        "unknown"
+      ])
+      .default("unknown"),
+    legalStatus: z
+      .enum(["current_effective", "issued_not_yet_effective", "draft_consultation", "superseded", "amended", "explanation_only", "unknown"])
+      .default("unknown"),
+    jurisdiction: z.enum(["national", "province", "city", "international", "unknown"]).default("unknown"),
+    region: z.string().min(1).optional(),
+    standardCode: z.string().min(1).optional(),
+    publishDate: z.string().min(1).optional(),
+    effectiveDate: z.string().min(1).optional(),
+    replaces: z.array(z.string().min(1)).default([]),
+    replacedBy: z.array(z.string().min(1)).default([]),
+    pollutants: z.array(z.string().min(1)).default([]),
+    useFor: z.array(z.string().min(1)).default([]),
+    doNotUseFor: z.array(z.string().min(1)).default([]),
+    confidence: z.number().min(0).max(1).optional(),
+    notes: z.array(z.string().min(1)).default([]),
+    metadataSource: z.enum(["sidecar", "rule", "llm", "mixed"]).default("llm"),
+    verificationState: z.enum(["unreviewed", "rule_verified", "human_verified"]).default("unreviewed"),
+    llmUncertainFields: z.array(z.string().min(1)).default([])
+  })
+  .default({
+    authorityLayer: "unknown",
+    legalForce: "unknown",
+    documentRole: "unknown",
+    legalStatus: "unknown",
+    jurisdiction: "unknown",
+    replaces: [],
+    replacedBy: [],
+    pollutants: [],
+    useFor: [],
+    doNotUseFor: [],
+    notes: [],
+    metadataSource: "llm",
+    verificationState: "unreviewed",
+    llmUncertainFields: []
+  });
 
 const sourceAnalysisSchema = z.object({
   title: z.string().min(1),
@@ -50,7 +116,8 @@ const sourceAnalysisSchema = z.object({
     .max(8)
     .default([]),
   questions: z.array(z.string()).max(6).default([]),
-  tags: z.array(z.string()).max(5).default([])
+  tags: z.array(z.string()).max(5).default([]),
+  domain: domainMetadataSchema.optional()
 });
 
 const HEURISTIC_SECTION_SOURCE_KINDS = new Map<SourceManifest["sourceKind"], string>([
@@ -87,6 +154,125 @@ const MARKDOWN_RATIONALE_KINDS = new Set<SourceKind>([
  * paragraph-isolated block, never on the whole file.
  */
 const PLAIN_TEXT_RATIONALE_KINDS = new Set<SourceKind>(["text", "transcript", "chat_export", "email", "calendar"]);
+
+const ENV_TERM_ALLOWLIST = new Set(["pm2.5", "pm10", "o3", "so2", "no2", "co", "aqi", "iaqi", "vocs", "nmhc"]);
+
+function normalizeEnvAirText(content: string): string {
+  const normalized = content
+    .replace(/\bP\s*M\s*2\s*\.?\s*5\b/gi, "PM2.5")
+    .replace(/\bP\s*M\s*1\s*0\b/gi, "PM10")
+    .replace(/\bO\s*3\b/gi, "O3")
+    .replace(/\bN\s*O\s*2\b/gi, "NO2")
+    .replace(/\bS\s*O\s*2\b/gi, "SO2")
+    .replace(/\bG\s*B\s*([0-9]{3,5})\b/gi, "GB $1")
+    .replace(/\bH\s*J\s*([0-9]{3,5})\b/gi, "HJ $1");
+  return normalizeWhitespace(normalized);
+}
+
+function isLikelyNoiseTerm(term: string): boolean {
+  const normalized = term.trim();
+  if (!normalized) {
+    return true;
+  }
+  const lower = normalized.toLowerCase();
+  if (ENV_TERM_ALLOWLIST.has(lower)) {
+    return false;
+  }
+  if (/^[0-9]+([.:/-][0-9]+)*$/.test(normalized)) {
+    return true;
+  }
+  if (/^[=+*/(){}[\]\\<>-]+$/.test(normalized)) {
+    return true;
+  }
+  if (/^[a-z]{1,2}$/i.test(normalized) && !ENV_TERM_ALLOWLIST.has(lower)) {
+    return true;
+  }
+  if (normalized.length <= 2 && !ENV_TERM_ALLOWLIST.has(lower)) {
+    return true;
+  }
+  if (/(?:^|[^a-z])(kpa|nmol|mmol|mg|ug|μg|g\/m3|mg\/m3)(?:$|[^a-z])/i.test(normalized) && !ENV_TERM_ALLOWLIST.has(lower)) {
+    return true;
+  }
+  return false;
+}
+
+function filterDomainTermCandidates(terms: string[], limit: number): string[] {
+  return uniqueBy(
+    terms
+      .map((term) => normalizeWhitespace(term))
+      .filter((term) => term.length > 0)
+      .filter((term) => !isLikelyNoiseTerm(term)),
+    (value) => value.toLowerCase()
+  ).slice(0, limit);
+}
+
+function inferDomainMetadata(manifest: SourceManifest, content: string): DomainMetadata {
+  const title = `${manifest.title} ${manifest.originalPath ?? ""} ${manifest.repoRelativePath ?? ""}`;
+  const text = `${title}\n${content}`.toLowerCase();
+  const standardCode = extractStandardReferences(`${title}\n${content}`)[0]?.normalized;
+  const pollutants = filterDomainTermCandidates(
+    ["PM2.5", "PM10", "O3", "SO2", "NO2", "CO", "AQI", "IAQI", "VOCs", "NMHC"].filter(
+      (name) => text.includes(name.toLowerCase()) || text.includes(name.replace(".", "").toLowerCase())
+    ),
+    10
+  );
+
+  let authorityLayer: DomainMetadata["authorityLayer"] = "unknown";
+  let legalForce: DomainMetadata["legalForce"] = "unknown";
+  let documentRole: DomainMetadata["documentRole"] = "unknown";
+  let legalStatus: DomainMetadata["legalStatus"] = "unknown";
+
+  if (/征求意见|草案/.test(text)) {
+    authorityLayer = "evolution";
+    legalForce = "draft";
+    documentRole = "draft";
+    legalStatus = "draft_consultation";
+  } else if (/编制说明|解读|释义/.test(text)) {
+    authorityLayer = "evidence";
+    legalForce = "explanatory";
+    documentRole = "official_explanation";
+    legalStatus = "explanation_only";
+  } else if (/年报|月报|公报|白皮书|蓝皮书/.test(text)) {
+    authorityLayer = "evidence";
+    legalForce = "statistical";
+    documentRole = "statistics";
+  } else if (/标准|规范|技术要求|监测方法|hj\s*(?:\/\s*t)?\s*[- ]?[0-9]{2,6}|gb\s*(?:\/\s*t)?\s*[- ]?[0-9]{2,6}|db[0-9]{2}/i.test(text)) {
+    authorityLayer = /地方|省|市/.test(text) ? "local" : "core";
+    legalForce = /gb\/t|hj\/t|指南|导则|技术指南|推荐/i.test(text) ? "recommended" : "mandatory";
+    documentRole = /技术指南|导则|指南/.test(text)
+      ? "technical_guide"
+      : /监测方法|技术规范|技术要求/.test(text)
+        ? "monitoring_method"
+        : /排放标准/.test(text)
+          ? "emission_standard"
+          : "standard";
+    legalStatus = "current_effective";
+  } else if (/研究|论文|综述/.test(text)) {
+    authorityLayer = "evidence";
+    legalForce = "research";
+    documentRole = "research_literature";
+  }
+
+  const jurisdiction: DomainMetadata["jurisdiction"] = /地方|省|市/.test(text) ? (/市/.test(text) ? "city" : "province") : "national";
+
+  return {
+    authorityLayer,
+    legalForce,
+    documentRole,
+    legalStatus,
+    jurisdiction,
+    standardCode,
+    pollutants,
+    useFor: [],
+    doNotUseFor: [],
+    replaces: [],
+    replacedBy: [],
+    notes: [],
+    metadataSource: "rule",
+    verificationState: "rule_verified",
+    llmUncertainFields: []
+  };
+}
 
 function filenameStemForSource(manifest: SourceManifest): string {
   const candidate = manifest.repoRelativePath ?? manifest.originalPath ?? manifest.storedPath;
@@ -255,14 +441,14 @@ function normalizeSourceAnalysis(manifest: SourceManifest, analysis: SourceAnaly
 }
 
 function heuristicAnalysis(manifest: SourceManifest, text: string, schemaHash: string): SourceAnalysis {
-  const analysisText = textForHeuristicAnalysis(manifest, text);
+  const analysisText = normalizeEnvAirText(textForHeuristicAnalysis(manifest, text));
   const normalized = normalizeWhitespace(analysisText);
-  const concepts = extractTopTerms(normalized, 6).map((term) => ({
+  const concepts = filterDomainTermCandidates(extractTopTerms(normalized, 10), 6).map((term) => ({
     id: `concept:${slugify(term)}`,
     name: term,
     description: `Frequently referenced concept in ${manifest.title}.`
   }));
-  const entities = extractEntities(analysisText, 6).map((term) => ({
+  const entities = filterDomainTermCandidates(extractEntities(analysisText, 10), 6).map((term) => ({
     id: `entity:${slugify(term)}`,
     name: term,
     description: `Named entity mentioned in ${manifest.title}.`
@@ -291,8 +477,17 @@ function heuristicAnalysis(manifest: SourceManifest, text: string, schemaHash: s
       polarity: detectPolarity(sentence),
       citation: manifest.sourceId
     })),
-    questions: concepts.slice(0, 3).map((term) => `How does ${term.name} relate to ${manifest.title}?`),
+    questions: [
+      `这份资料对${manifest.title}的适用边界是什么？`,
+      `这份资料是否可作为现行执行依据？`,
+      `它与相关标准或历史版本的关系是什么？`
+    ].slice(0, 3),
     tags: [],
+    domain: inferDomainMetadata(manifest, normalized),
+    analysisMode: "heuristic",
+    providerId: "heuristic",
+    providerModel: "heuristic-v1",
+    warnings: [],
     rationales: [],
     producedAt: new Date().toISOString()
   };
@@ -304,10 +499,12 @@ async function providerAnalysis(
   provider: ProviderAdapter,
   schema: VaultSchema
 ): Promise<SourceAnalysis> {
+  const cleanedText = normalizeEnvAirText(text);
   const parsed = await provider.generateStructured(
     {
       system: [
-        "You are compiling a durable markdown wiki and graph. Prefer grounded synthesis over creativity.",
+        "You are compiling a durable markdown wiki and graph for environmental air-pollution knowledge.",
+        "Distinguish authority tiers: current standards vs explanatory docs vs statistics vs draft/evolution materials.",
         "",
         "Follow the vault schema when choosing titles, categories, relationships, and summaries.",
         "",
@@ -318,10 +515,39 @@ async function providerAnalysis(
         "Vault schema instructions:",
         truncate(schema.content, 6000)
       ].join("\n"),
-      prompt: `Analyze the following source and return structured JSON.\n\nSource title: ${manifest.title}\nSource kind: ${manifest.sourceKind}\nSource id: ${manifest.sourceId}\n\nText:\n${truncate(text, 18000)}`
+      prompt: `Analyze the following source and return structured JSON.\n\nSource title: ${manifest.title}\nSource kind: ${manifest.sourceKind}\nSource id: ${manifest.sourceId}\n\nText:\n${truncate(cleanedText, 18000)}`
     },
     sourceAnalysisSchema
   );
+  const normalizedConcepts = filterDomainTermCandidates(
+    parsed.concepts.map((term) => term.name),
+    12
+  );
+  const normalizedEntities = filterDomainTermCandidates(
+    parsed.entities.map((term) => term.name),
+    12
+  );
+  const parsedDomain = parsed.domain
+    ? ({
+        ...parsed.domain,
+        replaces: parsed.domain.replaces ?? [],
+        replacedBy: parsed.domain.replacedBy ?? [],
+        pollutants: parsed.domain.pollutants ?? [],
+        useFor: parsed.domain.useFor ?? [],
+        doNotUseFor: parsed.domain.doNotUseFor ?? [],
+        notes: parsed.domain.notes ?? [],
+        llmUncertainFields: parsed.domain.llmUncertainFields ?? []
+      } as DomainMetadata)
+    : undefined;
+  const inferred = inferDomainMetadata(manifest, cleanedText);
+  const domain: DomainMetadata = parsedDomain
+    ? {
+        ...inferred,
+        ...parsedDomain,
+        metadataSource: parsedDomain.metadataSource ?? "mixed",
+        verificationState: parsedDomain.verificationState ?? "unreviewed"
+      }
+    : inferred;
 
   return {
     analysisVersion: ANALYSIS_FORMAT_VERSION,
@@ -332,15 +558,15 @@ async function providerAnalysis(
     schemaHash: schema.hash,
     title: parsed.title,
     summary: parsed.summary,
-    concepts: parsed.concepts.map((term) => ({
-      id: `concept:${slugify(term.name)}`,
-      name: term.name,
-      description: term.description
+    concepts: normalizedConcepts.map((name) => ({
+      id: `concept:${slugify(name)}`,
+      name,
+      description: parsed.concepts.find((item) => item.name === name)?.description ?? ""
     })),
-    entities: parsed.entities.map((term) => ({
-      id: `entity:${slugify(term.name)}`,
-      name: term.name,
-      description: term.description
+    entities: normalizedEntities.map((name) => ({
+      id: `entity:${slugify(name)}`,
+      name,
+      description: parsed.entities.find((item) => item.name === name)?.description ?? ""
     })),
     claims: parsed.claims.map((claim, index) => ({
       id: `claim:${manifest.sourceId}:${index + 1}`,
@@ -352,6 +578,11 @@ async function providerAnalysis(
     })),
     questions: parsed.questions,
     tags: parsed.tags,
+    domain,
+    analysisMode: "provider",
+    providerId: provider.id,
+    providerModel: provider.model,
+    warnings: [],
     rationales: [],
     producedAt: new Date().toISOString()
   };
@@ -395,6 +626,11 @@ function analysisFromVisionExtraction(
     })),
     questions: extraction.vision.questions,
     tags: [],
+    domain: inferDomainMetadata(manifest, extraction.vision.text),
+    analysisMode: "vision",
+    providerId: extraction.providerId,
+    providerModel: extraction.providerModel,
+    warnings: extraction.warnings ?? [],
     rationales: [],
     producedAt: new Date().toISOString()
   };
@@ -413,10 +649,11 @@ export async function analyzeSource(
   extractedText: string | undefined,
   provider: ProviderAdapter,
   paths: ResolvedPaths,
-  schema: VaultSchema
+  schema: VaultSchema,
+  options: { bypassCache?: boolean } = {}
 ): Promise<SourceAnalysis> {
   const cachePath = path.join(paths.analysesDir, `${manifest.sourceId}.json`);
-  const cached = await readJsonFile<SourceAnalysis>(cachePath);
+  const cached = options.bypassCache ? null : await readJsonFile<SourceAnalysis>(cachePath);
   if (
     cached &&
     cached.analysisVersion === ANALYSIS_FORMAT_VERSION &&
@@ -432,11 +669,19 @@ export async function analyzeSource(
   }
 
   const extraction = await readExtractionArtifact(paths.rootDir, manifest);
-  const content = normalizeWhitespace(extractedText ?? "");
+  const content = normalizeEnvAirText(normalizeWhitespace(extractedText ?? ""));
   let analysis: SourceAnalysis;
+  let providerFailure: string | undefined;
 
   if (manifest.sourceKind === "code" && content) {
-    analysis = await analyzeCodeSource(manifest, extractedText ?? "", schema.hash);
+    analysis = {
+      ...(await analyzeCodeSource(manifest, extractedText ?? "", schema.hash)),
+      domain: inferDomainMetadata(manifest, content),
+      analysisMode: "code",
+      providerId: provider.id,
+      providerModel: provider.model,
+      warnings: []
+    };
   } else if (manifest.sourceKind === "image") {
     const visionAnalysis = extraction ? analysisFromVisionExtraction(manifest, extraction, schema.hash) : null;
     if (visionAnalysis) {
@@ -456,6 +701,11 @@ export async function analyzeSource(
         claims: [],
         questions: [],
         tags: [],
+        domain: inferDomainMetadata(manifest, manifest.title),
+        analysisMode: "empty",
+        providerId: provider.id,
+        providerModel: provider.model,
+        warnings: extraction?.warnings ?? [],
         rationales: [],
         producedAt: new Date().toISOString()
       };
@@ -464,7 +714,8 @@ export async function analyzeSource(
     } else {
       try {
         analysis = await providerAnalysis(manifest, content, provider, schema);
-      } catch {
+      } catch (error) {
+        providerFailure = error instanceof Error ? error.message : String(error);
         analysis = heuristicAnalysis(manifest, content, schema.hash);
       }
     }
@@ -483,6 +734,11 @@ export async function analyzeSource(
       claims: [],
       questions: [],
       tags: [],
+      domain: inferDomainMetadata(manifest, manifest.title),
+      analysisMode: "empty",
+      providerId: provider.id,
+      providerModel: provider.model,
+      warnings: extraction?.warnings ?? [],
       rationales: [],
       producedAt: new Date().toISOString()
     };
@@ -491,7 +747,8 @@ export async function analyzeSource(
   } else {
     try {
       analysis = await providerAnalysis(manifest, content, provider, schema);
-    } catch {
+    } catch (error) {
+      providerFailure = error instanceof Error ? error.message : String(error);
       analysis = heuristicAnalysis(manifest, content, schema.hash);
     }
   }
@@ -506,6 +763,19 @@ export async function analyzeSource(
     if (extra.length) {
       analysis = { ...analysis, rationales: extra };
     }
+  }
+
+  if (!analysis.domain) {
+    analysis = { ...analysis, domain: inferDomainMetadata(manifest, content || manifest.title) };
+  }
+  if (providerFailure) {
+    analysis = {
+      ...analysis,
+      analysisMode: "heuristic",
+      providerId: provider.id,
+      providerModel: provider.model,
+      warnings: uniqueBy([...(analysis.warnings ?? []), `Provider analysis failed: ${truncate(providerFailure, 240)}`], (value) => value)
+    };
   }
 
   const normalized = normalizeSourceAnalysis(manifest, analysis);

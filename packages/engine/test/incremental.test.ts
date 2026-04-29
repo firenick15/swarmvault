@@ -13,6 +13,24 @@ async function createTempWorkspace(): Promise<string> {
   return dir;
 }
 
+async function updateConfig(
+  rootDir: string,
+  mutate: (config: {
+    providers: Record<string, unknown>;
+    tasks: Record<string, string>;
+    benchmark?: { enabled?: boolean; questions?: string[]; maxQuestions?: number };
+  }) => void
+): Promise<void> {
+  const configPath = path.join(rootDir, "swarmvault.config.json");
+  const config = JSON.parse(await fs.readFile(configPath, "utf8")) as {
+    providers: Record<string, unknown>;
+    tasks: Record<string, string>;
+    benchmark?: { enabled?: boolean; questions?: string[]; maxQuestions?: number };
+  };
+  mutate(config);
+  await fs.writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, "utf8");
+}
+
 afterEach(async () => {
   await Promise.all(tempDirs.splice(0).map((dir) => fs.rm(dir, { recursive: true, force: true })));
 });
@@ -45,6 +63,86 @@ describe("incremental compilation", () => {
     expect(Object.keys(state.sourceHashes).length).toBe(1);
     expect(state.rootSchemaHash).toBeTruthy();
     expect(state.effectiveSchemaHashes.global).toBeTruthy();
+  });
+
+  it("forces source reanalysis when compileVault runs with forceAnalysis", async () => {
+    const rootDir = await createTempWorkspace();
+    await initVault(rootDir);
+
+    await fs.writeFile(
+      path.join(rootDir, "counting-provider.mjs"),
+      [
+        "import fs from 'node:fs/promises';",
+        "import path from 'node:path';",
+        "",
+        "async function increment(counterPath) {",
+        "  let count = 0;",
+        "  try {",
+        "    count = Number((await fs.readFile(counterPath, 'utf8')).trim() || '0');",
+        "  } catch {",
+        "    count = 0;",
+        "  }",
+        "  count += 1;",
+        "  await fs.mkdir(path.dirname(counterPath), { recursive: true });",
+        "  await fs.writeFile(counterPath, String(count), 'utf8');",
+        "  return count;",
+        "}",
+        "",
+        "export async function createAdapter(id, config, rootDir) {",
+        "  const counterPath = path.join(rootDir, 'state', 'analysis-count.txt');",
+        "  return {",
+        "    id,",
+        "    type: 'custom',",
+        "    model: config.model,",
+        "    capabilities: new Set(config.capabilities ?? ['chat', 'structured']),",
+        "    async generateText() {",
+        "      return { text: 'ok' };",
+        "    },",
+        "    async generateStructured() {",
+        "      await increment(counterPath);",
+        "      return {",
+        "        title: 'Counting Source',",
+        "        summary: 'Counting summary.',",
+        "        concepts: [],",
+        "        entities: [],",
+        "        claims: [],",
+        "        questions: []",
+        "      };",
+        "    }",
+        "  };",
+        "}"
+      ].join("\n"),
+      "utf8"
+    );
+
+    await updateConfig(rootDir, (config) => {
+      config.providers.counting = {
+        type: "custom",
+        model: "counting",
+        module: "./counting-provider.mjs",
+        capabilities: ["chat", "structured"]
+      };
+      config.tasks.compileProvider = "counting";
+      config.tasks.queryProvider = "counting";
+      config.tasks.lintProvider = "counting";
+      config.tasks.visionProvider = "counting";
+      config.benchmark = {
+        enabled: false,
+        questions: []
+      };
+    });
+
+    await fs.writeFile(path.join(rootDir, "note.md"), "# Force Analysis\n\nThis note exercises the cache bypass path.", "utf8");
+    await ingestInput(rootDir, "note.md");
+
+    await compileVault(rootDir);
+    const counterPath = path.join(rootDir, "state", "analysis-count.txt");
+    const firstCount = Number((await fs.readFile(counterPath, "utf8")).trim());
+    expect(firstCount).toBe(1);
+
+    await compileVault(rootDir, { forceAnalysis: true });
+    const secondCount = Number((await fs.readFile(counterPath, "utf8")).trim());
+    expect(secondCount).toBe(2);
   });
 });
 

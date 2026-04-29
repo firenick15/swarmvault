@@ -326,6 +326,28 @@ export function buildSourcePage(
     title: analysis.title,
     ...(manifest.sourceType ? { source_type: manifest.sourceType } : {}),
     ...(manifest.sourceClass ? { source_class: manifest.sourceClass } : {}),
+    ...(analysis.domain
+      ? {
+          authority_layer: analysis.domain.authorityLayer,
+          legal_force: analysis.domain.legalForce,
+          document_role: analysis.domain.documentRole,
+          legal_status: analysis.domain.legalStatus,
+          jurisdiction: analysis.domain.jurisdiction,
+          ...(analysis.domain.region ? { region: analysis.domain.region } : {}),
+          ...(analysis.domain.standardCode ? { standard_code: analysis.domain.standardCode } : {}),
+          ...(analysis.domain.publishDate ? { publish_date: analysis.domain.publishDate } : {}),
+          ...(analysis.domain.effectiveDate ? { effective_date: analysis.domain.effectiveDate } : {}),
+          ...(analysis.domain.replaces?.length ? { replaces: analysis.domain.replaces } : {}),
+          ...(analysis.domain.replacedBy?.length ? { replaced_by: analysis.domain.replacedBy } : {}),
+          ...(analysis.domain.pollutants?.length ? { pollutants: analysis.domain.pollutants } : {}),
+          ...(analysis.domain.metadataSource ? { metadata_source: analysis.domain.metadataSource } : {}),
+          ...(analysis.domain.verificationState ? { verification_state: analysis.domain.verificationState } : {})
+        }
+      : {}),
+    ...(analysis.analysisMode ? { analysis_mode: analysis.analysisMode } : {}),
+    ...(analysis.providerId ? { analysis_provider_id: analysis.providerId } : {}),
+    ...(analysis.providerModel ? { analysis_provider_model: analysis.providerModel } : {}),
+    ...(analysis.warnings?.length ? { analysis_warnings: analysis.warnings } : {}),
     ...(detailValue(manifest, "occurred_at") ? { occurred_at: detailValue(manifest, "occurred_at") } : {}),
     ...(detailList(manifest, "participants") ? { participants: detailList(manifest, "participants") } : {}),
     ...(detailValue(manifest, "container_title") ? { container_title: detailValue(manifest, "container_title") } : {}),
@@ -355,6 +377,18 @@ export function buildSourcePage(
       manifest.url ? `Source URL: ${manifest.url}` : `Source Path: \`${manifest.originalPath ?? manifest.storedPath}\``,
       ...(manifest.sourceType ? [`Source Type: \`${manifest.sourceType}\``, ""] : [""]),
       ...(manifest.sourceClass ? [`Source Class: \`${manifest.sourceClass}\``, ""] : []),
+      ...(analysis.domain
+        ? [
+            `Authority Layer: \`${analysis.domain.authorityLayer}\``,
+            `Document Role: \`${analysis.domain.documentRole}\``,
+            `Legal Status: \`${analysis.domain.legalStatus}\``,
+            ...(analysis.domain.standardCode ? [`Standard Code: \`${analysis.domain.standardCode}\``] : []),
+            ""
+          ]
+        : []),
+      ...(analysis.analysisMode ? [`Analysis Mode: \`${analysis.analysisMode}\``] : []),
+      ...(analysis.providerId ? [`Analysis Provider: \`${analysis.providerId}\` (${analysis.providerModel ?? "unknown"})`] : []),
+      ...(analysis.warnings?.length ? ["", "## Analysis Warnings", "", ...analysis.warnings.map((warning) => `- ${warning}`), ""] : []),
       ...(manifest.sourceGroupTitle ? [`Source Group: ${manifest.sourceGroupTitle}`] : []),
       ...(manifest.partTitle ? [`Part: ${manifest.partIndex ?? "?"}/${manifest.partCount ?? "?"} - ${manifest.partTitle}`] : []),
       ...(manifest.details && Object.keys(manifest.details).length

@@ -25,6 +25,8 @@ import { conflictConfidence, edgeConfidence, nodeConfidence } from "./confidence
 import { defaultVaultSchema, initWorkspace, loadVaultConfig, PRIMARY_SCHEMA_FILENAME } from "./config.js";
 import { runConsolidation } from "./consolidate.js";
 import { runDeepLint } from "./deep-lint.js";
+import { classifyRecommendedNextTool } from "./domain/env-air.js";
+import { applyStandardRelationOverrides } from "./domain/standard-relations.js";
 import { embeddingSimilarityEdges, filterGraphBySourceClass, semanticGraphMatches, semanticPageSearch } from "./embeddings.js";
 import { markSuperseded, resolveDecayConfig, runDecayPass } from "./freshness.js";
 import { enrichGraph } from "./graph-enrichment.js";
@@ -71,7 +73,7 @@ import {
 } from "./output-artifacts.js";
 import { loadSavedOutputPages, relatedOutputsForPage, resolveUniqueOutputSlug } from "./outputs.js";
 import { loadExistingManagedPageState, loadInsightPages, parseStoredPage } from "./pages.js";
-import { getProviderForTask } from "./providers/registry.js";
+import { createProvider, getProviderForTask } from "./providers/registry.js";
 import { resolveRetrievalConfig, writeRetrievalManifest } from "./retrieval.js";
 import {
   buildSchemaPrompt,
@@ -81,7 +83,7 @@ import {
   loadVaultSchemas,
   schemaCategoryLabels
 } from "./schema.js";
-import { mergeSearchResults, rebuildSearchIndex, searchPages } from "./search.js";
+import { mergeSearchResults, rebuildSearchIndex, type SearchQueryOptions, searchPages } from "./search.js";
 import { ALL_SOURCE_CLASSES, aggregateManifestSourceClass } from "./source-classification.js";
 import { listGuidedSourceSessions, updateGuidedSourceSessionStatus } from "./source-sessions.js";
 import type {
@@ -131,8 +133,10 @@ import type {
   PageStatus,
   PromotionDecision,
   PromotionSession,
+  ProviderSmokeTestResult,
   QueryOptions,
   QueryResult,
+  RetrievalDebugInfo,
   ReviewActionResult,
   SearchResult,
   SourceAnalysis,
@@ -169,6 +173,11 @@ type QueryExecutionResult = {
     inputTokens?: number;
     outputTokens?: number;
   };
+  evidenceState?: QueryResult["evidenceState"];
+  groundingWarnings?: string[];
+  invalidCitations?: string[];
+  recommendedNextTool?: QueryResult["recommendedNextTool"];
+  retrievalDebug?: RetrievalDebugInfo;
 };
 
 type PersistedOutputPageResult = {
@@ -3360,6 +3369,7 @@ async function syncVaultArtifacts(
     memoryHashes: input.memoryHashes,
     candidateHistory
   } satisfies CompileState);
+  await applyStandardRelationOverrides(paths.wikiDir, allPages);
   await rebuildSearchIndex(paths.searchDbPath, allPages, paths.wikiDir);
   await writeRetrievalManifest(rootDir, graph);
 
@@ -3591,6 +3601,7 @@ async function refreshIndexesAndSearch(rootDir: string, pages: GraphPage[]): Pro
       .map((relativePath) => fs.rm(path.join(paths.wikiDir, relativePath), { force: true }))
   );
 
+  await applyStandardRelationOverrides(paths.wikiDir, pagesWithGraph);
   await rebuildSearchIndex(paths.searchDbPath, pagesWithGraph, paths.wikiDir);
   if (currentGraph) {
     await writeRetrievalManifest(rootDir, {
@@ -3787,11 +3798,149 @@ export async function stageGeneratedOutputPages(
   return await stageOutputApprovalBundle(rootDir, stagedPages, options);
 }
 
+const groundedAnswerSchema = z.object({
+  answer: z.string().min(1),
+  usedEvidenceIds: z.array(z.string().min(1)).default([]),
+  unsupportedClaims: z.array(z.string()).default([]),
+  missingEvidence: z.array(z.string()).default([]),
+  recommendedNextTool: z.enum(["knowledge_base", "environment_data_mcp", "both"]).optional()
+});
+
+type GroundedAnswer = z.infer<typeof groundedAnswerSchema>;
+type EvidenceItem = RetrievalDebugInfo["evidenceItems"][number];
+
+function buildQuerySearchOptions(queryOptions?: QueryOptions): SearchQueryOptions {
+  const searchOptions: SearchQueryOptions = {
+    limit: queryOptions?.debugContext ? 8 : 5,
+    region: queryOptions?.region,
+    pollutant: queryOptions?.pollutants?.[0],
+    includeDrafts: queryOptions?.includeDrafts,
+    includeSuperseded: queryOptions?.includeSuperseded,
+    project: queryOptions?.projectId
+  };
+  const queryIntent = queryOptions?.intent;
+  if (queryIntent === "current_basis" || queryOptions?.requireCurrentBasis) {
+    searchOptions.authorityLayer = queryOptions?.region ? ["core", "method", "local"] : ["core", "method"];
+    searchOptions.includeDrafts = false;
+    searchOptions.includeSuperseded = false;
+    if (queryOptions?.strictGrounding || queryOptions?.evidenceMode === "strict") {
+      searchOptions.legalStatus = "current_effective";
+    }
+  } else if (queryIntent === "evolution") {
+    searchOptions.authorityLayer = ["core", "evolution", "method"];
+    searchOptions.includeDrafts = true;
+    searchOptions.includeSuperseded = true;
+  } else if (queryIntent === "local") {
+    searchOptions.authorityLayer = ["local", "core", "method"];
+  } else if (queryIntent === "statistics") {
+    searchOptions.documentRole = ["statistics", "report", "white_paper", "research"];
+  }
+  return searchOptions;
+}
+
+function formatEvidenceSet(evidenceItems: EvidenceItem[]): string {
+  if (!evidenceItems.length) {
+    return "No evidence was retrieved from the vault or web search.";
+  }
+  return evidenceItems
+    .map((item) =>
+      [
+        `[${item.id}] kind=${item.kind} citation=${item.citation}`,
+        `title=${item.title}`,
+        item.authorityLayer ? `authority_layer=${item.authorityLayer}` : undefined,
+        item.legalStatus ? `legal_status=${item.legalStatus}` : undefined,
+        item.documentRole ? `document_role=${item.documentRole}` : undefined,
+        item.standardCode ? `standard_code=${item.standardCode}` : undefined,
+        item.region ? `region=${item.region}` : undefined,
+        "",
+        item.excerpt
+      ]
+        .filter((line): line is string => typeof line === "string")
+        .join("\n")
+    )
+    .join("\n\n---\n\n");
+}
+
+function parseEvidenceIds(text: string | undefined): string[] {
+  if (!text) {
+    return [];
+  }
+  return uniqueBy(
+    [...text.matchAll(/\[(E[0-9]+)\]/g)].map((match) => match[1]),
+    (item) => item
+  );
+}
+
+function strictExactQueryTerms(question: string): string[] {
+  return uniqueBy(
+    (question.match(/[a-z0-9][a-z0-9.-]*[0-9][a-z0-9.-]*/gi) ?? [])
+      .map((term) => term.toLowerCase().replace(/[^a-z0-9]/g, ""))
+      .filter((term) => term.length >= 3),
+    (item) => item
+  ).slice(0, 8);
+}
+
+function evidenceContainsExactTerms(evidenceItems: EvidenceItem[], terms: string[]): string[] {
+  const haystack = evidenceItems
+    .map((item) => [item.title, item.standardCode, item.citation, item.excerpt].filter(Boolean).join(" "))
+    .join("\n")
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "");
+  return terms.filter((term) => !haystack.includes(term));
+}
+
+function evaluateGrounding(input: { evidenceItems: EvidenceItem[]; answer: string; structured?: GroundedAnswer }): {
+  citations: string[];
+  usedEvidenceIds: string[];
+  invalidCitations: string[];
+  evidenceState: QueryResult["evidenceState"];
+  groundingWarnings: string[];
+} {
+  const evidenceById = new Map(input.evidenceItems.map((item) => [item.id, item]));
+  const structuredIds = input.structured?.usedEvidenceIds ?? [];
+  const inlineIds = parseEvidenceIds(input.answer);
+  const proposedIds = uniqueBy([...structuredIds, ...inlineIds], (item) => item);
+  const invalidCitations = proposedIds.filter((id) => !evidenceById.has(id));
+  const usedEvidenceIds = proposedIds.filter((id) => evidenceById.has(id));
+  const groundingWarnings: string[] = [];
+
+  if (!input.evidenceItems.length) {
+    groundingWarnings.push("no_retrieved_evidence");
+    return {
+      citations: [],
+      usedEvidenceIds: [],
+      invalidCitations,
+      evidenceState: "insufficient",
+      groundingWarnings
+    };
+  }
+  if (!usedEvidenceIds.length) {
+    groundingWarnings.push("answer_missing_evidence_ids");
+  }
+  for (const claim of input.structured?.unsupportedClaims ?? []) {
+    groundingWarnings.push(`unsupported_claim:${claim}`);
+  }
+  for (const missing of input.structured?.missingEvidence ?? []) {
+    groundingWarnings.push(`missing_evidence:${missing}`);
+  }
+  if (invalidCitations.length) {
+    groundingWarnings.push(`invalid_evidence_ids:${invalidCitations.join(",")}`);
+  }
+
+  const effectiveIds = usedEvidenceIds.length ? usedEvidenceIds : input.evidenceItems.map((item) => item.id);
+  const citations = uniqueBy(
+    effectiveIds.map((id) => evidenceById.get(id)?.citation).filter((citation): citation is string => Boolean(citation)),
+    (item) => item
+  );
+  const evidenceState: QueryResult["evidenceState"] = groundingWarnings.length || !usedEvidenceIds.length ? "partial" : "grounded";
+  return { citations, usedEvidenceIds: effectiveIds, invalidCitations, evidenceState, groundingWarnings };
+}
+
 async function executeQuery(
   rootDir: string,
   question: string,
   format: OutputFormat,
-  options: { gapFill?: boolean; gapFillTask?: "queryProvider" | "exploreProvider" } = {}
+  options: { gapFill?: boolean; gapFillTask?: "queryProvider" | "exploreProvider"; queryOptions?: QueryOptions } = {}
 ): Promise<QueryExecutionResult> {
   const { paths } = await loadVaultConfig(rootDir);
   const schemas = await loadVaultSchemas(rootDir);
@@ -3822,7 +3971,9 @@ async function executeQuery(
       .filter((page) => page.kind === "source" && page.sourceIds.length)
       .map((page) => [page.sourceIds[0], page.projectIds[0] ?? null])
   );
-  const searchResults = await searchVault(rootDir, question, 5);
+  const searchOptions = buildQuerySearchOptions(options.queryOptions);
+  const recommendedNextTool = classifyRecommendedNextTool(question);
+  const searchResults = await searchVault(rootDir, question, searchOptions);
   const excerpts = await Promise.all(
     searchResults.map(async (result) => {
       const absolutePath = path.join(paths.wikiDir, result.path);
@@ -3873,47 +4024,189 @@ async function executeQuery(
   const webExcerpts = webResults.map(
     (result) => `# ${result.title} [${result.url}]\n${truncate(normalizeWhitespace(result.snippet), 600)}`
   );
+  const evidenceItems: EvidenceItem[] = [];
+  searchResults.forEach((result, index) => {
+    const page = pageMap.get(result.pageId);
+    const sourceId = page?.sourceIds[0];
+    evidenceItems.push({
+      id: `E${evidenceItems.length + 1}`,
+      kind: "source",
+      citation: sourceId ?? result.pageId,
+      pageId: result.pageId,
+      sourceId,
+      title: result.title,
+      authorityLayer: result.authorityLayer,
+      legalStatus: result.legalStatus,
+      documentRole: result.documentRole,
+      standardCode: result.standardCode,
+      region: result.region,
+      excerpt: truncate(normalizeWhitespace(excerpts[index] ?? result.snippet), 1200)
+    });
+  });
+  webResults.forEach((result) => {
+    evidenceItems.push({
+      id: `E${evidenceItems.length + 1}`,
+      kind: "web",
+      citation: result.url,
+      title: result.title,
+      excerpt: truncate(normalizeWhitespace(result.snippet), 600)
+    });
+  });
+
+  if (!evidenceItems.length) {
+    const answer = [
+      "知识库中没有检索到足够证据来回答这个问题。",
+      recommendedNextTool === "environment_data_mcp"
+        ? "这个问题更像是监测数据查询或计算分析，应优先调用环境数据 MCP 工具。"
+        : recommendedNextTool === "both"
+          ? "建议先调用环境数据 MCP 获取监测数据，再结合知识库中的标准和技术依据进行解释。"
+          : "可以补充更明确的标准名称、地区、污染物或业务场景后重新查询。"
+    ].join("\n\n");
+    return {
+      answer,
+      citations: [],
+      relatedPageIds,
+      relatedNodeIds,
+      relatedSourceIds,
+      schemaHash: querySchema.hash,
+      projectIds: pageProjectIds,
+      evidenceState: "insufficient",
+      groundingWarnings: ["no_retrieved_evidence"],
+      invalidCitations: [],
+      recommendedNextTool,
+      retrievalDebug: options.queryOptions?.debugContext
+        ? {
+            query: question,
+            searchOptions: searchOptions as unknown as Record<string, unknown>,
+            evidenceItems,
+            usedEvidenceIds: [],
+            warnings: ["no_retrieved_evidence"]
+          }
+        : undefined
+    };
+  }
+  const strictGrounding = options.queryOptions?.strictGrounding || options.queryOptions?.evidenceMode === "strict";
+  const missingExactTerms = strictGrounding ? evidenceContainsExactTerms(evidenceItems, strictExactQueryTerms(question)) : [];
+  if (missingExactTerms.length) {
+    const warning = `strict_exact_terms_not_found:${missingExactTerms.join(",")}`;
+    return {
+      answer: `知识库检索到了相关背景材料，但没有检索到问题中关键精确项（${missingExactTerms.join(", ")}）的直接证据，因此不能给出有依据的结论。`,
+      citations: [],
+      relatedPageIds,
+      relatedNodeIds,
+      relatedSourceIds,
+      schemaHash: querySchema.hash,
+      projectIds: pageProjectIds,
+      evidenceState: "insufficient",
+      groundingWarnings: [warning],
+      invalidCitations: [],
+      recommendedNextTool,
+      retrievalDebug: options.queryOptions?.debugContext
+        ? {
+            query: question,
+            searchOptions: searchOptions as unknown as Record<string, unknown>,
+            evidenceItems,
+            usedEvidenceIds: [],
+            warnings: [warning]
+          }
+        : undefined
+    };
+  }
 
   let answer: string;
   let usage: QueryExecutionResult["usage"];
+  let structuredAnswer: GroundedAnswer | undefined;
+  const providerWarnings: string[] = [];
   if (provider.type === "heuristic") {
     answer = formatHeuristicAnswer(question, excerpts, rawExcerpts, searchResults, format);
   } else {
     const context = [
+      "Evidence set:",
+      formatEvidenceSet(evidenceItems),
+      "",
       ...(webExcerpts.length ? ["Web search evidence:", webExcerpts.join("\n\n---\n\n"), ""] : []),
       "Wiki context:",
       excerpts.join("\n\n---\n\n"),
       ...(rawExcerpts.length ? ["", "Raw source material:", rawExcerpts.join("\n\n---\n\n")] : [])
     ].join("\n\n");
-    const response = await provider.generateText({
-      system: buildSchemaPrompt(
-        querySchema,
-        [
-          "Answer using the provided context. Prefer raw source material over wiki summaries when they differ. Cite source IDs and web URLs when they appear in the evidence.",
-          outputFormatInstruction(format)
-        ].join(" ")
-      ),
-      prompt: `Question: ${question}\n\n${context}`
-    });
-    answer = response.text;
-    usage = response.usage;
+    const system = buildSchemaPrompt(
+      querySchema,
+      [
+        "You answer for environmental air pollution regulatory and technical work.",
+        "Use only the provided evidence set. Cite evidence item IDs like [E1] for every substantive claim.",
+        "Distinguish mandatory/current-effective standards from recommended guides, drafts, explanations, and historical versions.",
+        "For current-basis questions, prioritize current effective standards and explicitly mark drafts/history as non-binding.",
+        "For local questions, state jurisdiction boundaries and do not generalize local口径 to other regions.",
+        "If monitor data, rankings, concentration calculations,同比/环比, or process analysis are needed, say the environment_data_mcp tool should be used.",
+        "If evidence is insufficient, say so instead of filling gaps from general knowledge.",
+        outputFormatInstruction(format)
+      ].join(" ")
+    );
+    const wantsStructuredGrounding =
+      provider.capabilities.has("structured") &&
+      (options.queryOptions?.debugContext || options.queryOptions?.strictGrounding || options.queryOptions?.evidenceMode === "strict");
+    if (wantsStructuredGrounding) {
+      try {
+        structuredAnswer = await provider.generateStructured(
+          {
+            system,
+            prompt: [
+              `Question: ${question}`,
+              "",
+              context,
+              "",
+              "Return JSON with: answer, usedEvidenceIds, unsupportedClaims, missingEvidence, recommendedNextTool."
+            ].join("\n")
+          },
+          groundedAnswerSchema
+        );
+        answer = structuredAnswer.answer;
+      } catch (error) {
+        providerWarnings.push(`structured_query_fallback:${error instanceof Error ? error.message : String(error)}`);
+        const response = await provider.generateText({
+          system,
+          prompt: `Question: ${question}\n\n${context}`
+        });
+        answer = response.text;
+        usage = response.usage;
+      }
+    } else {
+      const response = await provider.generateText({
+        system,
+        prompt: `Question: ${question}\n\n${context}`
+      });
+      answer = response.text;
+      usage = response.usage;
+    }
   }
 
-  const webCitations = uniqueBy(
-    webResults.map((result) => result.url).filter((url): url is string => Boolean(url)),
-    (item) => item
-  );
-  const citations = uniqueBy([...relatedSourceIds, ...webCitations], (item) => item);
+  const grounding = evaluateGrounding({ evidenceItems, answer, structured: structuredAnswer });
+  const groundingWarnings = uniqueBy([...grounding.groundingWarnings, ...providerWarnings], (item) => item);
+  const evidenceState =
+    grounding.evidenceState === "insufficient" ? "insufficient" : groundingWarnings.length ? "partial" : grounding.evidenceState;
 
   return {
     answer,
-    citations,
+    citations: grounding.citations,
     relatedPageIds,
     relatedNodeIds,
     relatedSourceIds,
     schemaHash: querySchema.hash,
     projectIds: pageProjectIds,
-    usage
+    usage,
+    evidenceState,
+    groundingWarnings,
+    invalidCitations: grounding.invalidCitations,
+    recommendedNextTool: structuredAnswer?.recommendedNextTool ?? recommendedNextTool,
+    retrievalDebug: options.queryOptions?.debugContext
+      ? {
+          query: question,
+          searchOptions: searchOptions as unknown as Record<string, unknown>,
+          evidenceItems,
+          usedEvidenceIds: grounding.usedEvidenceIds,
+          warnings: groundingWarnings
+        }
+      : undefined
   };
 }
 
@@ -5113,6 +5406,52 @@ async function runConfiguredBenchmark(rootDir: string, config: VaultConfig): Pro
   }
 }
 
+function summarizeAnalysisStats(analyses: SourceAnalysis[]): NonNullable<CompileResult["analysisStats"]> {
+  const stats: NonNullable<CompileResult["analysisStats"]> = {
+    total: analyses.length,
+    provider: 0,
+    heuristic: 0,
+    vision: 0,
+    code: 0,
+    empty: 0,
+    fallbackCount: 0,
+    fallbackRatio: 0,
+    failedSourceIds: []
+  };
+  for (const analysis of analyses) {
+    const mode = analysis.analysisMode ?? "heuristic";
+    if (mode === "provider") stats.provider += 1;
+    else if (mode === "vision") stats.vision += 1;
+    else if (mode === "code") stats.code += 1;
+    else if (mode === "empty") stats.empty += 1;
+    else stats.heuristic += 1;
+
+    const hasProviderFailure = (analysis.warnings ?? []).some((warning) => /provider analysis failed/i.test(warning));
+    if (hasProviderFailure) {
+      stats.fallbackCount += 1;
+      stats.failedSourceIds.push(analysis.sourceId);
+    }
+  }
+  stats.fallbackRatio = stats.total > 0 ? stats.fallbackCount / stats.total : 0;
+  return stats;
+}
+
+async function runWithConcurrency<T>(tasks: Array<() => Promise<T>>, maxParallel: number): Promise<T[]> {
+  const limit = Math.max(1, maxParallel);
+  const results: T[] = new Array(tasks.length);
+  let cursor = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(limit, tasks.length) }, async () => {
+      while (cursor < tasks.length) {
+        const index = cursor;
+        cursor += 1;
+        results[index] = await tasks[index]();
+      }
+    })
+  );
+  return results;
+}
+
 export async function compileVault(rootDir: string, options: CompileOptions = {}): Promise<CompileResult> {
   const startedAt = new Date().toISOString();
   const { config, paths } = await initWorkspace(rootDir);
@@ -5159,7 +5498,16 @@ export async function compileVault(rootDir: string, options: CompileOptions = {}
 
   const dirty: SourceManifest[] = [];
   const clean: SourceManifest[] = [];
+  const forceAnalysis = options.forceAnalysis ?? false;
   for (const manifest of manifests) {
+    if (forceAnalysis) {
+      if (options.codeOnly && manifest.sourceKind !== "code") {
+        clean.push(manifest);
+      } else {
+        dirty.push(manifest);
+      }
+      continue;
+    }
     const hashChanged = previousSourceHashes[manifest.sourceId] !== manifest.semanticHash;
     const noAnalysis = !previousAnalyses[manifest.sourceId];
     const projectId = sourceProjects[manifest.sourceId] ?? null;
@@ -5228,45 +5576,29 @@ export async function compileVault(rootDir: string, options: CompileOptions = {}
   }
 
   const analysisProgress = createCompileProgressReporter("analyze", manifests.length);
-  const [dirtyAnalyses, cleanAnalyses] = await Promise.all([
-    Promise.all(
-      dirty.map(async (manifest) => {
-        const analysis = await analyzeSource(
+  const analysisConcurrency = 8;
+  const analyses = await runWithConcurrency(
+    manifests.map(
+      (manifest) => async () =>
+        await analyzeSource(
           manifest,
           await readExtractedText(rootDir, manifest),
           provider,
           paths,
-          getEffectiveSchema(schemas, sourceProjects[manifest.sourceId] ?? null)
-        );
-        analysisProgress.tick(manifest.title);
-        return analysis;
-      })
-    ),
-    Promise.all(
-      clean.map(async (manifest) => {
-        const cached = await readJsonFile<SourceAnalysis>(path.join(paths.analysesDir, `${manifest.sourceId}.json`));
-        if (cached) {
+          getEffectiveSchema(schemas, sourceProjects[manifest.sourceId] ?? null),
+          forceAnalysis ? { bypassCache: true } : undefined
+        ).then((analysis) => {
           analysisProgress.tick(manifest.title);
-          return cached;
-        }
-        const analysis = await analyzeSource(
-          manifest,
-          await readExtractedText(rootDir, manifest),
-          provider,
-          paths,
-          getEffectiveSchema(schemas, sourceProjects[manifest.sourceId] ?? null)
-        );
-        analysisProgress.tick(manifest.title);
-        return analysis;
-      })
-    )
-  ]);
+          return analysis;
+        })
+    ),
+    analysisConcurrency
+  );
   analysisProgress.finish(`dirty=${dirty.length}, clean=${clean.length}`);
 
-  const initialAnalyses = [...dirtyAnalyses, ...cleanAnalyses];
-  const codeIndex = await buildCodeIndex(rootDir, manifests, initialAnalyses);
-  const analyses = await Promise.all(
-    initialAnalyses.map(async (analysis) => {
+  const codeIndex = await buildCodeIndex(rootDir, manifests, analyses);
+  const enrichedAnalyses = await Promise.all(
+    analyses.map(async (analysis) => {
       const manifest = manifests.find((item) => item.sourceId === analysis.sourceId);
       if (!manifest || !analysis.code) {
         return analysis;
@@ -5278,6 +5610,20 @@ export async function compileVault(rootDir: string, options: CompileOptions = {}
       return enriched;
     })
   );
+  const analysisStats = summarizeAnalysisStats(enrichedAnalyses);
+  const fallbackPolicy = options.failOnFallback ? "fail" : (config.analysis?.failurePolicy ?? "warn");
+  const maxFallbackRatio = Math.min(1, Math.max(0, config.analysis?.maxFallbackRatio ?? 1));
+  const fallbackRatioExceeded = analysisStats.fallbackRatio > maxFallbackRatio;
+  const shouldFailOnFallback = (fallbackPolicy === "fail" && analysisStats.fallbackCount > 0) || fallbackRatioExceeded;
+  if (shouldFailOnFallback) {
+    const ratioPct = (analysisStats.fallbackRatio * 100).toFixed(2);
+    const thresholdPct = (maxFallbackRatio * 100).toFixed(2);
+    const failedPreview = analysisStats.failedSourceIds.slice(0, 12).join(", ");
+    throw new Error(
+      `Compile aborted: provider fallbacks=${analysisStats.fallbackCount}/${analysisStats.total} (${ratioPct}%), threshold=${thresholdPct}%.` +
+        (failedPreview ? ` sources=${failedPreview}` : "")
+    );
+  }
 
   await Promise.all([
     ensureDir(path.join(paths.wikiDir, "sources")),
@@ -5294,7 +5640,7 @@ export async function compileVault(rootDir: string, options: CompileOptions = {}
   const sync = await syncVaultArtifacts(rootDir, {
     schemas,
     manifests,
-    analyses,
+    analyses: enrichedAnalyses,
     codeIndex,
     sourceProjects,
     outputPages,
@@ -5418,6 +5764,11 @@ export async function compileVault(rootDir: string, options: CompileOptions = {}
       `memory=${memoryPages.length}`,
       `candidates=${sync.candidatePageCount}`,
       `promoted=${sync.promotedPageIds.length}`,
+      `analysis.total=${analysisStats.total}`,
+      `analysis.provider=${analysisStats.provider}`,
+      `analysis.heuristic=${analysisStats.heuristic}`,
+      `analysis.fallback=${analysisStats.fallbackCount}`,
+      `analysis.fallbackRatio=${analysisStats.fallbackRatio.toFixed(4)}`,
       `staged=${sync.staged}`,
       `postPassApproval=${postPassApprovalId ?? "none"}`,
       `schema=${schemas.effective.global.hash.slice(0, 12)}`,
@@ -5500,8 +5851,139 @@ export async function compileVault(rootDir: string, options: CompileOptions = {}
     promotedPageIds: [...sync.promotedPageIds, ...promotedFromAuto],
     candidatePageCount: sync.candidatePageCount,
     autoPromotion: autoPromotionSummary,
-    tokenStats
+    tokenStats,
+    analysisStats
   };
+}
+
+export async function providerSmokeTest(rootDir: string, providerId: string): Promise<ProviderSmokeTestResult> {
+  const { config } = await loadVaultConfig(rootDir);
+  const providerConfig = config.providers[providerId];
+  if (!providerConfig) {
+    throw new Error(`Provider not found: ${providerId}`);
+  }
+  const provider = await createProvider(providerId, providerConfig, rootDir);
+  const result: ProviderSmokeTestResult = {
+    providerId,
+    providerType: provider.type,
+    providerModel: provider.model,
+    textOk: false,
+    structuredOk: false,
+    errors: []
+  };
+
+  try {
+    const textResponse = await provider.generateText({
+      prompt: "Return exactly: ok"
+    });
+    result.textOk = true;
+    result.textPreview = truncate(normalizeWhitespace(textResponse.text), 120);
+  } catch (error) {
+    result.errors.push(`text:${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  if (provider.capabilities.has("structured")) {
+    try {
+      const structured = await provider.generateStructured(
+        {
+          prompt: "Return JSON object with keys ok (boolean true) and provider (string)."
+        },
+        z.object({
+          ok: z.boolean(),
+          provider: z.string().optional()
+        })
+      );
+      result.structuredOk = Boolean(structured.ok);
+      result.structuredPreview = structured;
+    } catch (error) {
+      result.errors.push(`structured:${error instanceof Error ? error.message : String(error)}`);
+    }
+  } else {
+    result.structuredOk = false;
+    result.errors.push("structured:provider does not advertise structured capability");
+  }
+
+  return result;
+}
+
+type SemanticSearchHit = { pageId: string; path: string; title: string; kind: string; status: string; score: number };
+
+function matchesScalarOrList(value: string, filter: string | string[] | undefined): boolean {
+  const values = (Array.isArray(filter) ? filter : filter ? [filter] : []).filter((item) => item && item !== "all");
+  return !values.length || values.includes(value);
+}
+
+async function filterSemanticHitsBySearchOptions(
+  wikiDir: string,
+  graph: GraphArtifact,
+  hits: SemanticSearchHit[],
+  options: SearchQueryOptions
+): Promise<SemanticSearchHit[]> {
+  const pageMap = new Map(graph.pages.map((page) => [page.id, page]));
+  const filtered: SemanticSearchHit[] = [];
+  for (const hit of hits) {
+    const page = pageMap.get(hit.pageId);
+    if (!page) {
+      continue;
+    }
+    if (options.kind && options.kind !== "all" && page.kind !== options.kind) {
+      continue;
+    }
+    if (options.status && options.status !== "all" && page.status !== options.status) {
+      continue;
+    }
+    if (options.project && options.project !== "all") {
+      if (options.project === "unassigned" ? page.projectIds.length > 0 : !page.projectIds.includes(options.project)) {
+        continue;
+      }
+    }
+    let data: Record<string, unknown> = {};
+    try {
+      data = matter(await fs.readFile(path.join(wikiDir, page.path), "utf8")).data;
+    } catch {
+      // Graph metadata is still enough for kind/status/project filters.
+    }
+    const authorityLayer = typeof data.authority_layer === "string" ? data.authority_layer : "";
+    const legalStatus = typeof data.legal_status === "string" ? data.legal_status : "";
+    const documentRole = typeof data.document_role === "string" ? data.document_role : "";
+    const jurisdiction = typeof data.jurisdiction === "string" ? data.jurisdiction : "";
+    const region = typeof data.region === "string" ? data.region : "";
+    const pollutants = Array.isArray(data.pollutants)
+      ? data.pollutants
+          .filter((item): item is string => typeof item === "string")
+          .join("|")
+          .toLowerCase()
+      : typeof data.pollutants === "string"
+        ? data.pollutants.toLowerCase()
+        : "";
+
+    if (!matchesScalarOrList(authorityLayer, options.authorityLayer)) {
+      continue;
+    }
+    if (!matchesScalarOrList(legalStatus, options.legalStatus)) {
+      continue;
+    }
+    if (!matchesScalarOrList(documentRole, options.documentRole)) {
+      continue;
+    }
+    if (!matchesScalarOrList(jurisdiction, options.jurisdiction)) {
+      continue;
+    }
+    if (options.region && options.region !== "all" && !region.includes(options.region)) {
+      continue;
+    }
+    if (options.pollutant && options.pollutant !== "all" && !pollutants.includes(options.pollutant.toLowerCase())) {
+      continue;
+    }
+    if (options.includeDrafts !== true && legalStatus === "draft_consultation") {
+      continue;
+    }
+    if (options.includeSuperseded !== true && legalStatus === "superseded") {
+      continue;
+    }
+    filtered.push(hit);
+  }
+  return filtered;
 }
 
 export async function queryVault(rootDir: string, options: QueryOptions): Promise<QueryResult> {
@@ -5512,7 +5994,8 @@ export async function queryVault(rootDir: string, options: QueryOptions): Promis
   const schemas = await loadVaultSchemas(rootDir);
   const query = await executeQuery(rootDir, options.question, outputFormat, {
     gapFill: options.gapFill,
-    gapFillTask: "queryProvider"
+    gapFillTask: "queryProvider",
+    queryOptions: options
   });
   let savedPath: string | undefined;
   let stagedPath: string | undefined;
@@ -5590,6 +6073,8 @@ export async function queryVault(rootDir: string, options: QueryOptions): Promis
     tokenUsage: query.usage,
     lines: [
       `citations=${query.citations.join(",") || "none"}`,
+      `evidenceState=${query.evidenceState ?? "unknown"}`,
+      `recommendedNextTool=${query.recommendedNextTool ?? "knowledge_base"}`,
       `saved=${Boolean(savedPath)}`,
       `staged=${Boolean(stagedPath)}`,
       `format=${outputFormat}`,
@@ -5619,7 +6104,12 @@ export async function queryVault(rootDir: string, options: QueryOptions): Promis
     staged: Boolean(stagedPath),
     approvalId,
     approvalDir,
-    outputAssets
+    outputAssets,
+    evidenceState: query.evidenceState,
+    groundingWarnings: query.groundingWarnings,
+    invalidCitations: query.invalidCitations,
+    recommendedNextTool: query.recommendedNextTool,
+    retrievalDebug: query.retrievalDebug
   };
 }
 
@@ -5894,15 +6384,24 @@ export async function exploreVault(rootDir: string, options: ExploreOptions): Pr
   };
 }
 
-export async function searchVault(rootDir: string, query: string, limit = 5): Promise<SearchResult[]> {
+export async function searchVault(
+  rootDir: string,
+  query: string,
+  limitOrOptions: number | (SearchQueryOptions & { intent?: QueryOptions["intent"] }) = 5
+): Promise<SearchResult[]> {
   const { paths, config } = await loadVaultConfig(rootDir);
   if (!(await fileExists(paths.searchDbPath))) {
     await compileVault(rootDir, {});
   }
+  const options = typeof limitOrOptions === "number" ? ({ limit: limitOrOptions } as SearchQueryOptions) : limitOrOptions;
+  const limit = options.limit ?? 5;
 
   const retrieval = resolveRetrievalConfig(config);
   const hybrid = retrieval.hybrid;
-  const ftsResults = searchPages(paths.searchDbPath, query, hybrid ? limit * 3 : limit);
+  const ftsResults = searchPages(paths.searchDbPath, query, {
+    ...options,
+    limit: hybrid ? limit * 3 : limit
+  });
 
   if (!hybrid || !(await fileExists(paths.graphPath))) {
     return ftsResults.slice(0, limit);
@@ -5914,11 +6413,12 @@ export async function searchVault(rootDir: string, query: string, limit = 5): Pr
   }
 
   const semanticHits = await semanticPageSearch(rootDir, graph, query, limit * 3).catch(() => []);
-  if (!semanticHits.length) {
+  const filteredSemanticHits = await filterSemanticHitsBySearchOptions(paths.wikiDir, graph, semanticHits, options);
+  if (!filteredSemanticHits.length) {
     return ftsResults.slice(0, limit);
   }
 
-  const merged = mergeSearchResults(ftsResults, semanticHits, limit);
+  const merged = mergeSearchResults(ftsResults, filteredSemanticHits, limit);
 
   if (retrieval.rerank && merged.length > 1) {
     return rerankSearchResults(rootDir, query, merged, limit);
@@ -6415,6 +6915,53 @@ function structuralLintFindings(
       const absolutePath = path.join(paths.wikiDir, page.path);
       if (await fileExists(absolutePath)) {
         const content = await fs.readFile(absolutePath, "utf8");
+        const parsed = matter(content);
+        const replacedBy =
+          Array.isArray(parsed.data.replaced_by) || (typeof parsed.data.replaced_by === "string" && parsed.data.replaced_by.trim());
+        if (replacedBy && parsed.data.legal_status === "current_effective") {
+          findings.push({
+            severity: "error",
+            code: "superseded_marked_current",
+            message: `Page ${page.title} declares replacement metadata but is still marked current_effective.`,
+            pagePath: absolutePath,
+            relatedPageIds: [page.id]
+          });
+        }
+        if (parsed.data.legal_status === "draft_consultation" && parsed.data.authority_layer === "core") {
+          findings.push({
+            severity: "warning",
+            code: "draft_in_core_layer",
+            message: `Page ${page.title} is a draft consultation document but is classified as core authority.`,
+            pagePath: absolutePath,
+            relatedPageIds: [page.id]
+          });
+        }
+        if (
+          (page.kind === "concept" || page.kind === "entity") &&
+          /(扫描件|目录|附件|正文|未知|文件|raw|curated|pdf)$/i.test(page.title.trim())
+        ) {
+          findings.push({
+            severity: "warning",
+            code: "noisy_promoted_page",
+            message: `Page ${page.title} looks like a file artifact rather than a stable professional concept/entity.`,
+            pagePath: absolutePath,
+            relatedPageIds: [page.id]
+          });
+        }
+        if (page.kind === "output") {
+          const citations = Array.isArray(parsed.data.citations)
+            ? parsed.data.citations.filter((item: unknown): item is string => typeof item === "string" && item.trim().length > 0)
+            : [];
+          if (!citations.length) {
+            findings.push({
+              severity: "warning",
+              code: "ungrounded_output",
+              message: `Output page ${page.title} has no recorded citations.`,
+              pagePath: absolutePath,
+              relatedPageIds: [page.id]
+            });
+          }
+        }
         const claimLines = extractClaimSectionLines(content);
         if (claimLines !== null) {
           const uncited = claimLines.filter(

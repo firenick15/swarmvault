@@ -1,4 +1,5 @@
 import nlp from "compromise";
+import { envAirSearchTerms, extractStandardReferences, standardSearchTokens } from "./domain/env-air.js";
 
 // POS-tagged closed-class words compromise can identify. Filtering on these
 // gives us language-aware stopword removal without hand-maintaining a list.
@@ -9,7 +10,7 @@ function splitTermToTokens(term: string, tokens: string[]): void {
   // split them back into individual lowercase alphanumeric tokens so the
   // result is consistent with how our search index and frequency counters
   // want to consume them.
-  for (const piece of term.split(/[^a-z0-9-]+/)) {
+  for (const piece of term.split(/[^a-z0-9.-]+/)) {
     const trimmed = piece.replace(/^-+|-+$/g, "");
     if (trimmed.length >= 2) {
       tokens.push(trimmed);
@@ -17,17 +18,38 @@ function splitTermToTokens(term: string, tokens: string[]): void {
   }
 }
 
-/**
- * Compromise-backed tokenizer. Returns lowercase term strings using
- * compromise's linguistic tokenization (handles contractions, hyphenation,
- * and most non-ASCII), with a narrow regex fallback when the NLP stack
- * returns nothing (e.g. very short strings, non-English text, or edge
- * cases that confuse the grammar).
- *
- * This is the shared replacement for ad-hoc `[a-z][a-z0-9-]{3,}` style
- * regex tokenization that used to live in analysis.ts and search.ts.
- */
-export function tokenize(text: string): string[] {
+function uniqueTokens(tokens: string[]): string[] {
+  const seen = new Set<string>();
+  const output: string[] = [];
+  for (const token of tokens) {
+    const normalized = token.toLowerCase().trim();
+    if (!normalized || seen.has(normalized)) {
+      continue;
+    }
+    seen.add(normalized);
+    output.push(normalized);
+  }
+  return output;
+}
+
+function chineseSearchTerms(text: string): string[] {
+  const terms: string[] = [];
+  for (const segment of text.match(/[\p{Script=Han}]{2,24}/gu) ?? []) {
+    if (segment.length <= 8) {
+      terms.push(segment);
+      continue;
+    }
+    terms.push(segment);
+    for (let size = 4; size <= 8; size += 2) {
+      for (let index = 0; index <= segment.length - size; index += 2) {
+        terms.push(segment.slice(index, index + size));
+      }
+    }
+  }
+  return terms;
+}
+
+function asciiSearchTokens(text: string): string[] {
   const lower = text.toLowerCase();
   try {
     const terms = nlp(lower).terms().out("array") as string[];
@@ -41,7 +63,36 @@ export function tokenize(text: string): string[] {
   } catch {
     // Fall through to the regex fallback below.
   }
-  return lower.match(/[a-z0-9][a-z0-9-]{1,}/g) ?? [];
+  return lower.match(/[a-z0-9][a-z0-9.-]{1,}/g) ?? [];
+}
+
+/**
+ * Compromise-backed tokenizer. Returns lowercase term strings using
+ * compromise's linguistic tokenization (handles contractions, hyphenation,
+ * and most non-ASCII), with a narrow regex fallback when the NLP stack
+ * returns nothing (e.g. very short strings, non-English text, or edge
+ * cases that confuse the grammar).
+ *
+ * This is the shared replacement for ad-hoc `[a-z][a-z0-9-]{3,}` style
+ * regex tokenization that used to live in analysis.ts and search.ts.
+ */
+export function tokenize(text: string): string[] {
+  return searchTokens(text);
+}
+
+/**
+ * Search-oriented tokenizer. Besides the English compromise tokens used by
+ * the original implementation, this preserves Chinese domain phrases and
+ * normalizes environmental standard references (GB 3095-2012, HJ/T 193, etc.).
+ */
+export function searchTokens(text: string): string[] {
+  const lower = text.toLowerCase();
+  return uniqueTokens([
+    ...asciiSearchTokens(lower),
+    ...standardSearchTokens(extractStandardReferences(text)),
+    ...envAirSearchTerms(text),
+    ...chineseSearchTerms(text)
+  ]);
 }
 
 /**

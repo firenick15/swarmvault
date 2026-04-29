@@ -1,5 +1,6 @@
 import path from "node:path";
 import { loadVaultConfig } from "./config.js";
+import { applyStandardRelationOverrides } from "./domain/standard-relations.js";
 import { rebuildSearchIndex } from "./search.js";
 import type { GraphArtifact, RetrievalConfig, RetrievalDoctorResult, RetrievalManifest, RetrievalStatus, VaultConfig } from "./types.js";
 import { fileExists, readJsonFile, sha256, toPosix, writeJsonFile } from "./utils.js";
@@ -57,6 +58,7 @@ export async function rebuildRetrievalIndex(rootDir: string): Promise<RetrievalS
   if (!graph) {
     throw new Error("Graph artifact not found. Run `swarmvault compile` before rebuilding retrieval.");
   }
+  await applyStandardRelationOverrides(paths.wikiDir, graph.pages);
   await rebuildSearchIndex(paths.searchDbPath, graph.pages, paths.wikiDir);
   await writeRetrievalManifest(rootDir, graph);
   return getRetrievalStatus(rootDir);

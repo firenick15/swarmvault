@@ -1,3 +1,4 @@
+import fs from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { z } from "zod";
@@ -16,6 +17,11 @@ const customModuleSchema = z.object({
   })
 });
 
+const PROVIDER_SECRETS_FILENAME = "swarmvault.secrets.json";
+const providerSecretsSchema = z.object({
+  providers: z.record(z.string(), z.object({ apiKey: z.string().min(1).optional() })).optional()
+});
+
 function resolveCapabilities(config: ProviderConfig, fallback: ProviderCapability[]): ProviderCapability[] {
   return config.capabilities?.length ? config.capabilities : fallback;
 }
@@ -24,7 +30,57 @@ function envOrUndefined(name?: string): string | undefined {
   return name ? process.env[name] : undefined;
 }
 
-function createOpenAiCompatiblePreset(
+async function apiKeyFromSecretsFile(rootDir: string, providerId: string): Promise<string | undefined> {
+  const secretsPath = path.join(rootDir, PROVIDER_SECRETS_FILENAME);
+  let raw: string;
+  try {
+    raw = await fs.readFile(secretsPath, "utf8");
+  } catch {
+    return undefined;
+  }
+  const parsed = providerSecretsSchema.safeParse(JSON.parse(raw));
+  if (!parsed.success) {
+    throw new Error(`Invalid ${PROVIDER_SECRETS_FILENAME} format. Expected { providers: { <id>: { apiKey } } }.`);
+  }
+  const candidate = parsed.data.providers?.[providerId]?.apiKey?.trim();
+  return candidate || undefined;
+}
+
+async function apiKeyFromFile(rootDir: string, filePath?: string): Promise<string | undefined> {
+  if (!filePath) {
+    return undefined;
+  }
+  const resolved = path.isAbsolute(filePath) ? filePath : path.resolve(rootDir, filePath);
+  const raw = (await fs.readFile(resolved, "utf8")).trim();
+  return raw || undefined;
+}
+
+async function resolveProviderSecret(
+  rootDir: string,
+  providerId: string,
+  config: ProviderConfig,
+  defaultApiKeyEnv?: string
+): Promise<string | undefined> {
+  const inlineKey = config.apiKey?.trim();
+  if (inlineKey) {
+    return inlineKey;
+  }
+
+  const secretFileKey = await apiKeyFromSecretsFile(rootDir, providerId);
+  if (secretFileKey) {
+    return secretFileKey;
+  }
+
+  const keyFromFile = await apiKeyFromFile(rootDir, config.apiKeyFile);
+  if (keyFromFile) {
+    return keyFromFile;
+  }
+
+  return envOrUndefined(config.apiKeyEnv ?? defaultApiKeyEnv);
+}
+
+async function createOpenAiCompatiblePreset(
+  rootDir: string,
   id: string,
   type: ProviderConfig["type"],
   config: ProviderConfig,
@@ -34,24 +90,30 @@ function createOpenAiCompatiblePreset(
     apiStyle?: "responses" | "chat";
     capabilities: ProviderCapability[];
   }
-): ProviderAdapter {
+): Promise<ProviderAdapter> {
+  const apiKey = await resolveProviderSecret(rootDir, id, config, defaults.apiKeyEnv);
   return new OpenAiCompatibleProviderAdapter(id, type, config.model, {
     baseUrl: config.baseUrl ?? defaults.baseUrl,
-    apiKey: envOrUndefined(config.apiKeyEnv ?? defaults.apiKeyEnv),
+    apiKey,
     headers: config.headers,
     apiStyle: config.apiStyle ?? defaults.apiStyle ?? "chat",
-    capabilities: resolveCapabilities(config, defaults.capabilities)
+    capabilities: resolveCapabilities(config, defaults.capabilities),
+    structuredOutputMode: config.structuredOutputMode,
+    maxRetries: config.maxRetries,
+    timeoutMs: config.timeoutMs,
+    debugProviderErrors: config.debugProviderErrors
   });
 }
 
 export async function createProvider(id: string, config: ProviderConfig, rootDir: string): Promise<ProviderAdapter> {
+  const resolvedApiKey = await resolveProviderSecret(rootDir, id, config);
   switch (config.type) {
     case "heuristic":
       return new HeuristicProviderAdapter(id, config.model);
     case "openai":
       return new OpenAiCompatibleProviderAdapter(id, "openai", config.model, {
         baseUrl: config.baseUrl ?? "https://api.openai.com/v1",
-        apiKey: envOrUndefined(config.apiKeyEnv),
+        apiKey: resolvedApiKey,
         headers: config.headers,
         apiStyle: config.apiStyle ?? "responses",
         capabilities: resolveCapabilities(config, [
@@ -64,12 +126,16 @@ export async function createProvider(id: string, config: ProviderConfig, rootDir
           "streaming",
           "image_generation",
           "audio"
-        ])
+        ]),
+        structuredOutputMode: config.structuredOutputMode,
+        maxRetries: config.maxRetries,
+        timeoutMs: config.timeoutMs,
+        debugProviderErrors: config.debugProviderErrors
       });
     case "ollama":
       return new OpenAiCompatibleProviderAdapter(id, "ollama", config.model, {
         baseUrl: config.baseUrl ?? "http://localhost:11434/v1",
-        apiKey: envOrUndefined(config.apiKeyEnv) ?? "ollama",
+        apiKey: resolvedApiKey ?? "ollama",
         headers: config.headers,
         apiStyle: config.apiStyle ?? "responses",
         capabilities: resolveCapabilities(config, [
@@ -82,46 +148,54 @@ export async function createProvider(id: string, config: ProviderConfig, rootDir
           "streaming",
           "local",
           "audio"
-        ])
+        ]),
+        structuredOutputMode: config.structuredOutputMode,
+        maxRetries: config.maxRetries,
+        timeoutMs: config.timeoutMs,
+        debugProviderErrors: config.debugProviderErrors
       });
     case "openai-compatible":
       return new OpenAiCompatibleProviderAdapter(id, "openai-compatible", config.model, {
         baseUrl: config.baseUrl ?? "http://localhost:8000/v1",
-        apiKey: envOrUndefined(config.apiKeyEnv),
+        apiKey: resolvedApiKey,
         headers: config.headers,
         apiStyle: config.apiStyle ?? "responses",
-        capabilities: resolveCapabilities(config, ["chat", "structured", "embeddings", "audio"])
+        capabilities: resolveCapabilities(config, ["chat", "structured", "embeddings", "audio"]),
+        structuredOutputMode: config.structuredOutputMode,
+        maxRetries: config.maxRetries,
+        timeoutMs: config.timeoutMs,
+        debugProviderErrors: config.debugProviderErrors
       });
     case "openrouter":
-      return createOpenAiCompatiblePreset(id, "openrouter", config, {
+      return createOpenAiCompatiblePreset(rootDir, id, "openrouter", config, {
         baseUrl: "https://openrouter.ai/api/v1",
         apiKeyEnv: "OPENROUTER_API_KEY",
         apiStyle: "chat",
         capabilities: ["chat", "structured", "embeddings"]
       });
     case "groq":
-      return createOpenAiCompatiblePreset(id, "groq", config, {
+      return createOpenAiCompatiblePreset(rootDir, id, "groq", config, {
         baseUrl: "https://api.groq.com/openai/v1",
         apiKeyEnv: "GROQ_API_KEY",
         apiStyle: "chat",
         capabilities: ["chat", "structured", "embeddings", "audio"]
       });
     case "together":
-      return createOpenAiCompatiblePreset(id, "together", config, {
+      return createOpenAiCompatiblePreset(rootDir, id, "together", config, {
         baseUrl: "https://api.together.xyz/v1",
         apiKeyEnv: "TOGETHER_API_KEY",
         apiStyle: "chat",
         capabilities: ["chat", "structured", "embeddings"]
       });
     case "xai":
-      return createOpenAiCompatiblePreset(id, "xai", config, {
+      return createOpenAiCompatiblePreset(rootDir, id, "xai", config, {
         baseUrl: "https://api.x.ai/v1",
         apiKeyEnv: "XAI_API_KEY",
         apiStyle: "chat",
         capabilities: ["chat", "structured", "embeddings"]
       });
     case "cerebras":
-      return createOpenAiCompatiblePreset(id, "cerebras", config, {
+      return createOpenAiCompatiblePreset(rootDir, id, "cerebras", config, {
         baseUrl: "https://api.cerebras.ai/v1",
         apiKeyEnv: "CEREBRAS_API_KEY",
         apiStyle: "chat",
@@ -129,13 +203,13 @@ export async function createProvider(id: string, config: ProviderConfig, rootDir
       });
     case "anthropic":
       return new AnthropicProviderAdapter(id, config.model, {
-        apiKey: envOrUndefined(config.apiKeyEnv),
+        apiKey: resolvedApiKey,
         headers: config.headers,
         baseUrl: config.baseUrl
       });
     case "gemini":
       return new GeminiProviderAdapter(id, config.model, {
-        apiKey: envOrUndefined(config.apiKeyEnv),
+        apiKey: resolvedApiKey,
         baseUrl: config.baseUrl
       });
     case "local-whisper":

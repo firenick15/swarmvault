@@ -29,6 +29,7 @@ import {
   pathGraphVault,
   previewCandidatePromotions,
   promoteCandidate,
+  providerSmokeTest,
   queryGraphVault,
   queryVault,
   readApproval,
@@ -258,17 +259,62 @@ export async function createMcpServer(rootDir: string): Promise<McpServer> {
       inputSchema: {
         question: z.string().min(1).describe("Question to ask the vault"),
         save: z.boolean().optional().describe("Persist the answer to wiki/outputs"),
-        format: z.enum(["markdown", "report", "slides", "chart", "image"]).optional().describe("Output format")
+        format: z.enum(["markdown", "report", "slides", "chart", "image"]).optional().describe("Output format"),
+        intent: z
+          .enum(["current_basis", "explanation", "evolution", "local", "statistics", "report_writing", "research"])
+          .optional()
+          .describe("Business intent for authority-aware retrieval and answer framing"),
+        region: z.string().optional().describe("Region/city/province filter"),
+        pollutants: z.array(z.string()).optional().describe("Optional pollutant focus list"),
+        includeDrafts: z.boolean().optional().describe("Allow draft consultation materials in retrieval"),
+        includeSuperseded: z.boolean().optional().describe("Allow superseded materials in retrieval"),
+        requireCurrentBasis: z.boolean().optional().describe("Require current effective basis materials"),
+        evidenceMode: z.enum(["strict", "balanced", "exploratory"]).optional().describe("Grounding strictness for the answer"),
+        strictGrounding: z.boolean().optional().describe("Only answer when retrieved evidence is sufficient"),
+        debugContext: z.boolean().optional().describe("Return retrieval evidence items and grounding diagnostics"),
+        scope: z.enum(["public_only", "tenant_only", "project_only", "mixed_public_private"]).optional(),
+        tenantId: z.string().optional(),
+        projectId: z.string().optional()
       }
     },
-    safeHandler(async ({ question, save, format }) => {
-      const result = await queryVault(rootDir, {
+    safeHandler(
+      async ({
         question,
-        save: save ?? true,
-        format
-      });
-      return asToolText(result);
-    })
+        save,
+        format,
+        intent,
+        region,
+        pollutants,
+        includeDrafts,
+        includeSuperseded,
+        requireCurrentBasis,
+        evidenceMode,
+        strictGrounding,
+        debugContext,
+        scope,
+        tenantId,
+        projectId
+      }) => {
+        const result = await queryVault(rootDir, {
+          question,
+          save: save ?? true,
+          format,
+          intent,
+          region,
+          pollutants,
+          includeDrafts,
+          includeSuperseded,
+          requireCurrentBasis,
+          evidenceMode,
+          strictGrounding,
+          debugContext,
+          scope,
+          tenantId,
+          projectId
+        });
+        return asToolText(result);
+      }
+    )
   );
 
   server.registerTool(
@@ -522,16 +568,36 @@ export async function createMcpServer(rootDir: string): Promise<McpServer> {
   );
 
   server.registerTool(
+    "provider_test",
+    {
+      description: "Run a provider smoke test (text + structured) for a configured provider id.",
+      inputSchema: {
+        providerId: z.string().min(1).describe("Provider id from swarmvault.config.json")
+      }
+    },
+    safeHandler(async ({ providerId }) => {
+      return asToolText(await providerSmokeTest(rootDir, providerId));
+    })
+  );
+
+  server.registerTool(
     "compile_vault",
     {
       description: "Compile source manifests into wiki pages, graph data, and search index.",
       inputSchema: {
         approve: z.boolean().optional().describe("Stage a review bundle without applying active page changes"),
-        maxTokens: z.number().int().min(1000).optional().describe("Maximum token budget for wiki output")
+        maxTokens: z.number().int().min(1000).optional().describe("Maximum token budget for wiki output"),
+        failOnFallback: z.boolean().optional().describe("Fail compile when provider analysis falls back to heuristics"),
+        forceAnalysis: z.boolean().optional().describe("Re-run analysis for all sources regardless of cache")
       }
     },
-    safeHandler(async ({ approve, maxTokens }) => {
-      const result = await compileVault(rootDir, { approve: approve ?? false, maxTokens });
+    safeHandler(async ({ approve, maxTokens, failOnFallback, forceAnalysis }) => {
+      const result = await compileVault(rootDir, {
+        approve: approve ?? false,
+        maxTokens,
+        failOnFallback: failOnFallback ?? false,
+        forceAnalysis: forceAnalysis ?? false
+      });
       return asToolText(result);
     })
   );

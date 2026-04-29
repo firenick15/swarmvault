@@ -23,11 +23,17 @@ const providerConfigSchema = z.object({
   type: providerTypeSchema,
   model: z.string().min(1),
   baseUrl: z.string().url().optional(),
+  apiKey: z.string().min(1).optional(),
   apiKeyEnv: z.string().min(1).optional(),
+  apiKeyFile: z.string().min(1).optional(),
   headers: z.record(z.string(), z.string()).optional(),
   module: z.string().min(1).optional(),
   capabilities: z.array(providerCapabilitySchema).optional(),
   apiStyle: z.enum(["responses", "chat"]).optional(),
+  structuredOutputMode: z.enum(["json_schema", "json_object", "prompt_json"]).optional(),
+  maxRetries: z.number().int().min(0).optional(),
+  timeoutMs: z.number().int().positive().optional(),
+  debugProviderErrors: z.boolean().optional(),
   binaryPath: z.string().min(1).optional(),
   modelPath: z.string().min(1).optional(),
   extraArgs: z.array(z.string()).optional(),
@@ -232,6 +238,22 @@ const vaultConfigSchema = z.object({
       rerank: z.boolean().optional(),
       embeddingProvider: z.string().min(1).optional(),
       maxIndexedRows: z.number().int().positive().optional()
+    })
+    .optional(),
+  analysis: z
+    .object({
+      failurePolicy: z.enum(["fail", "warn"]).optional(),
+      maxFallbackRatio: z.number().min(0).max(1).optional()
+    })
+    .optional(),
+  domain: z
+    .object({
+      profileId: z.string().min(1).optional(),
+      profilePath: z.string().min(1).optional(),
+      metadataSchemaPath: z.string().min(1).optional(),
+      termsPath: z.string().min(1).optional(),
+      rankingPath: z.string().min(1).optional(),
+      promptsDir: z.string().min(1).optional()
     })
     .optional(),
   webSearch: z
@@ -463,7 +485,12 @@ export function defaultVaultConfig(profile: VaultProfileConfig = defaultVaultPro
       shardSize: 25000,
       hybrid: true,
       rerank: false
-    }
+    },
+    analysis: {
+      failurePolicy: "warn",
+      maxFallbackRatio: 1
+    },
+    domain: {}
   };
 }
 
