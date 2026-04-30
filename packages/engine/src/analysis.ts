@@ -5,6 +5,9 @@ import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 import { analyzeCodeSource } from "./code-analysis.js";
 import { extractStandardReferences } from "./domain/env-air.js";
+import { DEFAULT_ENV_AIR_PROFILE } from "./domain/env-air-profile.js";
+import { normalizeDomainMetadataLegalStatus } from "./domain/env-air-status.js";
+import type { LoadedDomainProfile } from "./domain/profile-loader.js";
 import { readExtractionArtifact } from "./ingest.js";
 import {
   extractRationaleFromMarkdown,
@@ -38,7 +41,7 @@ import {
   writeJsonFile
 } from "./utils.js";
 
-const ANALYSIS_FORMAT_VERSION = 9;
+const ANALYSIS_FORMAT_VERSION = 10;
 
 const domainMetadataSchema = z
   .object({
@@ -535,7 +538,16 @@ function normalizeAnalysisTitle(manifest: SourceManifest, candidate: string): st
 
 function normalizeSourceAnalysis(manifest: SourceManifest, analysis: SourceAnalysis): SourceAnalysis {
   const title = normalizeAnalysisTitle(manifest, analysis.title);
-  return title === analysis.title ? analysis : { ...analysis, title };
+  const domain = analysis.domain
+    ? normalizeDomainMetadataLegalStatus(analysis.domain, {
+        title,
+        path: manifest.originalPath ?? manifest.repoRelativePath ?? manifest.storedPath
+      })
+    : undefined;
+  if (title === analysis.title && JSON.stringify(domain ?? null) === JSON.stringify(analysis.domain ?? null)) {
+    return analysis;
+  }
+  return { ...analysis, title, ...(domain ? { domain } : {}) };
 }
 
 function heuristicAnalysis(manifest: SourceManifest, text: string, schemaHash: string): SourceAnalysis {
@@ -595,19 +607,14 @@ async function providerAnalysis(
   manifest: SourceManifest,
   text: string,
   provider: ProviderAdapter,
-  schema: VaultSchema
+  schema: VaultSchema,
+  domainProfile: LoadedDomainProfile = DEFAULT_ENV_AIR_PROFILE
 ): Promise<SourceAnalysis> {
   const cleanedText = normalizeEnvAirText(text);
   const parsed = await provider.generateStructured(
     {
       system: [
-        "You are compiling a durable markdown wiki and graph for environmental air-pollution knowledge.",
-        "Build an integrated expert wiki, not one mechanical concept page per source. Merge related source-backed ideas into durable concepts that help environmental bureau staff decide what can be used in reports, enforcement support, monitoring review, and further research.",
-        "Distinguish authority tiers: current mandatory standards and regulations, current monitoring/evaluation methods, recommended technical guides, explanatory or statistical background, research evidence, local implementation rules, draft/evolution materials, amendments, and historical/superseded versions.",
-        "Do not treat research papers, monthly reports, annual bulletins, white papers, public interpretations, or technical guides as mandatory execution basis unless the source itself is a binding regulation, current standard, current method standard, or effective local rule.",
-        "For each source, preserve retrievable clues for standard codes, pollutants, averaging periods, limit values, formulas, effective dates, implementation dates, replacement relationships, jurisdictions, and document roles.",
-        "Prefer concepts around standard limits, evaluation methods, monitoring methods, data QA/QC, abnormal data handling, authority boundaries, local adaptation, historical evolution, and report-writing practice. Avoid generic concepts that only restate broad terms like pollution, environment, monitoring, or standard.",
-        "When amendments or drafts appear, identify the affected standard, changed clauses, implementation status, and whether the material is binding or only historical/evolution context.",
+        ...domainProfile.sourceAnalysisSystemPrompt,
         "",
         "Follow the vault schema when choosing titles, categories, relationships, and summaries.",
         "",
@@ -753,7 +760,7 @@ export async function analyzeSource(
   provider: ProviderAdapter,
   paths: ResolvedPaths,
   schema: VaultSchema,
-  options: { bypassCache?: boolean; domainProfileHash?: string } = {}
+  options: { bypassCache?: boolean; domainProfileHash?: string; domainProfile?: LoadedDomainProfile } = {}
 ): Promise<SourceAnalysis> {
   const cachePath = path.join(paths.analysesDir, `${manifest.sourceId}.json`);
   const cached = options.bypassCache ? null : await readJsonFile<SourceAnalysis>(cachePath);
@@ -817,7 +824,7 @@ export async function analyzeSource(
       analysis = heuristicAnalysis(manifest, content, schema.hash);
     } else {
       try {
-        analysis = await providerAnalysis(manifest, content, provider, schema);
+        analysis = await providerAnalysis(manifest, content, provider, schema, options.domainProfile);
       } catch (error) {
         providerFailure = error instanceof Error ? error.message : String(error);
         analysis = heuristicAnalysis(manifest, content, schema.hash);
@@ -850,7 +857,7 @@ export async function analyzeSource(
     analysis = heuristicAnalysis(manifest, content, schema.hash);
   } else {
     try {
-      analysis = await providerAnalysis(manifest, content, provider, schema);
+      analysis = await providerAnalysis(manifest, content, provider, schema, options.domainProfile);
     } catch (error) {
       providerFailure = error instanceof Error ? error.message : String(error);
       analysis = heuristicAnalysis(manifest, content, schema.hash);

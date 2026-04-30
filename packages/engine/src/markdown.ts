@@ -28,7 +28,7 @@ import type {
   SourceManifest,
   VaultConfig
 } from "./types.js";
-import { normalizeWhitespace, slugify, slugifyKnowledgeLabel, uniqueBy } from "./utils.js";
+import { normalizeWhitespace, slugify, slugifyKnowledgeLabel, truncate, uniqueBy } from "./utils.js";
 
 export interface ManagedPageMetadata {
   status: PageStatus;
@@ -399,6 +399,18 @@ export function buildSourcePage(
             `Document Role: \`${analysis.domain.documentRole}\``,
             `Legal Status: \`${analysis.domain.legalStatus}\``,
             ...(analysis.domain.standardCode ? [`Standard Code: \`${analysis.domain.standardCode}\``] : []),
+            ...(analysis.domain.notes?.some((note) => note.startsWith("legal_status_"))
+              ? [
+                  "",
+                  "## Status Notice",
+                  "",
+                  `- Normalized legal status: \`${analysis.domain.legalStatus}\``,
+                  ...analysis.domain.notes
+                    .filter((note) => note.startsWith("legal_status_"))
+                    .slice(0, 4)
+                    .map((note) => `- ${note}`)
+                ]
+              : []),
             ""
           ]
         : []),
@@ -761,17 +773,23 @@ function renderAggregateExpertBody(
   sourceAnalyses: SourceAnalysis[],
   relatedOutputs: GraphPage[]
 ): string {
+  const budget = {
+    maxBytes: 80_000,
+    maxClaimsPerRole: sourceAnalyses.length > 80 ? 4 : 6,
+    maxClaimChars: 220,
+    maxSourceIndexPerRole: 10
+  };
   const lowerName = name.toLowerCase();
   const claimsByRole = new Map<string, string[]>();
   for (const analysis of sourceAnalyses) {
     const role = aggregateEvidenceRole(analysis);
     const bucket = claimsByRole.get(role) ?? [];
     for (const claim of analysis.claims) {
-      if (bucket.length >= 12) {
+      if (bucket.length >= budget.maxClaimsPerRole) {
         break;
       }
       if (claim.text.toLowerCase().includes(lowerName) || name.length <= 4) {
-        bucket.push(`${claim.text} [source:${claim.citation}]`);
+        bucket.push(`${truncate(normalizeWhitespace(claim.text), budget.maxClaimChars)} [source:${claim.citation}]`);
       }
     }
     claimsByRole.set(role, bucket);
@@ -782,7 +800,7 @@ function renderAggregateExpertBody(
     "",
     "## Summary",
     "",
-    summary,
+    truncate(normalizeWhitespace(summary), 1400),
     "",
     "## Professional Boundary",
     "",
@@ -799,12 +817,15 @@ function renderAggregateExpertBody(
     renderRoleSection("Local Adaptation", claimsByRole.get("local_adaptation")),
     "## Source Index",
     "",
-    ...renderSourceIndex(sourceGroups),
+    ...renderSourceIndex(sourceGroups, budget.maxSourceIndexPerRole),
     "",
     ...relatedOutputsSection(relatedOutputs),
     ""
   ];
-  return lines.filter((line) => line !== undefined).join("\n");
+  const body = lines.filter((line) => line !== undefined).join("\n");
+  return body.length > budget.maxBytes
+    ? `${body.slice(0, budget.maxBytes - 180)}\n\n## Rendering Budget Notice\n\nThis aggregate page was truncated to keep retrieval context bounded. Use linked source pages for the full evidence trail.\n`
+    : body;
 }
 
 function aggregateEvidenceRole(analysis: SourceAnalysis): string {
@@ -831,7 +852,7 @@ function aggregateEvidenceRole(analysis: SourceAnalysis): string {
 }
 
 function renderRoleSection(title: string, claims: string[] | undefined): string {
-  const uniqueClaims = uniqueBy(claims ?? [], (item) => item).slice(0, 12);
+  const uniqueClaims = uniqueBy(claims ?? [], (item) => item);
   if (!uniqueClaims.length) {
     return [`## ${title}`, "", "No directly scoped source claims were selected for this view.", ""].join("\n");
   }
@@ -847,15 +868,15 @@ function groupAnalysesByRole(sourceAnalyses: SourceAnalysis[]): Map<string, Sour
   return groups;
 }
 
-function renderSourceIndex(groups: Map<string, SourceAnalysis[]>): string[] {
+function renderSourceIndex(groups: Map<string, SourceAnalysis[]>, maxPerRole = 12): string[] {
   const lines: string[] = [];
   for (const [role, analyses] of [...groups.entries()].sort((left, right) => left[0].localeCompare(right[0]))) {
     lines.push(`### ${role}`, "");
-    for (const analysis of analyses.slice(0, 12)) {
+    for (const analysis of analyses.slice(0, maxPerRole)) {
       lines.push(`- [[${pagePathFor("source", analysis.sourceId).replace(/\.md$/, "")}|${analysis.title}]]`);
     }
-    if (analyses.length > 12) {
-      lines.push(`- ... ${analyses.length - 12} more source(s) omitted from this index view.`);
+    if (analyses.length > maxPerRole) {
+      lines.push(`- ... ${analyses.length - maxPerRole} more source(s) omitted from this index view.`);
     }
     lines.push("");
   }

@@ -166,7 +166,7 @@ async function deterministicEnvAirFindings(rootDir: string, graph: GraphArtifact
     }
     if ((page.kind === "concept" || page.kind === "entity") && raw.length > (page.status === "candidate" ? 80_000 : 60_000)) {
       findings.push({
-        severity: "warning",
+        severity: raw.length > 150_000 ? "error" : "warning",
         code: "aggregate_page_too_large",
         message: `${page.kind} page ${title} is ${raw.length} bytes and may exceed the retrieval context budget.`,
         pagePath: absolutePath,
@@ -191,6 +191,16 @@ async function deterministicEnvAirFindings(rootDir: string, graph: GraphArtifact
     const documentRole = typeof parsed.data.document_role === "string" ? parsed.data.document_role : "";
     const authorityLayer = typeof parsed.data.authority_layer === "string" ? parsed.data.authority_layer : "";
     const relatedSourceIds = page.sourceIds;
+    if (parsed.data.analysis_mode === "empty" && parsed.data.allow_empty !== true) {
+      findings.push({
+        severity: "error",
+        code: "empty_extraction_source",
+        message: `Source ${title} has no extracted text and should be OCRed, replaced, or explicitly marked allow_empty.`,
+        pagePath: absolutePath,
+        relatedSourceIds,
+        relatedPageIds: [page.id]
+      });
+    }
     const looksLikePrimaryStandard =
       /(标准|规范|技术规定|监测方法|修改单|征求意见稿|编制说明)/.test(combined.slice(0, 1200)) &&
       !["statistics", "research_literature", "whitepaper", "official_explanation"].includes(documentRole) &&

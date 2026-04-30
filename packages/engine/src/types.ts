@@ -1486,6 +1486,8 @@ export interface CompileOptions {
   topicReview?: boolean;
   skipBenchmark?: boolean;
   debugLifecycle?: boolean;
+  explainDirty?: boolean;
+  refreshIndex?: boolean;
   lockMode?: "wait" | "fail" | "skip";
   lifecycleTimeoutMs?: number;
 }
@@ -1497,6 +1499,22 @@ export interface CompileLifecycleStep {
   durationMs: number;
   ok: boolean;
   details?: Record<string, string | number | boolean | null>;
+}
+
+export interface CompileInvalidationReport {
+  dirtySourceCount: number;
+  cleanSourceCount: number;
+  rootSchemaChanged: boolean;
+  effectiveSchemaChanged: boolean;
+  projectConfigChanged: boolean;
+  domainProfileChanged: boolean;
+  sourcesChanged: boolean;
+  outputsChanged: boolean;
+  insightsChanged: boolean;
+  memoryChanged: boolean;
+  artifactsExist: boolean;
+  pendingCandidatePromotion: boolean;
+  dirtyReasons: Array<{ sourceId: string; reasons: string[] }>;
 }
 
 export interface InitOptions {
@@ -1545,6 +1563,7 @@ export interface CompileResult {
     skipped?: boolean;
     error?: string;
   };
+  invalidation?: CompileInvalidationReport;
   lifecycle?: CompileLifecycleStep[];
 }
 
@@ -1605,6 +1624,15 @@ export interface SearchResult {
   factType?: string;
   factTable?: string;
   factRawText?: string;
+  factClauseNo?: string;
+  factTableNo?: string;
+  factFormulaNo?: string;
+  factSourceSection?: string;
+  factSubject?: string;
+  factPredicate?: string;
+  factObjectValue?: string;
+  factQualifiers?: Record<string, string>;
+  factProvenance?: string;
   rankingSignals?: string[];
 }
 
@@ -1752,6 +1780,15 @@ export interface RetrievalDebugEvidenceItem {
   factType?: string;
   factTable?: string;
   factRawText?: string;
+  factClauseNo?: string;
+  factTableNo?: string;
+  factFormulaNo?: string;
+  factSourceSection?: string;
+  factSubject?: string;
+  factPredicate?: string;
+  factObjectValue?: string;
+  factQualifiers?: Record<string, string>;
+  factProvenance?: string;
   canonicalAliases?: string[];
   region?: string;
   excerpt: string;
@@ -1813,6 +1850,9 @@ export interface QueryResult {
   dataToolHints?: string[];
   agentDecision?: AgentDecision;
   evidenceSet?: RetrievalDebugEvidenceItem[];
+  primaryEvidenceSet?: RetrievalDebugEvidenceItem[];
+  supportingEvidenceSet?: RetrievalDebugEvidenceItem[];
+  excludedEvidenceSet?: Array<RetrievalDebugEvidenceItem & { exclusionReason: string }>;
   standardCoverage?: StandardCoverage[];
   evidenceCompleteness?: {
     requiredStandards: string[];

@@ -21,8 +21,11 @@ describe("environment air structured facts", () => {
     });
 
     expect(facts.length).toBeGreaterThan(0);
-    expect(facts[0]?.id).toMatch(/^fact:\d+$/);
-    expect(facts[0]?.stableId).toBe(facts[0]?.id);
-    expect(facts[0]?.legacyIds.some((id) => /^fact:\d+:[a-z_]+$/.test(id))).toBe(true);
+    const tableFact = facts.find((fact) => fact.provenance === "table");
+    expect(tableFact?.id).toMatch(/^fact:[a-f0-9]{16}$/);
+    expect(tableFact?.stableId).toBe(tableFact?.id);
+    expect(tableFact?.legacyIds.some((id) => /^fact:\d+$/.test(id))).toBe(true);
+    expect(tableFact?.legacyIds.some((id) => /^fact:\d+:[a-z_]+$/.test(id))).toBe(true);
+    expect(tableFact?.provenance).toBe("table");
   });
 });

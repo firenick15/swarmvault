@@ -35,6 +35,10 @@ export {
   standardSearchTokens
 } from "./domain/env-air.js";
 export { extractEnvAirStructuredFacts, renderStructuredFactSnippet } from "./domain/env-air-facts.js";
+export { DEFAULT_ENV_AIR_PROFILE } from "./domain/env-air-profile.js";
+export { normalizeDomainMetadataLegalStatus, normalizeEnvAirLegalStatus } from "./domain/env-air-status.js";
+export { buildDomainQueryPlan } from "./domain/intents.js";
+export { loadDomainProfile } from "./domain/profile-loader.js";
 export { applyStandardRelationOverrides } from "./domain/standard-relations.js";
 export {
   applyDecayToPages,

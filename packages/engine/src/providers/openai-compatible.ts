@@ -144,6 +144,47 @@ function stripNullObjectProperties(value: unknown): unknown {
   return Object.fromEntries(entries);
 }
 
+function coerceStructuredValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => coerceStructuredValue(item));
+  }
+  if (!isJsonSchemaObject(value)) {
+    return value;
+  }
+  const entries = Object.entries(value).map(([key, item]) => {
+    if ((key === "citation" || key.endsWith("Citation")) && isJsonSchemaObject(item)) {
+      return [key, JSON.stringify(item)];
+    }
+    if ((key === "concepts" || key === "entities" || key === "tags") && Array.isArray(item)) {
+      return [
+        key,
+        item.map((entry) =>
+          typeof entry === "string" && (key === "concepts" || key === "entities")
+            ? { name: entry, description: "" }
+            : coerceStructuredValue(entry)
+        )
+      ];
+    }
+    if (key === "claims" && Array.isArray(item)) {
+      return [
+        key,
+        item.map((entry) => {
+          if (typeof entry === "string") {
+            return { text: entry, citation: "", confidence: 0.5 };
+          }
+          if (isJsonSchemaObject(entry) && typeof entry.text !== "string") {
+            const candidate = entry.text ?? entry.claim ?? entry.summary ?? entry.content;
+            return { ...entry, text: typeof candidate === "string" ? candidate : JSON.stringify(candidate ?? entry) };
+          }
+          return coerceStructuredValue(entry);
+        })
+      ];
+    }
+    return [key, coerceStructuredValue(item)];
+  });
+  return Object.fromEntries(entries);
+}
+
 function buildStructuredFormat(schema: z.ZodTypeAny) {
   return {
     type: "json_schema" as const,
@@ -155,6 +196,27 @@ function buildStructuredFormat(schema: z.ZodTypeAny) {
 
 function truncateErrorBody(value: string): string {
   return truncate(value.replace(/\s+/g, " ").trim(), 360);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRetriableProviderError(status: number, body: string): boolean {
+  const normalized = body.toLowerCase();
+  return (
+    status === 429 ||
+    status >= 500 ||
+    normalized.includes("overloaded") ||
+    normalized.includes("failed_response") ||
+    normalized.includes("timeout") ||
+    normalized.includes("timed out") ||
+    normalized.includes("rate limit")
+  );
+}
+
+function retryDelayMs(attempt: number): number {
+  return [1_000, 3_000, 8_000][attempt] ?? 8_000;
 }
 
 function structuredErrorMessage(
@@ -209,7 +271,7 @@ export class OpenAiCompatibleProviderAdapter extends BaseProviderAdapter {
         throw new Error(structuredErrorMessage(this.id, attempt, result, error));
       }
       try {
-        return schema.parse(stripNullObjectProperties(JSON.parse(jsonText)));
+        return schema.parse(coerceStructuredValue(stripNullObjectProperties(JSON.parse(jsonText))));
       } catch (error) {
         throw new Error(structuredErrorMessage(this.id, attempt, result, error, jsonText.length));
       }
@@ -273,9 +335,10 @@ export class OpenAiCompatibleProviderAdapter extends BaseProviderAdapter {
           const errorBody = await response.text().catch(() => "");
           const summary = this.debugProviderErrors && errorBody ? ` body=${truncateErrorBody(errorBody)}` : "";
           const message = `Provider ${this.id} failed: ${response.status} ${response.statusText}${summary}`;
-          const retriable = response.status === 429 || response.status >= 500;
+          const retriable = isRetriableProviderError(response.status, errorBody);
           if (attempt < attempts - 1 && retriable) {
             lastError = new Error(message);
+            await sleep(retryDelayMs(attempt));
             continue;
           }
           throw new Error(message);
@@ -292,6 +355,7 @@ export class OpenAiCompatibleProviderAdapter extends BaseProviderAdapter {
         if (attempt >= attempts - 1) {
           throw lastError;
         }
+        await sleep(retryDelayMs(attempt));
       } finally {
         clearTimeout(timeout);
       }

@@ -1,4 +1,6 @@
 import { z } from "zod";
+import { DEFAULT_ENV_AIR_PROFILE, type EnvAirTopicSeed } from "./domain/env-air-profile.js";
+import type { LoadedDomainProfile } from "./domain/profile-loader.js";
 import { estimateTokens } from "./token-estimation.js";
 import type { ProviderAdapter, SourceAnalysis } from "./types.js";
 import { normalizeWhitespace, sha256, slugifyKnowledgeLabel, truncate, uniqueBy } from "./utils.js";
@@ -12,47 +14,6 @@ export interface TopicSynthesisPage {
   inputTokenEstimate: number;
   promptHash: string;
 }
-
-interface TopicSeed {
-  id: string;
-  title: string;
-  matcher: (analysis: SourceAnalysis) => boolean;
-}
-
-const TOPIC_SEEDS: TopicSeed[] = [
-  {
-    id: "ambient-air-quality-limits",
-    title: "环境空气质量标准限值",
-    matcher: (analysis) => /GB\s*3095|环境空气质量标准|限值|浓度限值/.test(topicHaystack(analysis))
-  },
-  {
-    id: "aqi-iaqi-method",
-    title: "AQI 与 IAQI 评价方法",
-    matcher: (analysis) => /HJ\s*633|AQI|IAQI|空气质量指数|日报|实时报/i.test(topicHaystack(analysis))
-  },
-  {
-    id: "ambient-air-assessment",
-    title: "环境空气质量达标评价",
-    matcher: (analysis) => /HJ\s*663|达标评价|评价技术规范|环境空气质量评价/i.test(topicHaystack(analysis))
-  },
-  {
-    id: "monitoring-qaqc",
-    title: "环境空气监测方法与质量控制",
-    matcher: (analysis) => /监测方法|自动监测|质量控制|质控|数据有效性|点位|采样|校准/.test(topicHaystack(analysis))
-  },
-  {
-    id: "local-adaptation",
-    title: "地方适配与执行口径",
-    matcher: (analysis) => analysis.domain?.authorityLayer === "local" || /地方|省|市|DB\d{2}/i.test(topicHaystack(analysis))
-  },
-  {
-    id: "standard-evolution",
-    title: "标准演化、修改单与历史版本",
-    matcher: (analysis) =>
-      analysis.domain?.authorityLayer === "evolution" ||
-      /修改单|征求意见|编制说明|历史版本|废止|替代|superseded|draft/i.test(topicHaystack(analysis))
-  }
-];
 
 const synthesisSchema = z.object({
   title: z.string().min(1),
@@ -73,6 +34,13 @@ function topicHaystack(analysis: SourceAnalysis): string {
   ]
     .filter(Boolean)
     .join("\n");
+}
+
+function topicSeedMatches(seed: EnvAirTopicSeed, analysis: SourceAnalysis): boolean {
+  const haystack = topicHaystack(analysis).toLowerCase().replace(/\s+/g, "");
+  const textMatched = (seed.anyText ?? []).some((term) => haystack.includes(term.toLowerCase().replace(/\s+/g, "")));
+  const layerMatched = Boolean(seed.domainAuthorityLayers?.includes(analysis.domain?.authorityLayer ?? ""));
+  return textMatched || layerMatched;
 }
 
 function contextForTopic(title: string, analyses: SourceAnalysis[], maxChars = 120_000): string {
@@ -142,22 +110,22 @@ export async function synthesizeEnvAirTopics(input: {
   analyses: SourceAnalysis[];
   provider: ProviderAdapter;
   schemaContent: string;
+  domainProfile?: LoadedDomainProfile;
   maxTopics?: number;
 }): Promise<TopicSynthesisPage[]> {
   const pages: TopicSynthesisPage[] = [];
-  for (const seed of TOPIC_SEEDS.slice(0, input.maxTopics ?? TOPIC_SEEDS.length)) {
-    const analyses = uniqueBy(input.analyses.filter(seed.matcher), (analysis) => analysis.sourceId).slice(0, 36);
+  const domainProfile = input.domainProfile ?? DEFAULT_ENV_AIR_PROFILE;
+  for (const seed of domainProfile.topicSeeds.slice(0, input.maxTopics ?? domainProfile.topicSeeds.length)) {
+    const analyses = uniqueBy(
+      input.analyses.filter((analysis) => topicSeedMatches(seed, analysis)),
+      (analysis) => analysis.sourceId
+    ).slice(0, 36);
     if (analyses.length < 2) {
       continue;
     }
     const context = contextForTopic(seed.title, analyses);
     const prompt = [
-      "你正在为环保局环境空气污染业务构建跨文档专家知识库。",
-      "请把多个来源有机综合成一个专业 wiki 页面，而不是逐条复述材料。",
-      "必须区分：现行强制执行依据、现行方法规范、推荐性技术指南、统计/报告证据、研究背景、地方口径、征求意见稿/编制说明/历史版本。",
-      "报告、研究、白皮书、公报不能直接写成强制执行依据；只有法律、法规、现行标准、现行规范、有效地方规则才能作为执行依据。",
-      "输出 Markdown body，使用这些二级标题：专家综合结论、现行执行依据、方法与计算口径、解释统计与研究背景、演化与历史版本、地方适配、不能直接作为依据的材料、来源索引。",
-      "所有关键陈述必须带 [source:<source_id>] 引用。",
+      ...domainProfile.topicSynthesisPromptLines,
       "",
       `Vault schema:\n${truncate(input.schemaContent, 6000)}`,
       "",

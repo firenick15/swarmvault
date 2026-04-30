@@ -1,4 +1,5 @@
 import type { ToolRoutingDecision } from "../types.js";
+import { DEFAULT_ENV_AIR_PROFILE, type EnvAirStandardCatalogEntry } from "./env-air-profile.js";
 
 export interface StandardReference {
   raw: string;
@@ -7,15 +8,6 @@ export interface StandardReference {
   year?: string;
   normalized: string;
   compact: string;
-}
-
-export interface EnvAirStandardCatalogEntry {
-  identity: string;
-  family: string;
-  number: string;
-  current?: string;
-  title: string;
-  aliases: string[];
 }
 
 export type RecommendedNextTool = "knowledge_base" | "environment_data_mcp" | "both";
@@ -41,212 +33,20 @@ const STANDARD_REFERENCE_PATTERN =
 
 const STANDARD_DASH_PATTERN = /[-‐‑‒–—―]/g;
 
-export const ENV_AIR_STANDARD_CATALOG: EnvAirStandardCatalogEntry[] = [
-  {
-    identity: "GB 3095",
-    family: "GB",
-    number: "3095",
-    current: "GB 3095-2026",
-    title: "环境空气质量标准",
-    aliases: ["GB 3095", "GB3095", "GB 3095-2026", "GB30952026", "环境空气质量标准", "环境空气标准", "空气质量标准"]
-  },
-  {
-    identity: "HJ 663",
-    family: "HJ",
-    number: "663",
-    current: "HJ 663-2026",
-    title: "环境空气质量评价技术规范",
-    aliases: ["HJ 663", "HJ663", "HJ 663-2026", "HJ6632026", "环境空气质量评价技术规范", "达标评价技术规范"]
-  },
-  {
-    identity: "HJ 633",
-    family: "HJ",
-    number: "633",
-    current: "HJ 633-2026",
-    title: "环境空气质量指数(AQI)技术规定",
-    aliases: ["HJ 633", "HJ633", "HJ 633-2026", "HJ6332026", "AQI技术规定", "空气质量指数技术规定", "日报和实时报技术规定"]
-  },
-  {
-    identity: "HJ 655",
-    family: "HJ",
-    number: "655",
-    title: "环境空气颗粒物连续自动监测系统安装和验收技术规范",
-    aliases: ["HJ 655", "HJ655", "颗粒物连续自动监测系统", "安装和验收技术规范"]
-  },
-  {
-    identity: "HJ 664",
-    family: "HJ",
-    number: "664",
-    title: "环境空气质量监测点位布设技术规范",
-    aliases: ["HJ 664", "HJ664", "监测点位布设", "环境空气质量监测点位"]
-  },
-  {
-    identity: "HJ 818",
-    family: "HJ",
-    number: "818",
-    title: "环境空气气态污染物连续自动监测系统运行和质控技术规范",
-    aliases: ["HJ 818", "HJ818", "气态污染物连续自动监测系统", "运行和质控技术规范"]
-  }
-];
+export const ENV_AIR_STANDARD_CATALOG: EnvAirStandardCatalogEntry[] = DEFAULT_ENV_AIR_PROFILE.standardCatalog;
 
-const ENV_AIR_TERMS = [
-  "环境空气",
-  "空气质量",
-  "环境空气质量",
-  "自动监测",
-  "连续自动监测",
-  "监测系统",
-  "监测方法",
-  "参比方法",
-  "手工监测",
-  "比对测试",
-  "平行性",
-  "零点噪声",
-  "量程噪声",
-  "示值误差",
-  "转换炉效率",
-  "数据有效性",
-  "有效数据",
-  "负值数据",
-  "负值",
-  "质量保证",
-  "质量控制",
-  "运行维护",
-  "运维",
-  "标准限值",
-  "执行依据",
-  "现行标准",
-  "强制标准",
-  "推荐标准",
-  "地方标准",
-  "国家标准",
-  "技术指南",
-  "技术规范",
-  "编制说明",
-  "征求意见稿",
-  "修改单",
-  "历史版本",
-  "废止",
-  "替代",
-  "重污染天气",
-  "应急减排",
-  "绩效分级",
-  "达标评价",
-  "污染过程",
-  "来源解析",
-  "协同控制",
-  "臭氧",
-  "细颗粒物",
-  "颗粒物",
-  "挥发性有机物",
-  "非甲烷总烃",
-  "氮氧化物",
-  "二氧化硫",
-  "二氧化氮",
-  "一氧化碳"
-];
-
-const TERM_ALIASES: Record<string, string[]> = {
-  "PM2.5": ["pm2.5", "pm 2.5", "pm25", "细颗粒物"],
-  PM10: ["pm10", "pm 10", "可吸入颗粒物"],
-  O3: ["o3", "o₃", "臭氧"],
-  SO2: ["so2", "so₂", "s o 2", "二氧化硫"],
-  NO2: ["no2", "no₂", "n o 2", "二氧化氮"],
-  CO: ["co", "一氧化碳"],
-  VOCs: ["vocs", "挥发性有机物"],
-  NMHC: ["nmhc", "非甲烷总烃"],
-  AQI: ["aqi", "空气质量指数"],
-  IAQI: ["iaqi", "分指数"]
-};
-
-const POLLUTANT_FOCUS_TERMS: Record<string, string[]> = {
-  "PM2.5": ["PM2.5", "PM 2.5", "PM25", "细颗粒物", "年平均", "日平均", "浓度限值", "一级", "二级"],
-  PM10: ["PM10", "PM 10", "可吸入颗粒物", "年平均", "日平均", "浓度限值", "一级", "二级"],
-  O3: ["O3", "O₃", "臭氧", "日最大8小时平均", "8小时平均", "1小时平均", "浓度限值", "一级", "二级"],
-  SO2: ["SO2", "SO₂", "二氧化硫", "年平均", "日平均", "1小时平均", "浓度限值", "一级", "二级"],
-  NO2: ["NO2", "NO₂", "二氧化氮", "年平均", "日平均", "1小时平均", "浓度限值", "一级", "二级"],
-  CO: ["CO", "一氧化碳", "日平均", "1小时平均", "浓度限值", "一级", "二级"]
-};
-
-const DATA_OBJECT_TERMS = ["监测数据", "实测", "站点数据", "原始数据", "连续监测", "小时值", "日均值", "月均值", "年均值"];
-const DATA_TIME_TERMS = [
-  "今天",
-  "今日",
-  "昨日",
-  "昨天",
-  "本周",
-  "上周",
-  "本月",
-  "上月",
-  "今年",
-  "去年",
-  "小时",
-  "日均",
-  "月均",
-  "年均",
-  "时段",
-  "期间",
-  "过程"
-];
-const DATA_LOCATION_TERMS = ["站点", "国控站", "省控站", "城市", "区域", "区县", "省", "市"];
-const DATA_OPERATION_TERMS = ["查询", "统计", "排名", "同比", "环比", "趋势", "过程分析", "达标率", "超标天数", "连续负值", "异常诊断"];
-const EXPLICIT_DATA_TOOL_TERMS = ["数据mcp", "环境数据mcp", "监测数据mcp", "调用数据"];
-const KNOWLEDGE_OPERATION_TERMS = [
-  "标准",
-  "规范",
-  "指南",
-  "依据",
-  "限值",
-  "浓度限值",
-  "评价方法",
-  "计算公式",
-  "技术规定",
-  "适用范围",
-  "修订",
-  "修改单",
-  "关系",
-  "口径",
-  "编制说明",
-  "法律",
-  "办法"
-];
-
-const KNOWLEDGE_HINTS = ["知识库", "标准", "规范", "指南", "依据", "限值", "要求", "方法", "解释", "编制说明", "法律", "办法"];
-
-const CURRENT_BASIS_HINTS = [
-  "现行",
-  "按什么执行",
-  "执行依据",
-  "限值",
-  "标准",
-  "依据",
-  "评价报告",
-  "报告依据",
-  "依据说明",
-  "达标评价",
-  "评价技术规范",
-  "分工",
-  "作用",
-  "current basis",
-  "what standard"
-];
-const LIMIT_HINTS = ["限值", "浓度限值", "一级", "二级", "年平均", "日平均", "小时平均", "日最大", "8小时", "达标", "超标", "评价"];
-const AQI_HINTS = ["AQI", "IAQI", "空气质量指数", "日报", "实时报", "日报和实时报", "日报技术规定"];
-const MONITORING_METHOD_HINTS = ["监测方法", "采样", "分析方法", "测定", "检出限", "公式", "校准", "质控", "质量控制"];
-const AUTHORITY_BOUNDARY_HINTS = [
-  "研究论文",
-  "论文",
-  "文献",
-  "报告",
-  "公报",
-  "白皮书",
-  "征求意见稿",
-  "编制说明",
-  "能否作为执法依据",
-  "直接执行",
-  "要求企业执行",
-  "是否强制"
-];
+const ENV_AIR_TERMS = DEFAULT_ENV_AIR_PROFILE.envTerms;
+const TERM_ALIASES: Record<string, string[]> = DEFAULT_ENV_AIR_PROFILE.termAliases;
+const POLLUTANT_FOCUS_TERMS: Record<string, string[]> = DEFAULT_ENV_AIR_PROFILE.pollutantFocusTerms;
+const DATA_OBJECT_TERMS = DEFAULT_ENV_AIR_PROFILE.dataObjectTerms;
+const DATA_TIME_TERMS = DEFAULT_ENV_AIR_PROFILE.dataTimeTerms;
+const DATA_LOCATION_TERMS = DEFAULT_ENV_AIR_PROFILE.dataLocationTerms;
+const DATA_OPERATION_TERMS = DEFAULT_ENV_AIR_PROFILE.dataOperationTerms;
+const EXPLICIT_DATA_TOOL_TERMS = DEFAULT_ENV_AIR_PROFILE.explicitDataToolTerms;
+const KNOWLEDGE_OPERATION_TERMS = DEFAULT_ENV_AIR_PROFILE.knowledgeOperationTerms;
+const KNOWLEDGE_HINTS = DEFAULT_ENV_AIR_PROFILE.knowledgeHints;
+const CURRENT_BASIS_HINTS = DEFAULT_ENV_AIR_PROFILE.currentBasisHints;
+const AUTHORITY_BOUNDARY_HINTS = DEFAULT_ENV_AIR_PROFILE.authorityBoundaryHints;
 
 function normalizeSpace(value: string): string {
   return value.replace(/\s+/g, " ").trim();
@@ -482,41 +282,15 @@ export function buildEnvAirQueryPlan(query: string): EnvAirQueryPlan {
     rankingSignals.push("explicit_standard_reference");
   }
 
-  if (
-    includesAnyTerm(normalizedQuery, LIMIT_HINTS) &&
-    pollutants.some((item) => ["PM2.5", "PM10", "O3", "SO2", "NO2", "CO"].includes(item))
-  ) {
-    expandedTerms.push("GB 3095", "GB 3095-2026", "GB 3095-2012", "环境空气质量标准", "环境空气质量标准限值", "一级", "二级");
-    pinnedStandards.push("GB 3095", "GB 3095-2026");
-    rankingSignals.push("ambient_air_quality_limit_question");
-  }
-
-  if (includesAnyTerm(normalizedQuery, AQI_HINTS)) {
-    expandedTerms.push("HJ 633", "HJ 633-2026", "HJ 633-2012", "环境空气质量指数", "空气质量日报", "空气质量实时报");
-    pinnedStandards.push("HJ 633", "HJ 633-2026");
-    rankingSignals.push("aqi_reporting_question");
-  }
-
-  if (includesAnyTerm(normalizedQuery, ["评价技术规范", "达标评价", "评价报告", "报告依据", "空气质量评价"])) {
-    expandedTerms.push("HJ 663", "HJ 663-2026", "环境空气质量评价技术规范", "达标评价技术规范");
-    pinnedStandards.push("HJ 663", "HJ 663-2026");
-    rankingSignals.push("ambient_air_quality_assessment_question");
-  }
-
-  if (includesAnyTerm(normalizedQuery, MONITORING_METHOD_HINTS)) {
-    expandedTerms.push("环境空气监测方法", "环境空气质量监测规范", "采样", "质量保证", "质量控制");
-    rankingSignals.push("monitoring_method_question");
-  }
-
-  if (inferAuthorityBoundaryIntent(normalizedQuery)) {
-    expandedTerms.push("执行依据", "强制标准", "推荐标准", "征求意见稿", "编制说明", "研究论文", "技术参考", "法律效力");
-    rankingSignals.push("authority_boundary_question");
-  }
-
-  if (normalizedQuery.includes("HJ 482") || normalizedQuery.includes("HJ482") || normalizedQuery.includes("副玫瑰苯胺")) {
-    expandedTerms.push("HJ 482", "HJ 482-2009", "修改单", "甲醛吸收", "副玫瑰苯胺分光光度法");
-    pinnedStandards.push("HJ 482");
-    rankingSignals.push("hj482_amendment_question");
+  for (const rule of [...DEFAULT_ENV_AIR_PROFILE.intentRules].sort((left, right) => right.priority - left.priority)) {
+    const textMatched = !rule.anyText?.length || includesAnyTerm(normalizedQuery, rule.anyText);
+    const pollutantMatched = rule.anyPollutant !== true || pollutants.length > 0;
+    if (!textMatched || !pollutantMatched) {
+      continue;
+    }
+    expandedTerms.push(...(rule.expandedTerms ?? []));
+    pinnedStandards.push(...(rule.pinnedStandards ?? []));
+    rankingSignals.push(...(rule.rankingSignals ?? []));
   }
 
   return {

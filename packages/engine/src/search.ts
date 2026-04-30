@@ -2,7 +2,6 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import matter from "gray-matter";
 import {
-  buildEnvAirQueryPlan,
   buildEnvAirSearchText,
   extractStandardReferences,
   inferCurrentBasisIntent,
@@ -13,6 +12,9 @@ import {
   standardRefsForExactRetrieval
 } from "./domain/env-air.js";
 import { extractEnvAirStructuredFacts, renderStructuredFactSnippet } from "./domain/env-air-facts.js";
+import { normalizeEnvAirLegalStatus } from "./domain/env-air-status.js";
+import { buildDomainQueryPlan } from "./domain/intents.js";
+import type { LoadedDomainProfile } from "./domain/profile-loader.js";
 import { searchTokens } from "./tokenize.js";
 import type {
   GraphPage,
@@ -50,6 +52,7 @@ export interface SearchPageFilters {
 
 export interface SearchQueryOptions extends SearchPageFilters {
   limit?: number;
+  domainProfile?: LoadedDomainProfile;
   chunking?: {
     enabled?: boolean;
     maxChars?: number;
@@ -189,6 +192,40 @@ function parseJsonStringList(value: unknown): string[] | undefined {
   }
 }
 
+function parseJsonObject(value: unknown): Record<string, string> | undefined {
+  const raw = typeof value === "string" ? value : "";
+  if (!raw) {
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return undefined;
+    }
+    return Object.fromEntries(Object.entries(parsed).filter((entry): entry is [string, string] => typeof entry[1] === "string"));
+  } catch {
+    return undefined;
+  }
+}
+
+function uniqueCompact(values: string[]): string[] {
+  const seen = new Set<string>();
+  const output: string[] = [];
+  for (const value of values) {
+    const normalized = value.replace(/\s+/g, " ").trim();
+    if (!normalized) {
+      continue;
+    }
+    const key = normalized.toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    output.push(normalized);
+  }
+  return output;
+}
+
 function normalizedStandardQuery(query: string): string {
   return query
     .replace(/\bgb\s*\/\s*t\s*[- ]?([0-9]{2,6})(?:\s*[- ]\s*([0-9]{2,4}))?\b/gi, (_match, number, year) =>
@@ -267,6 +304,26 @@ function sourceExcerptBody(text: string): string {
   }
   const excerpt = text.slice(markerIndex + marker.length).trim();
   return excerpt || text;
+}
+
+function stripGeneratedSourceSections(text: string): string {
+  const generatedHeadings = new Set(["Concepts", "Entities", "Claims", "Questions", "Analysis Warnings", "Code Module"]);
+  const lines = text.split(/\r?\n/);
+  const kept: string[] = [];
+  let skipping = false;
+  for (const line of lines) {
+    const heading = line.match(/^##\s+(.+?)\s*$/)?.[1];
+    if (heading) {
+      skipping = generatedHeadings.has(heading);
+      if (skipping) {
+        continue;
+      }
+    }
+    if (!skipping) {
+      kept.push(line);
+    }
+  }
+  return kept.join("\n").trim();
 }
 
 function includesFocusTerm(text: string, focusTerms: string[]): boolean {
@@ -453,7 +510,18 @@ function inferEnvAirMetadata(input: {
     }
   }
 
-  return { authorityLayer, legalStatus, documentRole };
+  const normalizedStatus = normalizeEnvAirLegalStatus({
+    title: input.title,
+    path: input.sourcePath,
+    authorityLayer,
+    documentRole,
+    legalStatus
+  });
+  return {
+    authorityLayer: normalizedStatus.authorityLayer ?? authorityLayer,
+    legalStatus: normalizedStatus.legalStatus,
+    documentRole: normalizedStatus.documentRole ?? documentRole
+  };
 }
 
 function inferEvidenceRole(input: {
@@ -632,6 +700,15 @@ export async function rebuildSearchIndex(
       fact_legacy_ids TEXT NOT NULL,
       fact_type TEXT NOT NULL,
       table_name TEXT NOT NULL,
+      clause_no TEXT NOT NULL,
+      table_no TEXT NOT NULL,
+      formula_no TEXT NOT NULL,
+      source_section TEXT NOT NULL,
+      subject TEXT NOT NULL,
+      predicate TEXT NOT NULL,
+      object_value TEXT NOT NULL,
+      qualifiers_json TEXT NOT NULL,
+      provenance TEXT NOT NULL,
       standard_identity TEXT NOT NULL,
       evidence_role TEXT NOT NULL,
       source_authority_layer TEXT NOT NULL,
@@ -681,7 +758,7 @@ export async function rebuildSearchIndex(
     "INSERT INTO chunks (id, page_id, ordinal, heading, kind, location, text, search_terms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
   );
   const insertFact = db.prepare(
-    "INSERT INTO facts (id, page_id, fact_ordinal, fact_stable_id, fact_legacy_ids, fact_type, table_name, standard_identity, evidence_role, source_authority_layer, source_document_role, source_legal_status, reporting_period, evidence_period, pollutant, metric, averaging_period, value, unit, raw_text, search_terms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    "INSERT INTO facts (id, page_id, fact_ordinal, fact_stable_id, fact_legacy_ids, fact_type, table_name, clause_no, table_no, formula_no, source_section, subject, predicate, object_value, qualifiers_json, provenance, standard_identity, evidence_role, source_authority_layer, source_document_role, source_legal_status, reporting_period, evidence_period, pollutant, metric, averaging_period, value, unit, raw_text, search_terms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
   );
   const rootDir = path.dirname(wikiDir);
 
@@ -692,6 +769,7 @@ export async function rebuildSearchIndex(
       const content = await fs.readFile(absolutePath, "utf8");
       const parsed = matter(content);
       let body = parsed.content;
+      let rawSourceText = "";
       let sourcePath = "";
       const primarySourceId =
         Array.isArray(parsed.data.source_ids) && typeof parsed.data.source_ids[0] === "string"
@@ -707,7 +785,8 @@ export async function rebuildSearchIndex(
           if (excerptPath) {
             const excerpt = await fs.readFile(path.join(rootDir, excerptPath), "utf8");
             if (excerpt.trim()) {
-              body = `${body}\n\n## Source Excerpt\n\n${excerpt.trim()}`.trim();
+              rawSourceText = excerpt.trim();
+              body = `${body}\n\n## Source Excerpt\n\n${rawSourceText}`.trim();
             }
           }
         } catch {
@@ -797,8 +876,16 @@ export async function rebuildSearchIndex(
           insertChunk.run(chunk.chunkId, page.id, chunk.ordinal, chunk.heading, chunk.kind, chunk.location, chunk.text, chunk.searchTerms);
         }
       }
-      if (shouldExtractEnvAirFacts({ kind: page.kind, title: page.title, body, standardCode, standardRefCount: standards.length })) {
-        for (const fact of extractEnvAirStructuredFacts({ body, standardRefs: standards, standardCode })) {
+      const factBody = rawSourceText || stripGeneratedSourceSections(parsed.content);
+      if (
+        shouldExtractEnvAirFacts({ kind: page.kind, title: page.title, body: factBody, standardCode, standardRefCount: standards.length })
+      ) {
+        for (const fact of extractEnvAirStructuredFacts({
+          body: factBody,
+          standardRefs: standards,
+          standardCode,
+          sourceId: primarySourceId
+        })) {
           insertFact.run(
             `${page.id}:${fact.id}`,
             page.id,
@@ -807,6 +894,15 @@ export async function rebuildSearchIndex(
             JSON.stringify(fact.legacyIds ?? []),
             fact.type,
             fact.tableName ?? "",
+            fact.clauseNo ?? "",
+            fact.tableNo ?? "",
+            fact.formulaNo ?? "",
+            fact.sourceSection ?? "",
+            fact.subject ?? "",
+            fact.predicate ?? "",
+            fact.objectValue ?? "",
+            JSON.stringify(fact.qualifiers ?? {}),
+            fact.provenance ?? "",
             fact.standardCode ? standardIdentityKey(fact.standardCode) : standardIdentity,
             inferEvidenceRole(inferredMetadata),
             inferredMetadata.authorityLayer,
@@ -888,7 +984,7 @@ export function mergeSearchResults(
 
 export function searchPages(dbPath: string, query: string, limitOrOptions: number | SearchQueryOptions = 5): SearchResult[] {
   const options = typeof limitOrOptions === "number" ? { limit: limitOrOptions } : limitOrOptions;
-  const domainPlan = buildEnvAirQueryPlan(query);
+  const domainPlan = buildDomainQueryPlan(query, options.domainProfile);
   const expandedQuery = [domainPlan.normalizedQuery, ...domainPlan.expandedTerms, ...domainPlan.pinnedStandards].join(" ");
   const normalizedQuery = normalizedStandardQuery(expandedQuery);
   const ftsQuery = toFtsQuery(normalizedQuery);
@@ -956,6 +1052,15 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
         NULL AS factType,
         NULL AS factTable,
         NULL AS factRawText,
+        NULL AS factClauseNo,
+        NULL AS factTableNo,
+        NULL AS factFormulaNo,
+        NULL AS factSourceSection,
+        NULL AS factSubject,
+        NULL AS factPredicate,
+        NULL AS factObjectValue,
+        NULL AS factQualifiers,
+        NULL AS factProvenance,
         '${stage}' AS retrievalStage,
         ${snippetExpression} AS snippet,
         ${rankExpression} AS rank
@@ -999,6 +1104,15 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
         NULL AS factType,
         NULL AS factTable,
         NULL AS factRawText,
+        NULL AS factClauseNo,
+        NULL AS factTableNo,
+        NULL AS factFormulaNo,
+        NULL AS factSourceSection,
+        NULL AS factSubject,
+        NULL AS factPredicate,
+        NULL AS factObjectValue,
+        NULL AS factQualifiers,
+        NULL AS factProvenance,
         'chunk_fts' AS retrievalStage,
         ${snippetExpression} AS snippet,
         ${rankExpression} AS rank
@@ -1033,7 +1147,7 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
         facts.id AS chunkId,
         NULL AS chunkOrdinal,
         facts.table_name AS chunkHeading,
-        'table' AS chunkKind,
+        CASE WHEN facts.fact_type = 'formula' THEN 'formula' ELSE 'table' END AS chunkKind,
         facts.table_name AS chunkLocation,
         facts.id AS factId,
         facts.fact_stable_id AS factStableId,
@@ -1042,6 +1156,15 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
         facts.fact_type AS factType,
         facts.table_name AS factTable,
         facts.raw_text AS factRawText,
+        facts.clause_no AS factClauseNo,
+        facts.table_no AS factTableNo,
+        facts.formula_no AS factFormulaNo,
+        facts.source_section AS factSourceSection,
+        facts.subject AS factSubject,
+        facts.predicate AS factPredicate,
+        facts.object_value AS factObjectValue,
+        facts.qualifiers_json AS factQualifiers,
+        facts.provenance AS factProvenance,
         'structured_fact' AS retrievalStage,
         ${snippetExpression} AS snippet,
         ${rankExpression} AS rank
@@ -1140,8 +1263,8 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
           ELSE 0
         END,
         CASE
-          WHEN ${ambientLimitIntent ? 1 : 0} = 1 AND pages.standard_family = 'GB' AND pages.standard_number = '3095' AND (pages.document_role = 'standard' OR pages.title LIKE '%环境空气质量标准%') THEN 0
-          WHEN ${ambientLimitIntent ? 1 : 0} = 1 AND pages.standard_family = 'GB' AND pages.standard_number = '3095' THEN 1
+          WHEN ${ambientLimitIntent ? 1 : 0} = 1 AND pages.evidence_role = 'current_authority' AND pages.document_role = 'standard' THEN 0
+          WHEN ${ambientLimitIntent ? 1 : 0} = 1 AND pages.authority_layer IN ('core', 'method', 'local') THEN 1
           WHEN ${ambientLimitIntent ? 1 : 0} = 1 THEN 2
           ELSE 0
         END,
@@ -1230,8 +1353,8 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
     if ((ambientLimitIntent || retrievalStage === "structured_fact") && retrievalStage === "structured_fact") {
       return -95;
     }
-    if (ambientLimitIntent && /GB\s*3095/i.test(standardCode)) {
-      if (documentRole === "standard" || title.includes("环境空气质量标准") || title === "中华人民共和国国家标准") {
+    if (ambientLimitIntent && (evidenceRole === "current_authority" || authorityLayer === "core" || authorityLayer === "method")) {
+      if (documentRole === "standard" || retrievalStage === "structured_fact") {
         return -90;
       }
       return -70;
@@ -1258,7 +1381,9 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
       const title = String(row.title ?? "");
       const standardCode = String(row.standardCode ?? "");
       const snippet = String(row.snippet ?? "");
-      const isAmbientLimitTarget = ambientLimitIntent && /GB\s*3095/i.test(standardCode);
+      const isAmbientLimitTarget =
+        ambientLimitIntent &&
+        (String(row.evidenceRole ?? "") === "current_authority" || String(row.authorityLayer ?? "") === "core" || standardCode.length > 0);
       const isAmendmentTarget = amendmentIntent && (title.includes("修改单") || standardCode.includes("修改单"));
       if (!isAmbientLimitTarget && !isAmendmentTarget) {
         return false;
@@ -1275,9 +1400,9 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
       return;
     }
     const ambientTerms = pollutantFocusTermsForQuery(normalizedQuery);
-    const amendmentTerms = ["修改单", "甲醛吸收", "副玫瑰苯胺", "修订", "替换"];
+    const amendmentTerms = uniqueCompact([...domainPlan.expandedTerms, "修改单", "修订", "替换"]);
     for (const row of targetRows) {
-      const terms = ambientLimitIntent && /GB\s*3095/i.test(String(row.standardCode ?? "")) ? ambientTerms : amendmentTerms;
+      const terms = ambientLimitIntent ? ambientTerms : amendmentTerms;
       const statement = db.prepare(`
         SELECT id, ordinal, heading, kind, location, text
         FROM chunks
@@ -1291,15 +1416,13 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
           const text = String(chunk.text ?? "");
           const kind = String(chunk.kind ?? "");
           const matchScore = terms.reduce((score, term) => score + (text.includes(term) ? 1 : 0), 0);
-          const domainScore =
-            ambientLimitIntent && /GB\s*3095/i.test(String(row.standardCode ?? ""))
-              ? (includesFocusTerm(text, ambientTerms) ? 6 : 0) +
-                (/(年平均|日平均|1小时平均|日最大8小时平均)/.test(text) ? 4 : 0) +
-                (text.includes("浓度限值") || text.includes("一级") || text.includes("二级") ? 3 : 0)
-              : (text.includes("修改单") ? 5 : 0) +
-                (text.includes("甲醛吸收") ? 3 : 0) +
-                (text.includes("副玫瑰苯胺") ? 3 : 0) +
-                (hasUsefulAmendmentSnippet(sourceExcerptBody(text)) ? 8 : 0);
+          const domainScore = ambientLimitIntent
+            ? (includesFocusTerm(text, ambientTerms) ? 6 : 0) +
+              (/(年平均|日平均|1小时平均|日最大8小时平均)/.test(text) ? 4 : 0) +
+              (text.includes("浓度限值") || text.includes("一级") || text.includes("二级") ? 3 : 0)
+            : (text.includes("修改单") ? 5 : 0) +
+              amendmentTerms.reduce((score, term) => score + (text.includes(term) ? 2 : 0), 0) +
+              (hasUsefulAmendmentSnippet(sourceExcerptBody(text)) ? 8 : 0);
           const kindScore = kind === "table" || kind === "formula" ? 2 : kind === "paragraph" ? 1 : kind === "heading" ? -1 : 0;
           return { chunk, score: domainScore + matchScore + kindScore, kindScore };
         })
@@ -1321,9 +1444,7 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
       row.chunkLocation = chunk.location;
       row.snippet = focusedChunkSnippet(
         String(chunk.text ?? ""),
-        ambientLimitIntent && /GB\s*3095/i.test(String(row.standardCode ?? ""))
-          ? ambientTerms
-          : ["将", "修改为", "结果表示", "按式", "式中"]
+        ambientLimitIntent ? ambientTerms : ["将", "修改为", "结果表示", "按式", "式中"]
       );
       row.retrievalStage = row.retrievalStage ?? "chunk_fts";
     }
@@ -1553,6 +1674,15 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
     factType: String(row.factType ?? "") || undefined,
     factTable: String(row.factTable ?? "") || undefined,
     factRawText: String(row.factRawText ?? "") || undefined,
+    factClauseNo: String(row.factClauseNo ?? "") || undefined,
+    factTableNo: String(row.factTableNo ?? "") || undefined,
+    factFormulaNo: String(row.factFormulaNo ?? "") || undefined,
+    factSourceSection: String(row.factSourceSection ?? "") || undefined,
+    factSubject: String(row.factSubject ?? "") || undefined,
+    factPredicate: String(row.factPredicate ?? "") || undefined,
+    factObjectValue: String(row.factObjectValue ?? "") || undefined,
+    factQualifiers: parseJsonObject(row.factQualifiers),
+    factProvenance: String(row.factProvenance ?? "") || undefined,
     rankingSignals: domainPlan.rankingSignals,
     snippet:
       String(row.retrievalStage ?? "") === "structured_fact"

@@ -840,6 +840,8 @@ program
   .option("--topic-review", "Stage topic synthesis changes for review with compile approvals", false)
   .option("--skip-benchmark", "Skip configured benchmark after compile", false)
   .option("--debug-lifecycle", "Emit compile lifecycle timing in JSON output and active-handle diagnostics on stderr", false)
+  .option("--explain-dirty", "Include compile invalidation and per-source dirty reasons in output", false)
+  .option("--no-refresh-index", "Skip search-index refresh during compile")
   .addOption(new Option("--lock-mode <mode>", "Compile lock behavior").choices(["wait", "fail", "skip"]).default("wait"))
   .action(
     async (options: {
@@ -852,6 +854,8 @@ program
       topicReview?: boolean;
       skipBenchmark?: boolean;
       debugLifecycle?: boolean;
+      explainDirty?: boolean;
+      refreshIndex?: boolean;
       lockMode?: "wait" | "fail" | "skip";
     }) => {
       const maxTokens = options.maxTokens ? parsePositiveInt(options.maxTokens, 0) || undefined : undefined;
@@ -867,6 +871,8 @@ program
         topicReview: options.topicReview ?? false,
         skipBenchmark: options.skipBenchmark ?? false,
         debugLifecycle: options.debugLifecycle ?? false,
+        explainDirty: options.explainDirty ?? false,
+        refreshIndex: options.refreshIndex ?? true,
         lockMode: options.lockMode ?? "wait"
       });
       if (options.debugLifecycle) {
@@ -897,6 +903,11 @@ program
         }
         if (result.lifecycle?.length) {
           log(`Lifecycle: ${result.lifecycle.map((step) => `${step.phase}=${step.durationMs}ms`).join(", ")}.`);
+        }
+        if (options.explainDirty && result.invalidation) {
+          log(
+            `Invalidation: dirty=${result.invalidation.dirtySourceCount}, clean=${result.invalidation.cleanSourceCount}, reasons=${result.invalidation.dirtyReasons.length}.`
+          );
         }
       }
       if (options.commit) {

@@ -35,7 +35,9 @@ import {
   standardIdentityKey,
   standardRefsForExactRetrieval
 } from "./domain/env-air.js";
+import { buildDomainQueryPlan } from "./domain/intents.js";
 import { domainProfileHash } from "./domain/profile.js";
+import { type LoadedDomainProfile, loadDomainProfile } from "./domain/profile-loader.js";
 import { applyStandardRelationOverrides } from "./domain/standard-relations.js";
 import { embeddingSimilarityEdges, filterGraphBySourceClass, semanticGraphMatches, semanticPageSearch } from "./embeddings.js";
 import { markSuperseded, resolveDecayConfig, runDecayPass } from "./freshness.js";
@@ -118,6 +120,7 @@ import type {
   CandidatePromotionConfig,
   CandidateRecord,
   CodeIndexArtifact,
+  CompileInvalidationReport,
   CompileLifecycleStep,
   CompileOptions,
   CompileResult,
@@ -198,6 +201,9 @@ type QueryExecutionResult = {
   dataToolHints?: string[];
   agentDecision?: QueryResult["agentDecision"];
   evidenceSet?: QueryResult["evidenceSet"];
+  primaryEvidenceSet?: QueryResult["primaryEvidenceSet"];
+  supportingEvidenceSet?: QueryResult["supportingEvidenceSet"];
+  excludedEvidenceSet?: QueryResult["excludedEvidenceSet"];
   standardCoverage?: QueryResult["standardCoverage"];
   evidenceCompleteness?: QueryResult["evidenceCompleteness"];
   retrievalDebug?: RetrievalDebugInfo;
@@ -2966,6 +2972,7 @@ async function syncVaultArtifacts(
     insightHashes: Record<string, string>;
     memoryHashes: Record<string, string>;
     domainProfileHash: string;
+    domainProfile: LoadedDomainProfile;
     previousState: CompileState | null;
     approve?: boolean;
     promoteCandidates?: boolean;
@@ -3202,7 +3209,8 @@ async function syncVaultArtifacts(
     const topicPages = await synthesizeEnvAirTopics({
       analyses: input.analyses,
       provider: topicProvider,
-      schemaContent: input.schemas.effective.global.content
+      schemaContent: input.schemas.effective.global.content,
+      domainProfile: input.domainProfile
     });
     for (const topic of topicPages) {
       const sourceIds = uniqueStrings(topic.sourceIds);
@@ -4151,6 +4159,59 @@ function inferAuthorityBoundary(evidenceItems: EvidenceItem[]): NonNullable<Quer
   return "unknown";
 }
 
+function isCurrentAuthorityEvidence(item: EvidenceItem): boolean {
+  return (
+    (item.authorityLayer === "core" || item.authorityLayer === "method" || item.authorityLayer === "local") &&
+    (item.legalStatus === "current_effective" || !item.legalStatus) &&
+    (item.evidenceRole === "current_authority" ||
+      item.evidenceRole === "method" ||
+      item.evidenceRole === "local_adaptation" ||
+      Boolean(item.factId))
+  );
+}
+
+function splitEvidenceByAuthority(
+  evidenceItems: EvidenceItem[],
+  currentBasis: boolean
+): {
+  primary: EvidenceItem[];
+  supporting: EvidenceItem[];
+  excluded: Array<EvidenceItem & { exclusionReason: string }>;
+} {
+  if (!currentBasis) {
+    return { primary: evidenceItems, supporting: [], excluded: [] };
+  }
+  const primary: EvidenceItem[] = [];
+  const supporting: EvidenceItem[] = [];
+  const excluded: Array<EvidenceItem & { exclusionReason: string }> = [];
+  for (const item of evidenceItems) {
+    if (item.kind === "web") {
+      supporting.push(item);
+      continue;
+    }
+    if (isCurrentAuthorityEvidence(item)) {
+      primary.push(item);
+      continue;
+    }
+    if (
+      item.authorityLayer === "evidence" ||
+      item.evidenceRole === "statistics" ||
+      item.evidenceRole === "research" ||
+      item.evidenceRole === "official_explanation" ||
+      item.documentRole === "technical_guide"
+    ) {
+      supporting.push(item);
+      continue;
+    }
+    if (item.legalStatus === "draft_consultation" || item.legalStatus === "superseded" || item.authorityLayer === "evolution") {
+      excluded.push({ ...item, exclusionReason: "not_current_execution_basis" });
+      continue;
+    }
+    supporting.push(item);
+  }
+  return { primary, supporting, excluded };
+}
+
 function buildAgentDecision(input: {
   evidenceState?: QueryResult["evidenceState"];
   recommendedNextTool?: QueryResult["recommendedNextTool"];
@@ -4249,6 +4310,11 @@ function formatEvidenceSet(evidenceItems: EvidenceItem[]): string {
         item.factLegacyIds?.length ? `fact_legacy_ids=${item.factLegacyIds.join("|")}` : undefined,
         item.factType ? `fact_type=${item.factType}` : undefined,
         item.factTable ? `fact_table=${item.factTable}` : undefined,
+        item.factClauseNo ? `clause_no=${item.factClauseNo}` : undefined,
+        item.factTableNo ? `table_no=${item.factTableNo}` : undefined,
+        item.factFormulaNo ? `formula_no=${item.factFormulaNo}` : undefined,
+        item.factSourceSection ? `source_section=${item.factSourceSection}` : undefined,
+        item.factProvenance ? `fact_provenance=${item.factProvenance}` : undefined,
         "",
         item.excerpt
       ]
@@ -4510,7 +4576,8 @@ async function executeQuery(
   format: OutputFormat,
   options: { gapFill?: boolean; gapFillTask?: "queryProvider" | "exploreProvider"; queryOptions?: QueryOptions } = {}
 ): Promise<QueryExecutionResult> {
-  const { paths } = await loadVaultConfig(rootDir);
+  const { paths, config } = await loadVaultConfig(rootDir);
+  const domainProfile = await loadDomainProfile(rootDir, config);
   const schemas = await loadVaultSchemas(rootDir);
   const provider = await getProviderForTask(rootDir, "queryProvider");
   if (!(await fileExists(paths.searchDbPath)) || !(await fileExists(paths.graphPath))) {
@@ -4543,7 +4610,7 @@ async function executeQuery(
   const baseToolRouting = classifyEnvAirToolRouting(question);
   const recommendedNextTool = baseToolRouting.finalNextTool;
   const dataToolHints = buildEnvironmentDataToolHints(question);
-  const queryPlan = buildEnvAirQueryPlan(question);
+  const queryPlan = buildDomainQueryPlan(question, domainProfile);
   const currentBasisQuery =
     options.queryOptions?.intent === "current_basis" ||
     options.queryOptions?.intent === "report_writing" ||
@@ -4691,6 +4758,15 @@ async function executeQuery(
       factType: result.factType,
       factTable: result.factTable,
       factRawText: result.factRawText,
+      factClauseNo: result.factClauseNo,
+      factTableNo: result.factTableNo,
+      factFormulaNo: result.factFormulaNo,
+      factSourceSection: result.factSourceSection,
+      factSubject: result.factSubject,
+      factPredicate: result.factPredicate,
+      factObjectValue: result.factObjectValue,
+      factQualifiers: result.factQualifiers,
+      factProvenance: result.factProvenance,
       region: result.region,
       canonicalAliases: uniqueStrings(
         [result.factId, result.factStableId, ...(result.factLegacyIds ?? []), result.chunkId, result.pageId, sourceId].filter(
@@ -4728,7 +4804,9 @@ async function executeQuery(
       )
     });
   }
-  const standardCoverage = buildStandardCoverage(requiredStandards, evidenceItems);
+  const evidenceLayers = splitEvidenceByAuthority(evidenceItems, currentBasisQuery);
+  const evidenceForCoverage = currentBasisQuery && evidenceLayers.primary.length ? evidenceLayers.primary : evidenceItems;
+  const standardCoverage = buildStandardCoverage(requiredStandards, evidenceForCoverage);
   const evidenceCompleteness = evidenceCompletenessFromCoverage(standardCoverage);
   retrievalPlan.coveredStandards = evidenceCompleteness.coveredStandards;
   retrievalPlan.missingStandards = evidenceCompleteness.missingStandards;
@@ -4762,13 +4840,16 @@ async function executeQuery(
       agentDecision: buildAgentDecision({
         evidenceState: "insufficient",
         recommendedNextTool,
-        evidenceItems,
+        evidenceItems: currentBasisQuery && evidenceLayers.primary.length ? evidenceLayers.primary : evidenceItems,
         projectIds: pageProjectIds,
         standardCoverage,
         blockingReasons: ["no_retrieved_evidence"]
       }),
       standardCoverage,
       evidenceSet: evidenceItems,
+      primaryEvidenceSet: evidenceLayers.primary,
+      supportingEvidenceSet: evidenceLayers.supporting,
+      excludedEvidenceSet: evidenceLayers.excluded,
       evidenceCompleteness,
       retrievalDebug: options.queryOptions?.debugContext
         ? {
@@ -4813,7 +4894,7 @@ async function executeQuery(
       recommendedNextTool,
       toolRouting: baseToolRouting,
       answerBasis: inferAnswerBasis(options.queryOptions, recommendedNextTool),
-      currentStatus: summarizeCurrentStatus(evidenceItems),
+      currentStatus: summarizeCurrentStatus(currentBasisQuery && evidenceLayers.primary.length ? evidenceLayers.primary : evidenceItems),
       dataToolHints,
       agentDecision: buildAgentDecision({
         evidenceState: "insufficient",
@@ -4825,6 +4906,9 @@ async function executeQuery(
       }),
       standardCoverage,
       evidenceSet: evidenceItems,
+      primaryEvidenceSet: evidenceLayers.primary,
+      supportingEvidenceSet: evidenceLayers.supporting,
+      excludedEvidenceSet: evidenceLayers.excluded,
       evidenceCompleteness,
       retrievalDebug: options.queryOptions?.debugContext
         ? {
@@ -4851,8 +4935,18 @@ async function executeQuery(
     answer = formatHeuristicAnswer(question, excerpts, rawExcerpts, searchResults, format);
   } else {
     const context = [
-      "Evidence set:",
-      formatEvidenceSet(evidenceItems),
+      currentBasisQuery ? "Primary evidence set:" : "Evidence set:",
+      formatEvidenceSet(currentBasisQuery ? evidenceLayers.primary : evidenceItems),
+      ...(currentBasisQuery && evidenceLayers.supporting.length
+        ? ["", "Supporting evidence set:", formatEvidenceSet(evidenceLayers.supporting)]
+        : []),
+      ...(currentBasisQuery && evidenceLayers.excluded.length
+        ? [
+            "",
+            "Excluded from current execution basis:",
+            evidenceLayers.excluded.map((item) => `[${item.id}] ${item.title}: ${item.exclusionReason}`).join("\n")
+          ]
+        : []),
       "",
       ...(webExcerpts.length ? ["Web search evidence:", webExcerpts.join("\n\n---\n\n"), ""] : []),
       "Wiki context:",
@@ -4865,6 +4959,7 @@ async function executeQuery(
         `Current date: ${new Date().toISOString().slice(0, 10)}.`,
         "You answer for environmental air pollution regulatory and technical work.",
         "Use only the provided evidence set. Cite evidence item IDs like [E1] for every substantive claim.",
+        "For current-basis questions, answer execution requirements from the primary evidence set first; supporting evidence can explain background but must not override or create binding requirements.",
         "Evidence items may include chunk_id, chunk_heading, chunk_kind, and chunk_location; prefer table/formula chunks for limits, formulas, and numeric requirements.",
         "Distinguish mandatory/current-effective standards from recommended guides, drafts, explanations, and historical versions.",
         "Research papers, bulletins, white papers, public interpretations, and technical guides may explain background or method choices, but they cannot by themselves be stated as enforcement or mandatory execution basis.",
@@ -4949,18 +5044,21 @@ async function executeQuery(
     recommendedNextTool,
     toolRouting: finalToolRouting,
     answerBasis: inferAnswerBasis(options.queryOptions, recommendedNextTool),
-    currentStatus: summarizeCurrentStatus(evidenceItems),
+    currentStatus: summarizeCurrentStatus(currentBasisQuery && evidenceLayers.primary.length ? evidenceLayers.primary : evidenceItems),
     dataToolHints,
     agentDecision: buildAgentDecision({
       evidenceState,
       recommendedNextTool,
-      evidenceItems,
+      evidenceItems: currentBasisQuery && evidenceLayers.primary.length ? evidenceLayers.primary : evidenceItems,
       projectIds: pageProjectIds,
       standardCoverage,
       blockingReasons: groundingWarnings
     }),
     standardCoverage,
     evidenceSet: evidenceItems,
+    primaryEvidenceSet: evidenceLayers.primary,
+    supportingEvidenceSet: evidenceLayers.supporting,
+    excludedEvidenceSet: evidenceLayers.excluded,
     evidenceCompleteness,
     retrievalDebug: options.queryOptions?.debugContext
       ? {
@@ -5032,6 +5130,7 @@ export async function refreshVaultAfterOutputSave(rootDir: string): Promise<void
     insightHashes: pageHashes(storedInsights),
     memoryHashes: memoryTaskHashes(storedMemoryPages),
     domainProfileHash: currentDomainProfileHash,
+    domainProfile: await loadDomainProfile(rootDir, config),
     previousState: await readJsonFile<CompileState>(paths.compileStatePath),
     approve: false,
     promoteCandidates: false
@@ -6272,6 +6371,9 @@ async function compileVaultUnlocked(rootDir: string, options: CompileOptions = {
   const domainHashStarted = Date.now();
   const nextDomainProfileHash = await domainProfileHash(rootDir, config);
   lifecycle.record("domain_profile_hash", domainHashStarted, { hash: nextDomainProfileHash.slice(0, 12) });
+  const domainProfileStarted = Date.now();
+  const domainProfile = await loadDomainProfile(rootDir, config);
+  lifecycle.record("load_domain_profile", domainProfileStarted, { profile: domainProfile.id });
   const schemas = await loadVaultSchemas(rootDir);
   const provider = await getProviderForTask(rootDir, "compileProvider");
   const manifests = await listManifests(rootDir);
@@ -6316,6 +6418,7 @@ async function compileVaultUnlocked(rootDir: string, options: CompileOptions = {
 
   const dirty: SourceManifest[] = [];
   const clean: SourceManifest[] = [];
+  const dirtyReasons: CompileInvalidationReport["dirtyReasons"] = [];
   const forceAnalysis = options.forceAnalysis ?? false;
   for (const manifest of manifests) {
     if (forceAnalysis) {
@@ -6323,6 +6426,7 @@ async function compileVaultUnlocked(rootDir: string, options: CompileOptions = {
         clean.push(manifest);
       } else {
         dirty.push(manifest);
+        dirtyReasons.push({ sourceId: manifest.sourceId, reasons: ["force_analysis"] });
       }
       continue;
     }
@@ -6336,11 +6440,50 @@ async function compileVaultUnlocked(rootDir: string, options: CompileOptions = {
         clean.push(manifest);
       } else {
         dirty.push(manifest);
+        dirtyReasons.push({
+          sourceId: manifest.sourceId,
+          reasons: [
+            ...(hashChanged ? ["source_hash_changed"] : []),
+            ...(noAnalysis ? ["missing_analysis"] : []),
+            ...(projectChanged ? ["project_changed"] : []),
+            ...(effectiveHashChanged ? ["effective_schema_changed"] : [])
+          ]
+        });
       }
     } else {
       clean.push(manifest);
     }
   }
+
+  const invalidation: CompileInvalidationReport = {
+    dirtySourceCount: dirty.length,
+    cleanSourceCount: clean.length,
+    rootSchemaChanged,
+    effectiveSchemaChanged,
+    projectConfigChanged,
+    domainProfileChanged,
+    sourcesChanged,
+    outputsChanged,
+    insightsChanged,
+    memoryChanged,
+    artifactsExist,
+    pendingCandidatePromotion,
+    dirtyReasons
+  };
+  lifecycle.record("dirty_check", Date.now(), {
+    dirty: dirty.length,
+    clean: clean.length,
+    rootSchemaChanged,
+    effectiveSchemaChanged,
+    projectConfigChanged,
+    domainProfileChanged,
+    sourcesChanged,
+    outputsChanged,
+    insightsChanged,
+    memoryChanged,
+    artifactsExist,
+    pendingCandidatePromotion
+  });
 
   if (
     dirty.length === 0 &&
@@ -6361,7 +6504,7 @@ async function compileVaultUnlocked(rootDir: string, options: CompileOptions = {
     const benchmarkStarted = Date.now();
     const benchmark = await runConfiguredBenchmark(rootDir, config, options);
     lifecycle.record("benchmark", benchmarkStarted, { ok: benchmark.ok, skipped: benchmark.skipped ?? false }, benchmark.ok);
-    if (graph && benchmark.ok) {
+    if (graph && benchmark.ok && options.refreshIndex !== false) {
       const refreshStarted = Date.now();
       await refreshIndexesAndSearch(rootDir, graph.pages);
       lifecycle.record("refresh_indexes", refreshStarted, { pages: graph.pages.length });
@@ -6396,7 +6539,8 @@ async function compileVaultUnlocked(rootDir: string, options: CompileOptions = {
         sourceCount: manifests.length,
         staged: false,
         promotedPageIds: [],
-        candidatePageCount: (graph?.pages ?? []).filter((page) => page.status === "candidate").length
+        candidatePageCount: (graph?.pages ?? []).filter((page) => page.status === "candidate").length,
+        invalidation
       },
       lifecycle.steps,
       benchmark
@@ -6416,7 +6560,8 @@ async function compileVaultUnlocked(rootDir: string, options: CompileOptions = {
           getEffectiveSchema(schemas, sourceProjects[manifest.sourceId] ?? null),
           {
             bypassCache: forceAnalysis,
-            domainProfileHash: nextDomainProfileHash
+            domainProfileHash: nextDomainProfileHash,
+            domainProfile
           }
         ).then((analysis) => {
           analysisProgress.tick(manifest.title);
@@ -6482,6 +6627,7 @@ async function compileVaultUnlocked(rootDir: string, options: CompileOptions = {
     insightHashes: currentInsightHashes,
     memoryHashes: currentMemoryHashes,
     domainProfileHash: nextDomainProfileHash,
+    domainProfile,
     previousState,
     approve: options.approve,
     topicSynthesis: options.topicSynthesis
@@ -6575,7 +6721,7 @@ async function compileVaultUnlocked(rootDir: string, options: CompileOptions = {
   const benchmarkStarted = Date.now();
   const benchmark = options.approve ? { ok: true, skipped: true } : await runConfiguredBenchmark(rootDir, config, options);
   lifecycle.record("benchmark", benchmarkStarted, { ok: benchmark.ok, skipped: benchmark.skipped ?? false }, benchmark.ok);
-  if (!options.approve && benchmark.ok) {
+  if (!options.approve && benchmark.ok && options.refreshIndex !== false) {
     const refreshStarted = Date.now();
     await refreshIndexesAndSearch(rootDir, sync.allPages);
     lifecycle.record("refresh_indexes", refreshStarted, { pages: sync.allPages.length });
@@ -6690,7 +6836,8 @@ async function compileVaultUnlocked(rootDir: string, options: CompileOptions = {
       candidatePageCount: sync.candidatePageCount,
       autoPromotion: autoPromotionSummary,
       tokenStats,
-      analysisStats
+      analysisStats,
+      invalidation
     },
     lifecycle.steps,
     benchmark
@@ -7245,11 +7392,13 @@ export async function searchVault(
   }
   const options = typeof limitOrOptions === "number" ? ({ limit: limitOrOptions } as SearchQueryOptions) : limitOrOptions;
   const limit = options.limit ?? 5;
+  const domainProfile = await loadDomainProfile(rootDir, config);
 
   const retrieval = resolveRetrievalConfig(config);
   const hybrid = retrieval.hybrid;
   const ftsResults = searchPages(paths.searchDbPath, query, {
     ...options,
+    domainProfile,
     limit: hybrid ? limit * 3 : limit
   });
 
