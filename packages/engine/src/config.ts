@@ -251,7 +251,8 @@ const vaultConfigSchema = z.object({
   analysis: z
     .object({
       failurePolicy: z.enum(["fail", "warn"]).optional(),
-      maxFallbackRatio: z.number().min(0).max(1).optional()
+      maxFallbackRatio: z.number().min(0).max(1).optional(),
+      concurrency: z.number().int().positive().optional()
     })
     .optional(),
   domain: z

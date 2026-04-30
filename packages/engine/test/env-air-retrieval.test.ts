@@ -56,6 +56,19 @@ async function writePage(wikiDir: string, relativePath: string, frontmatter: Rec
   await fs.writeFile(absolutePath, matter.stringify(body, frontmatter), "utf8");
 }
 
+async function updateConfig(
+  rootDir: string,
+  mutate: (config: { providers: Record<string, unknown>; tasks: Record<string, string> }) => void
+): Promise<void> {
+  const configPath = path.join(rootDir, "swarmvault.config.json");
+  const config = JSON.parse(await fs.readFile(configPath, "utf8")) as {
+    providers: Record<string, unknown>;
+    tasks: Record<string, string>;
+  };
+  mutate(config);
+  await fs.writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, "utf8");
+}
+
 describe("environment air retrieval", () => {
   it("keeps Chinese business terms and environmental standard references searchable", () => {
     const tokens = searchTokens("GB 3095-2012 环境空气 PM2.5 和臭氧限值");
@@ -160,6 +173,52 @@ describe("environment air retrieval", () => {
     expect(results[0]?.chunkKind).toBe("table");
   });
 
+  it("focuses GB 3095 table evidence on O3 rows instead of PM2.5-only snippets", async () => {
+    const { wikiDir, dbPath } = await createTempWorkspace();
+    const standardPage = graphPage("source:gb3095-o3", "GB 3095-2026 环境空气质量标准", "sources/gb3095-o3.md");
+    await writePage(
+      wikiDir,
+      standardPage.path,
+      {
+        authority_layer: "core",
+        legal_status: "current_effective",
+        document_role: "standard",
+        standard_code: "GB 3095-2026",
+        pollutants: ["PM2.5", "PM10", "O3", "SO2", "NO2", "CO"]
+      },
+      [
+        "# GB 3095-2026",
+        "",
+        "## 表 1 环境空气污染物基本项目浓度限值",
+        "",
+        "| 污染物 | 平均时间 | 一级浓度限值 | 二级浓度限值 |",
+        "|---|---|---:|---:|",
+        "| PM2.5 | 年平均 | 15 | 35 |",
+        "| PM2.5 | 24小时平均 | 35 | 75 |",
+        "| O3（臭氧） | 日最大8小时平均 | 100 | 160 |",
+        "| O3（臭氧） | 1小时平均 | 160 | 200 |",
+        "| SO2（二氧化硫） | 1小时平均 | 150 | 500 |"
+      ].join("\n")
+    );
+    await rebuildSearchIndex(dbPath, [standardPage], wikiDir);
+
+    const results = searchPages(dbPath, "臭氧 O3 日最大8小时平均和1小时平均一级二级限值是多少？", {
+      limit: 5,
+      authorityLayer: ["core", "method"],
+      includeDrafts: false,
+      includeSuperseded: false
+    });
+
+    expect(results[0]?.pageId).toBe("source:gb3095-o3");
+    expect(results[0]?.chunkKind).toBe("table");
+    expect(results[0]?.snippet).toContain("O3");
+    expect(results[0]?.snippet).toContain("日最大8小时平均");
+    expect(results[0]?.snippet).toContain("1小时平均");
+    expect(results[0]?.snippet).toContain("100");
+    expect(results[0]?.snippet).toContain("160");
+    expect(results[0]?.snippet).toContain("200");
+  });
+
   it("retrieves Chinese monitoring-method questions without malformed FTS failures", async () => {
     const { wikiDir, dbPath } = await createTempWorkspace();
     const page = graphPage("source:auto", "HJ 193 环境空气气态污染物自动监测系统", "sources/auto.md");
@@ -237,6 +296,95 @@ describe("environment air retrieval", () => {
     });
     expect(results.map((result) => result.pageId)).toContain("source:gb2012");
     expect(results.map((result) => result.pageId)).not.toContain("source:gb1996");
+  });
+
+  it("answers authority-boundary questions with schema evidence available to the query provider", async () => {
+    const { rootDir } = await createTempWorkspace();
+    await initVault(rootDir);
+    await fs.writeFile(
+      path.join(rootDir, "authority-query-provider.mjs"),
+      [
+        "export async function createAdapter(id, config) {",
+        "  return {",
+        "    id,",
+        "    type: 'custom',",
+        "    model: config.model,",
+        "    capabilities: new Set(['chat', 'structured']),",
+        "    async generateText() {",
+        "      return { text: '研究论文不能直接作为执法依据要求企业执行；应以现行有效法律法规、标准或规范为强制依据。[E1]' };",
+        "    },",
+        "    async generateStructured() {",
+        "      return {",
+        "        answer: '研究论文不能直接作为执法依据要求企业执行；只能作为背景、机理或论证参考，强制执行仍需引用现行有效法律法规、标准或规范。[E1]',",
+        "        usedEvidenceIds: ['E1'],",
+        "        unsupportedClaims: [],",
+        "        missingEvidence: [],",
+        "        recommendedNextTool: 'knowledge_base'",
+        "      };",
+        "    }",
+        "  };",
+        "}"
+      ].join("\n"),
+      "utf8"
+    );
+    await updateConfig(rootDir, (config) => {
+      config.providers.authorityQuery = {
+        type: "custom",
+        model: "authority-query-test",
+        module: "./authority-query-provider.mjs",
+        capabilities: ["chat", "structured"]
+      };
+      config.tasks.queryProvider = "authorityQuery";
+    });
+    await fs.writeFile(
+      path.join(rootDir, "research.md"),
+      "# 研究论文证据边界\n\n研究论文和综述可以作为环境空气污染成因分析的参考材料，但不能替代现行有效标准、法规或规范作为执法依据要求企业执行。",
+      "utf8"
+    );
+    await ingestInput(rootDir, "research.md");
+    await compileVault(rootDir);
+
+    const result = await queryVault(rootDir, {
+      question: "研究论文能否直接作为执法依据要求企业执行？",
+      save: false,
+      intent: "authority_boundary",
+      strictGrounding: true,
+      debugContext: true
+    });
+
+    expect(result.evidenceState).toBe("grounded");
+    expect(result.answer).toContain("不能直接作为执法依据");
+    expect(result.retrievalDebug?.evidenceItems.some((item) => item.citation.startsWith("schema:"))).toBe(true);
+    expect(result.agentDecision?.reportUsability).toBe("direct");
+  });
+
+  it("keeps SO2 data-quality questions in data-MCP handoff instead of strict literal failure", async () => {
+    const { rootDir } = await createTempWorkspace();
+    await initVault(rootDir);
+    await fs.writeFile(
+      path.join(rootDir, "so2-qaqc.md"),
+      [
+        "# SO2 连续监测异常数据处理",
+        "",
+        "知识库负责说明 SO2 自动监测质量控制、异常值审核、负值记录复核和报告表述边界。",
+        "某站点连续负值、小时值、日均值、过程分析和统计计算应调用环境数据 MCP 查询原始监测数据后再判断。"
+      ].join("\n"),
+      "utf8"
+    );
+    await ingestInput(rootDir, "so2-qaqc.md");
+    await compileVault(rootDir);
+
+    const result = await queryVault(rootDir, {
+      question: "某站点 SO2 连续负值怎么处理，知识库和数据MCP分别做什么？",
+      save: false,
+      strictGrounding: true,
+      debugContext: true
+    });
+
+    expect(result.evidenceState).not.toBe("insufficient");
+    expect(["environment_data_mcp", "both"]).toContain(result.recommendedNextTool);
+    expect(result.agentDecision?.mustCallTools).toContain("environment_data_mcp");
+    expect(result.agentDecision?.reportUsability).toBe("needs_data_mcp");
   });
 
   it("returns insufficient evidence instead of generating an ungrounded answer", async () => {

@@ -416,6 +416,7 @@ export interface VaultConfig {
   analysis?: {
     failurePolicy?: "fail" | "warn";
     maxFallbackRatio?: number;
+    concurrency?: number;
   };
   domain?: {
     profileId?: string;
@@ -540,7 +541,16 @@ export interface CandidatePromotionConfig {
   dryRun: boolean;
 }
 
-export type PromotionGateKind = "sources" | "confidence" | "agreement" | "degree" | "age";
+export type PromotionGateKind =
+  | "sources"
+  | "confidence"
+  | "agreement"
+  | "degree"
+  | "age"
+  | "slug_quality"
+  | "topic_coherence"
+  | "source_spread"
+  | "god_node";
 
 export interface PromotionGateResult {
   gate: PromotionGateKind;
@@ -761,6 +771,8 @@ export interface SourceManifest {
   partIndex?: number;
   partCount?: number;
   partTitle?: string;
+  visibility?: "public" | "tenant" | "project";
+  tenantId?: string;
   details?: Record<string, string>;
   createdAt: string;
   updatedAt: string;
@@ -903,6 +915,7 @@ export interface SourceAnalysis {
   questions: string[];
   tags: string[];
   domain?: DomainMetadata;
+  domainProfileHash?: string;
   analysisMode?: "provider" | "heuristic" | "vision" | "code" | "empty";
   providerId?: string;
   providerModel?: string;
@@ -940,6 +953,7 @@ export type LegalStatus =
   | "superseded"
   | "amended"
   | "explanation_only"
+  | "time_scoped_evidence"
   | "unknown";
 export type MetadataSource = "sidecar" | "rule" | "llm" | "mixed";
 export type MetadataVerificationState = "unreviewed" | "rule_verified" | "human_verified";
@@ -954,6 +968,8 @@ export interface DomainMetadata {
   standardCode?: string;
   publishDate?: string;
   effectiveDate?: string;
+  reportingPeriod?: string;
+  evidencePeriod?: string;
   replaces?: string[];
   replacedBy?: string[];
   pollutants?: string[];
@@ -964,6 +980,10 @@ export interface DomainMetadata {
   metadataSource?: MetadataSource;
   verificationState?: MetadataVerificationState;
   llmUncertainFields?: string[];
+  visibility?: "public" | "tenant" | "project";
+  tenantId?: string;
+  projectId?: string;
+  sourceScope?: "public_authority" | "tenant_private" | "project_private" | "generated_report";
 }
 
 export interface GraphNode {
@@ -1013,6 +1033,9 @@ export interface GraphEdge {
   evidenceClass: EvidenceClass;
   confidence: number;
   provenance: string[];
+  edgeRole?: "current_authority" | "method" | "evidence_context" | "local_adaptation" | "evolution" | "weak_mention";
+  relationStrength?: "strong" | "medium" | "weak";
+  authorityWeight?: number;
   similarityReasons?: Array<
     "shared_concept" | "shared_entity" | "shared_tag" | "shared_symbol" | "shared_rationale_theme" | "shared_source_type"
   >;
@@ -1070,6 +1093,8 @@ export interface GraphPage {
   relatedPageIds: string[];
   relatedNodeIds: string[];
   relatedSourceIds: string[];
+  visibility?: "public" | "tenant" | "project";
+  tenantId?: string;
   createdAt: string;
   updatedAt: string;
   compiledFrom: string[];
@@ -1551,6 +1576,21 @@ export interface SearchResult {
   jurisdiction?: string;
   region?: string;
   standardCode?: string;
+  standardIdentity?: string;
+  evidenceRole?:
+    | "current_authority"
+    | "method"
+    | "official_explanation"
+    | "statistics"
+    | "research"
+    | "local_adaptation"
+    | "evolution"
+    | "background";
+  reportingPeriod?: string;
+  evidencePeriod?: string;
+  visibility?: "public" | "tenant" | "project";
+  tenantId?: string;
+  sourceScope?: "public_authority" | "tenant_private" | "project_private" | "generated_report";
   pollutants?: string[];
   chunkId?: string;
   chunkOrdinal?: number;
@@ -1559,6 +1599,9 @@ export interface SearchResult {
   chunkLocation?: string;
   retrievalStage?: "standard_exact" | "structured_fact" | "fts" | "chunk_fts" | "like" | "semantic" | "rerank";
   factId?: string;
+  factStableId?: string;
+  factOrdinal?: number;
+  factLegacyIds?: string[];
   factType?: string;
   factTable?: string;
   factRawText?: string;
@@ -1650,9 +1693,20 @@ export interface QueryOptions {
 export type EvidenceState = "grounded" | "partial" | "insufficient";
 export type RecommendedNextTool = "knowledge_base" | "environment_data_mcp" | "both";
 
+export interface ToolRoutingDecision {
+  deterministicNextTool: RecommendedNextTool;
+  modelRecommendedNextTool?: RecommendedNextTool;
+  finalNextTool: RecommendedNextTool;
+  reasons: string[];
+  dataSignals: string[];
+  knowledgeSignals: string[];
+  conflictResolvedBy: "deterministic_policy" | "model_agreement" | "fallback";
+}
+
 export interface AgentDecision {
   reportUsability: "direct" | "draft_only" | "needs_data_mcp" | "insufficient";
   mustCallTools: Array<"environment_data_mcp">;
+  shouldCallEnvironmentDataMcp?: boolean;
   authorityBoundary: "current_mandatory" | "recommended_guidance" | "draft_or_historical" | "mixed" | "unknown";
   privateKnowledgeUsed: boolean;
   publicAuthorityUsed: boolean;
@@ -1684,10 +1738,21 @@ export interface RetrievalDebugEvidenceItem {
   legalStatus?: string;
   documentRole?: string;
   standardCode?: string;
+  standardIdentity?: string;
+  evidenceRole?: string;
+  reportingPeriod?: string;
+  evidencePeriod?: string;
+  visibility?: "public" | "tenant" | "project";
+  tenantId?: string;
+  sourceScope?: "public_authority" | "tenant_private" | "project_private" | "generated_report";
   factId?: string;
+  factStableId?: string;
+  factOrdinal?: number;
+  factLegacyIds?: string[];
   factType?: string;
   factTable?: string;
   factRawText?: string;
+  canonicalAliases?: string[];
   region?: string;
   excerpt: string;
 }
@@ -1714,6 +1779,7 @@ export interface QueryRetrievalPlan {
   authorityPinnedEvidenceCount?: number;
   rankingSignals: string[];
   recommendedNextTool: RecommendedNextTool;
+  toolRouting?: ToolRoutingDecision;
   stages: Array<{
     name: string;
     status: "planned" | "used" | "skipped";
@@ -1741,10 +1807,12 @@ export interface QueryResult {
   groundingWarnings?: string[];
   invalidCitations?: string[];
   recommendedNextTool?: RecommendedNextTool;
+  toolRouting?: ToolRoutingDecision;
   answerBasis?: "current_effective" | "historical_or_evolution" | "local_adaptation" | "evidence_explanation" | "data_required";
   currentStatus?: string;
   dataToolHints?: string[];
   agentDecision?: AgentDecision;
+  evidenceSet?: RetrievalDebugEvidenceItem[];
   standardCoverage?: StandardCoverage[];
   evidenceCompleteness?: {
     requiredStandards: string[];

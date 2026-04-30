@@ -1,3 +1,5 @@
+import type { ToolRoutingDecision } from "../types.js";
+
 export interface StandardReference {
   raw: string;
   family: string;
@@ -166,25 +168,47 @@ const POLLUTANT_FOCUS_TERMS: Record<string, string[]> = {
   CO: ["CO", "一氧化碳", "日平均", "1小时平均", "浓度限值", "一级", "二级"]
 };
 
-const DATA_TOOL_HINTS = [
-  "监测数据",
-  "小时值",
-  "日均值",
-  "月均值",
-  "年均值",
-  "浓度",
-  "站点",
-  "城市",
-  "同比",
-  "环比",
-  "排名",
-  "污染过程",
-  "超标",
-  "达标率",
-  "计算",
-  "分析",
-  "连续负值",
-  "数据MCP"
+const DATA_OBJECT_TERMS = ["监测数据", "实测", "站点数据", "原始数据", "连续监测", "小时值", "日均值", "月均值", "年均值"];
+const DATA_TIME_TERMS = [
+  "今天",
+  "今日",
+  "昨日",
+  "昨天",
+  "本周",
+  "上周",
+  "本月",
+  "上月",
+  "今年",
+  "去年",
+  "小时",
+  "日均",
+  "月均",
+  "年均",
+  "时段",
+  "期间",
+  "过程"
+];
+const DATA_LOCATION_TERMS = ["站点", "国控站", "省控站", "城市", "区域", "区县", "省", "市"];
+const DATA_OPERATION_TERMS = ["查询", "统计", "排名", "同比", "环比", "趋势", "过程分析", "达标率", "超标天数", "连续负值", "异常诊断"];
+const EXPLICIT_DATA_TOOL_TERMS = ["数据mcp", "环境数据mcp", "监测数据mcp", "调用数据"];
+const KNOWLEDGE_OPERATION_TERMS = [
+  "标准",
+  "规范",
+  "指南",
+  "依据",
+  "限值",
+  "浓度限值",
+  "评价方法",
+  "计算公式",
+  "技术规定",
+  "适用范围",
+  "修订",
+  "修改单",
+  "关系",
+  "口径",
+  "编制说明",
+  "法律",
+  "办法"
 ];
 
 const KNOWLEDGE_HINTS = ["知识库", "标准", "规范", "指南", "依据", "限值", "要求", "方法", "解释", "编制说明", "法律", "办法"];
@@ -508,27 +532,68 @@ export function buildEnvAirQueryPlan(query: string): EnvAirQueryPlan {
 }
 
 export function classifyRecommendedNextTool(question: string): RecommendedNextTool {
+  return classifyEnvAirToolRouting(question).finalNextTool;
+}
+
+function matchedTerms(question: string, terms: string[]): string[] {
   const compact = question.toLowerCase().replace(/\s+/g, "");
-  const wantsData = DATA_TOOL_HINTS.some((hint) => compact.includes(hint.toLowerCase().replace(/\s+/g, "")));
-  const wantsKnowledge =
-    KNOWLEDGE_HINTS.some((hint) => compact.includes(hint.toLowerCase().replace(/\s+/g, ""))) ||
-    extractStandardReferences(question).length > 0;
-  if (wantsData && wantsKnowledge) {
-    return "both";
+  return terms.filter((term) => compact.includes(term.toLowerCase().replace(/\s+/g, "")));
+}
+
+export function classifyEnvAirToolRouting(question: string): ToolRoutingDecision {
+  const dataObjects = matchedTerms(question, DATA_OBJECT_TERMS);
+  const dataTimes = matchedTerms(question, DATA_TIME_TERMS);
+  const dataLocations = matchedTerms(question, DATA_LOCATION_TERMS);
+  const dataOperations = matchedTerms(question, DATA_OPERATION_TERMS);
+  const explicitDataTools = matchedTerms(question, EXPLICIT_DATA_TOOL_TERMS);
+  const knowledgeSignals = uniqueCompact([
+    ...matchedTerms(question, KNOWLEDGE_HINTS),
+    ...matchedTerms(question, KNOWLEDGE_OPERATION_TERMS),
+    ...extractStandardReferences(question).map((ref) => ref.normalized)
+  ]);
+  const dataSignals = uniqueCompact([...dataObjects, ...dataTimes, ...dataLocations, ...dataOperations, ...explicitDataTools]);
+  const hasExplicitDataTool = explicitDataTools.length > 0;
+  const hasConcreteDataObject = dataObjects.length > 0;
+  const hasDataFrame = dataTimes.length > 0 || dataLocations.length > 0;
+  const hasDataOperation = dataOperations.length > 0;
+  const wantsData = hasExplicitDataTool || hasConcreteDataObject || (hasDataFrame && hasDataOperation);
+  const wantsKnowledge = knowledgeSignals.length > 0;
+  const reasons: string[] = [];
+  if (wantsKnowledge) {
+    reasons.push("knowledge_signals_present");
   }
-  if (wantsData) {
-    return "environment_data_mcp";
+  if (hasExplicitDataTool) {
+    reasons.push("explicit_environment_data_mcp_request");
+  } else if (hasConcreteDataObject) {
+    reasons.push("monitoring_data_object_present");
+  } else if (hasDataFrame && hasDataOperation) {
+    reasons.push("data_time_or_location_plus_operation");
   }
-  return "knowledge_base";
+  if (!wantsData && dataSignals.length) {
+    reasons.push("data_terms_without_concrete_monitoring_request");
+  }
+  const finalNextTool: RecommendedNextTool = wantsData && wantsKnowledge ? "both" : wantsData ? "environment_data_mcp" : "knowledge_base";
+  return {
+    deterministicNextTool: finalNextTool,
+    finalNextTool,
+    reasons,
+    dataSignals,
+    knowledgeSignals,
+    conflictResolvedBy: "deterministic_policy"
+  };
 }
 
 export function buildEnvironmentDataToolHints(question: string): string[] {
+  const routing = classifyEnvAirToolRouting(question);
+  if (routing.finalNextTool === "knowledge_base") {
+    return [];
+  }
   const compact = question.toLowerCase().replace(/\s+/g, "");
   const hints: string[] = [];
   if (["今天", "昨日", "昨天", "本月", "今年", "小时值", "日均值", "月均值", "年均值"].some((term) => compact.includes(term))) {
     hints.push("需要调用环境数据 MCP 查询对应时间范围的监测浓度或统计值。");
   }
-  if (["超标", "达标", "排名", "同比", "环比", "污染过程", "浓度", "连续负值"].some((term) => compact.includes(term))) {
+  if (["超标", "达标", "排名", "同比", "环比", "污染过程", "连续负值"].some((term) => compact.includes(term))) {
     hints.push("知识库只能提供评价依据和计算口径，是否超标或排名需要环境数据 MCP 返回实际数据后判断。");
   }
   if (["站点", "城市", "区域", "省", "市"].some((term) => compact.includes(term))) {

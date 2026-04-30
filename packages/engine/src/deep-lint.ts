@@ -164,16 +164,55 @@ async function deterministicEnvAirFindings(rootDir: string, graph: GraphArtifact
         relatedPageIds: [page.id]
       });
     }
+    if ((page.kind === "concept" || page.kind === "entity") && raw.length > (page.status === "candidate" ? 80_000 : 60_000)) {
+      findings.push({
+        severity: "warning",
+        code: "aggregate_page_too_large",
+        message: `${page.kind} page ${title} is ${raw.length} bytes and may exceed the retrieval context budget.`,
+        pagePath: absolutePath,
+        relatedPageIds: [page.id]
+      });
+    }
+    const sourceClaimCount = (parsed.content.match(/^- .*?\[source:/gm) ?? []).length;
+    if ((page.kind === "concept" || page.kind === "entity") && sourceClaimCount > 80) {
+      findings.push({
+        severity: "warning",
+        code: "source_claim_dump",
+        message: `${page.kind} page ${title} contains ${sourceClaimCount} source-claim bullets; summarize or group claims by authority layer.`,
+        pagePath: absolutePath,
+        relatedPageIds: [page.id]
+      });
+    }
     if (page.kind !== "source" && page.kind !== "module") {
       continue;
     }
     const combined = `${title}\n${parsed.content}`;
     const refs = extractStandardReferences(combined);
-    const looksLikeStandard = refs.length > 0 || /(标准|规范|技术规定|监测方法|修改单|征求意见稿|编制说明)/.test(combined.slice(0, 1200));
+    const documentRole = typeof parsed.data.document_role === "string" ? parsed.data.document_role : "";
+    const authorityLayer = typeof parsed.data.authority_layer === "string" ? parsed.data.authority_layer : "";
+    const relatedSourceIds = page.sourceIds;
+    const looksLikePrimaryStandard =
+      /(标准|规范|技术规定|监测方法|修改单|征求意见稿|编制说明)/.test(combined.slice(0, 1200)) &&
+      !["statistics", "research_literature", "whitepaper", "official_explanation"].includes(documentRole) &&
+      authorityLayer !== "evidence";
+    const looksLikeStandard = refs.length > 0 && looksLikePrimaryStandard;
+    if (
+      typeof parsed.data.legal_status === "string" &&
+      parsed.data.legal_status === "current_effective" &&
+      /(年报|月报|公报|白皮书|蓝皮书)/.test(combined.slice(0, 1200))
+    ) {
+      findings.push({
+        severity: "warning",
+        code: "time_scoped_evidence_marked_current",
+        message: `Statistical/report-like source ${title} is marked current_effective; it should be time_scoped_evidence or explanation_only.`,
+        pagePath: absolutePath,
+        relatedSourceIds,
+        relatedPageIds: [page.id]
+      });
+    }
     if (!looksLikeStandard) {
       continue;
     }
-    const relatedSourceIds = page.sourceIds;
     if (refs.length > 0 && isUnknown(parsed.data.standard_code)) {
       findings.push({
         severity: "warning",

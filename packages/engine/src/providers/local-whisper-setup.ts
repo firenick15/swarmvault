@@ -65,7 +65,8 @@ export async function discoverLocalWhisperBinary(options: LocalWhisperDiscoveryO
 
 export function expectedModelPath(modelName: string, homeDir?: string): string {
   const home = homeDir ?? os.homedir();
-  return path.join(home, ".swarmvault", "models", `ggml-${modelName}.bin`);
+  const joinPath = home.includes("/") && !home.includes("\\") ? path.posix.join : path.join;
+  return joinPath(home, ".swarmvault", "models", `ggml-${modelName}.bin`);
 }
 
 export function modelDownloadUrl(modelName: string): string {

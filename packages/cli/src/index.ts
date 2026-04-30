@@ -836,6 +836,8 @@ program
   .option("--max-tokens <n>", "Cap wiki output by trimming lower-priority pages")
   .option("--fail-on-fallback", "Fail compile when provider analysis falls back to heuristics", false)
   .option("--force-analysis", "Re-run source analysis for all sources regardless of cache", false)
+  .option("--topic-synthesis", "Run LLM-backed cross-document topic synthesis pages", false)
+  .option("--topic-review", "Stage topic synthesis changes for review with compile approvals", false)
   .option("--skip-benchmark", "Skip configured benchmark after compile", false)
   .option("--debug-lifecycle", "Emit compile lifecycle timing in JSON output and active-handle diagnostics on stderr", false)
   .addOption(new Option("--lock-mode <mode>", "Compile lock behavior").choices(["wait", "fail", "skip"]).default("wait"))
@@ -846,6 +848,8 @@ program
       maxTokens?: string;
       failOnFallback?: boolean;
       forceAnalysis?: boolean;
+      topicSynthesis?: boolean;
+      topicReview?: boolean;
       skipBenchmark?: boolean;
       debugLifecycle?: boolean;
       lockMode?: "wait" | "fail" | "skip";
@@ -855,10 +859,12 @@ program
         emitActiveHandles("compile.activeHandles.before");
       }
       const result = await compileVault(process.cwd(), {
-        approve: options.approve ?? false,
+        approve: (options.approve ?? false) || (options.topicReview ?? false),
         maxTokens,
         failOnFallback: options.failOnFallback ?? false,
         forceAnalysis: options.forceAnalysis ?? false,
+        topicSynthesis: options.topicSynthesis ?? false,
+        topicReview: options.topicReview ?? false,
         skipBenchmark: options.skipBenchmark ?? false,
         debugLifecycle: options.debugLifecycle ?? false,
         lockMode: options.lockMode ?? "wait"

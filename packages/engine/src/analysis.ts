@@ -1,5 +1,7 @@
+import fs from "node:fs/promises";
 import path from "node:path";
 import nlp from "compromise";
+import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 import { analyzeCodeSource } from "./code-analysis.js";
 import { extractStandardReferences } from "./domain/env-air.js";
@@ -25,6 +27,7 @@ import type {
   SourceRationale
 } from "./types.js";
 import {
+  fileExists,
   firstSentences,
   normalizeWhitespace,
   readJsonFile,
@@ -66,13 +69,24 @@ const domainMetadataSchema = z
       ])
       .default("unknown"),
     legalStatus: z
-      .enum(["current_effective", "issued_not_yet_effective", "draft_consultation", "superseded", "amended", "explanation_only", "unknown"])
+      .enum([
+        "current_effective",
+        "issued_not_yet_effective",
+        "draft_consultation",
+        "superseded",
+        "amended",
+        "explanation_only",
+        "time_scoped_evidence",
+        "unknown"
+      ])
       .default("unknown"),
     jurisdiction: z.enum(["national", "province", "city", "international", "unknown"]).default("unknown"),
     region: z.string().min(1).optional(),
     standardCode: z.string().min(1).optional(),
     publishDate: z.string().min(1).optional(),
     effectiveDate: z.string().min(1).optional(),
+    reportingPeriod: z.string().min(1).optional(),
+    evidencePeriod: z.string().min(1).optional(),
     replaces: z.array(z.string().min(1)).default([]),
     replacedBy: z.array(z.string().min(1)).default([]),
     pollutants: z.array(z.string().min(1)).default([]),
@@ -82,7 +96,11 @@ const domainMetadataSchema = z
     notes: z.array(z.string().min(1)).default([]),
     metadataSource: z.enum(["sidecar", "rule", "llm", "mixed"]).default("llm"),
     verificationState: z.enum(["unreviewed", "rule_verified", "human_verified"]).default("unreviewed"),
-    llmUncertainFields: z.array(z.string().min(1)).default([])
+    llmUncertainFields: z.array(z.string().min(1)).default([]),
+    visibility: z.enum(["public", "tenant", "project"]).optional(),
+    tenantId: z.string().min(1).optional(),
+    projectId: z.string().min(1).optional(),
+    sourceScope: z.enum(["public_authority", "tenant_private", "project_private", "generated_report"]).optional()
   })
   .default({
     authorityLayer: "unknown",
@@ -230,6 +248,7 @@ function inferDomainMetadata(manifest: SourceManifest, content: string): DomainM
   let legalForce: DomainMetadata["legalForce"] = "unknown";
   let documentRole: DomainMetadata["documentRole"] = "unknown";
   let legalStatus: DomainMetadata["legalStatus"] = "unknown";
+  const reportingPeriod = inferReportingPeriod(`${title}\n${content}`);
 
   if (/征求意见|草案/.test(text)) {
     authorityLayer = "evolution";
@@ -244,7 +263,8 @@ function inferDomainMetadata(manifest: SourceManifest, content: string): DomainM
   } else if (/年报|月报|公报|白皮书|蓝皮书/.test(text)) {
     authorityLayer = "evidence";
     legalForce = "statistical";
-    documentRole = "statistics";
+    documentRole = /白皮书|蓝皮书/.test(text) ? "whitepaper" : "statistics";
+    legalStatus = "time_scoped_evidence";
   } else if (/标准|规范|技术要求|监测方法|hj\s*(?:\/\s*t)?\s*[- ]?[0-9]{2,6}|gb\s*(?:\/\s*t)?\s*[- ]?[0-9]{2,6}|db[0-9]{2}/i.test(text)) {
     authorityLayer = /地方|省|市/.test(text) ? "local" : "core";
     legalForce = /gb\/t|hj\/t|指南|导则|技术指南|推荐/i.test(text) ? "recommended" : "mandatory";
@@ -271,6 +291,8 @@ function inferDomainMetadata(manifest: SourceManifest, content: string): DomainM
     legalStatus,
     jurisdiction,
     standardCode,
+    reportingPeriod,
+    evidencePeriod: reportingPeriod,
     pollutants,
     useFor: [],
     doNotUseFor: [],
@@ -281,6 +303,73 @@ function inferDomainMetadata(manifest: SourceManifest, content: string): DomainM
     verificationState: "rule_verified",
     llmUncertainFields: []
   };
+}
+
+function inferReportingPeriod(text: string): string | undefined {
+  const normalized = text.replace(/\s+/g, "");
+  const month = normalized.match(/(20[0-9]{2})年([0-9]{1,2})月/);
+  if (month) {
+    return `${month[1]}-${String(month[2]).padStart(2, "0")}`;
+  }
+  const year = normalized.match(/(20[0-9]{2})年(?:度)?(?:生态环境状况)?(?:公报|年报|报告|白皮书|蓝皮书)/);
+  return year?.[1];
+}
+
+async function readSidecarDomainMetadata(rootDir: string, manifest: SourceManifest): Promise<DomainMetadata | undefined> {
+  const sourcePath = manifest.originalPath ?? manifest.repoRelativePath ?? manifest.storedPath;
+  if (!sourcePath) {
+    return undefined;
+  }
+  const absoluteSourcePath = path.isAbsolute(sourcePath) ? sourcePath : path.resolve(rootDir, sourcePath);
+  const parsed = path.parse(absoluteSourcePath);
+  const candidates = [
+    path.join(parsed.dir, `${parsed.name}.swarmvault.meta.json`),
+    path.join(parsed.dir, `${parsed.name}.swarmvault.meta.yaml`),
+    path.join(parsed.dir, `${parsed.name}.swarmvault.meta.yml`),
+    path.join(parsed.dir, ".swarmvault.defaults.json"),
+    path.join(parsed.dir, ".swarmvault.defaults.yaml"),
+    path.join(parsed.dir, ".swarmvault.defaults.yml")
+  ];
+  const merged: Record<string, unknown> = {};
+  for (const candidate of candidates.reverse()) {
+    if (!(await fileExists(candidate))) {
+      continue;
+    }
+    const content = await fs.readFile(candidate, "utf8");
+    const raw = (candidate.endsWith(".json") ? JSON.parse(content) : parseYaml(content)) as Record<string, unknown>;
+    Object.assign(merged, normalizeSidecarKeys(raw));
+  }
+  if (!Object.keys(merged).length) {
+    return undefined;
+  }
+  const parsedDomain = domainMetadataSchema.parse({
+    ...merged,
+    metadataSource: "sidecar",
+    verificationState: merged.verificationState ?? "human_verified"
+  });
+  return parsedDomain as DomainMetadata;
+}
+
+function normalizeSidecarKeys(raw: Record<string, unknown>): Record<string, unknown> {
+  const keyMap: Record<string, string> = {
+    authority_layer: "authorityLayer",
+    legal_force: "legalForce",
+    document_role: "documentRole",
+    legal_status: "legalStatus",
+    standard_code: "standardCode",
+    publish_date: "publishDate",
+    effective_date: "effectiveDate",
+    reporting_period: "reportingPeriod",
+    evidence_period: "evidencePeriod",
+    replaced_by: "replacedBy",
+    metadata_source: "metadataSource",
+    verification_state: "verificationState",
+    llm_uncertain_fields: "llmUncertainFields",
+    tenant_id: "tenantId",
+    project_id: "projectId",
+    source_scope: "sourceScope"
+  };
+  return Object.fromEntries(Object.entries(raw).map(([key, value]) => [keyMap[key] ?? key, value]));
 }
 
 function filenameStemForSource(manifest: SourceManifest): string {
@@ -513,7 +602,12 @@ async function providerAnalysis(
     {
       system: [
         "You are compiling a durable markdown wiki and graph for environmental air-pollution knowledge.",
-        "Distinguish authority tiers: current standards vs explanatory docs vs statistics vs draft/evolution materials.",
+        "Build an integrated expert wiki, not one mechanical concept page per source. Merge related source-backed ideas into durable concepts that help environmental bureau staff decide what can be used in reports, enforcement support, monitoring review, and further research.",
+        "Distinguish authority tiers: current mandatory standards and regulations, current monitoring/evaluation methods, recommended technical guides, explanatory or statistical background, research evidence, local implementation rules, draft/evolution materials, amendments, and historical/superseded versions.",
+        "Do not treat research papers, monthly reports, annual bulletins, white papers, public interpretations, or technical guides as mandatory execution basis unless the source itself is a binding regulation, current standard, current method standard, or effective local rule.",
+        "For each source, preserve retrievable clues for standard codes, pollutants, averaging periods, limit values, formulas, effective dates, implementation dates, replacement relationships, jurisdictions, and document roles.",
+        "Prefer concepts around standard limits, evaluation methods, monitoring methods, data QA/QC, abnormal data handling, authority boundaries, local adaptation, historical evolution, and report-writing practice. Avoid generic concepts that only restate broad terms like pollution, environment, monitoring, or standard.",
+        "When amendments or drafts appear, identify the affected standard, changed clauses, implementation status, and whether the material is binding or only historical/evolution context.",
         "",
         "Follow the vault schema when choosing titles, categories, relationships, and summaries.",
         "",
@@ -659,7 +753,7 @@ export async function analyzeSource(
   provider: ProviderAdapter,
   paths: ResolvedPaths,
   schema: VaultSchema,
-  options: { bypassCache?: boolean } = {}
+  options: { bypassCache?: boolean; domainProfileHash?: string } = {}
 ): Promise<SourceAnalysis> {
   const cachePath = path.join(paths.analysesDir, `${manifest.sourceId}.json`);
   const cached = options.bypassCache ? null : await readJsonFile<SourceAnalysis>(cachePath);
@@ -668,7 +762,8 @@ export async function analyzeSource(
     cached.analysisVersion === ANALYSIS_FORMAT_VERSION &&
     (cached.semanticHash ?? cached.sourceHash) === manifest.semanticHash &&
     cached.extractionHash === manifest.extractionHash &&
-    cached.schemaHash === schema.hash
+    cached.schemaHash === schema.hash &&
+    (options.domainProfileHash ? cached.domainProfileHash === options.domainProfileHash : true)
   ) {
     const normalizedCached = normalizeSourceAnalysis(manifest, cached);
     if (normalizedCached !== cached) {
@@ -777,6 +872,25 @@ export async function analyzeSource(
   if (!analysis.domain) {
     analysis = { ...analysis, domain: inferDomainMetadata(manifest, content || manifest.title) };
   }
+  const sidecarDomain = await readSidecarDomainMetadata(paths.rootDir, manifest).catch((error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      ...inferDomainMetadata(manifest, content || manifest.title),
+      metadataSource: "sidecar",
+      verificationState: "unreviewed",
+      notes: [`Invalid sidecar metadata: ${truncate(message, 180)}`]
+    } satisfies DomainMetadata;
+  });
+  if (sidecarDomain) {
+    analysis = {
+      ...analysis,
+      domain: {
+        ...(analysis.domain ?? inferDomainMetadata(manifest, content || manifest.title)),
+        ...sidecarDomain,
+        metadataSource: "sidecar"
+      }
+    };
+  }
   if (providerFailure) {
     analysis = {
       ...analysis,
@@ -788,6 +902,7 @@ export async function analyzeSource(
   }
 
   const normalized = normalizeSourceAnalysis(manifest, analysis);
+  normalized.domainProfileHash = options.domainProfileHash;
   await writeJsonFile(cachePath, normalized);
   return normalized;
 }

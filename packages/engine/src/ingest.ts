@@ -457,13 +457,12 @@ async function localCodeDetectionOptions(absolutePath: string, payloadBytes?: Bu
   try {
     const stat = await fs.stat(absolutePath);
     const executable = Boolean(stat.mode & 0o111);
-    if (!executable) {
-      return { executable: false };
-    }
     const bytes = payloadBytes ?? (await fs.readFile(absolutePath));
+    const content = bytes.subarray(0, 256).toString("utf8");
+    const hasShebang = content.startsWith("#!");
     return {
-      executable,
-      content: bytes.subarray(0, 256).toString("utf8")
+      executable: executable || hasShebang,
+      content
     };
   } catch {
     return {};

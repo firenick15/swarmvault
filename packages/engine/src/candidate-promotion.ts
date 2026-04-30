@@ -40,6 +40,13 @@ function maxDegreeFor(graph: GraphArtifact, nodeIds: readonly string[]): number 
   return best;
 }
 
+function slugQualityScore(title: string): number {
+  const normalized = title.trim().toLowerCase();
+  if (/^\d{4}.*(目录|清单|公告|公报|报告)/.test(title)) return 0;
+  if (/^[a-z0-9]{1,3}$/.test(normalized) && !/^(co|o3|so2|no2|nox|pm10|pm2\.?5|aqi|iaqi|vocs|nmhc)$/.test(normalized)) return 0.25;
+  return 1;
+}
+
 function describeGate(result: PromotionGateResult): string {
   const verb = result.passed ? ">=" : "<";
   return `${result.gate} ${result.value.toFixed(2)} ${verb} ${result.threshold.toFixed(2)}`;
@@ -57,13 +64,19 @@ export function evaluateCandidateForPromotion(
   const agreement = historicalSources.length ? jaccard(historicalSources, page.sourceIds) : 0;
   const degree = maxDegreeFor(graph, page.nodeIds);
   const ageHours = hoursSince(page.createdAt, now);
+  const slugQuality = slugQualityScore(page.title);
+  const sourceSpread = page.sourceIds.length;
+  const isGodNode = page.nodeIds.some((nodeId) => graph.nodes.find((node) => node.id === nodeId)?.isGodNode);
 
   const gates: PromotionGateResult[] = [
     { gate: "sources", value: page.sourceIds.length, threshold: config.minSources, passed: page.sourceIds.length >= config.minSources },
     { gate: "confidence", value: page.confidence, threshold: config.minConfidence, passed: page.confidence >= config.minConfidence },
     { gate: "agreement", value: agreement, threshold: config.minAgreement, passed: agreement >= config.minAgreement },
     { gate: "degree", value: degree, threshold: config.minDegree, passed: degree >= config.minDegree },
-    { gate: "age", value: ageHours, threshold: config.minAgeHours, passed: ageHours >= config.minAgeHours }
+    { gate: "age", value: ageHours, threshold: config.minAgeHours, passed: ageHours >= config.minAgeHours },
+    { gate: "slug_quality", value: slugQuality, threshold: 0.75, passed: slugQuality >= 0.75 },
+    { gate: "source_spread", value: sourceSpread, threshold: 50, passed: sourceSpread <= 50 },
+    { gate: "god_node", value: isGodNode ? 1 : 0, threshold: 0, passed: !isGodNode }
   ];
 
   const passedCount = gates.filter((gate) => gate.passed).length;

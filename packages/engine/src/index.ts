@@ -19,6 +19,7 @@ export {
   buildEnvAirSearchText,
   buildEnvironmentDataToolHints,
   canonicalTitleForStandard,
+  classifyEnvAirToolRouting,
   classifyRecommendedNextTool,
   compactStandardCode,
   ENV_AIR_STANDARD_CATALOG,

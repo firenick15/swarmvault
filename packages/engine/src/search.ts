@@ -9,6 +9,7 @@ import {
   normalizeStandardCode,
   pollutantFocusTermsForQuery,
   searchLikeTerms,
+  standardIdentityKey,
   standardRefsForExactRetrieval
 } from "./domain/env-air.js";
 import { extractEnvAirStructuredFacts, renderStructuredFactSnippet } from "./domain/env-air-facts.js";
@@ -37,6 +38,9 @@ export interface SearchPageFilters {
   jurisdiction?: string;
   region?: string;
   pollutant?: string;
+  scope?: "public_only" | "tenant_only" | "project_only" | "mixed_public_private";
+  visibility?: "public" | "tenant" | "project";
+  tenantId?: string;
   includeDrafts?: boolean;
   includeSuperseded?: boolean;
   intent?: QueryIntent;
@@ -157,6 +161,32 @@ function normalizeRetrievalStage(value: unknown): SearchResult["retrievalStage"]
     value === "rerank"
     ? value
     : undefined;
+}
+
+function normalizeEvidenceRole(value: unknown): SearchResult["evidenceRole"] | undefined {
+  return value === "current_authority" ||
+    value === "method" ||
+    value === "official_explanation" ||
+    value === "statistics" ||
+    value === "research" ||
+    value === "local_adaptation" ||
+    value === "evolution" ||
+    value === "background"
+    ? value
+    : undefined;
+}
+
+function parseJsonStringList(value: unknown): string[] | undefined {
+  const raw = typeof value === "string" ? value : "";
+  if (!raw) {
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string") : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function normalizedStandardQuery(query: string): string {
@@ -394,6 +424,12 @@ function inferEnvAirMetadata(input: {
       documentRole = "compilation_explanation";
     } else if (/(征求意见稿|draft|consultation)/i.test(combined)) {
       documentRole = "draft";
+    } else if (/(年报|月报|公报)/i.test(combined)) {
+      documentRole = "statistics";
+    } else if (/(白皮书|蓝皮书|whitepaper|white paper)/i.test(combined)) {
+      documentRole = "whitepaper";
+    } else if (/(研究|论文|综述|journal|article)/i.test(combined)) {
+      documentRole = "research_literature";
     } else if (/(技术指南|technical[_ -]?guide|guide)/i.test(combined)) {
       documentRole = "technical_guide";
     } else if (/(监测方法|monitoring_methods|测定|采样)/i.test(combined)) {
@@ -408,12 +444,51 @@ function inferEnvAirMetadata(input: {
       legalStatus = "draft_consultation";
     } else if (/(废止|历史版本|superseded)/i.test(combined)) {
       legalStatus = "superseded";
+    } else if (documentRole === "statistics") {
+      legalStatus = "time_scoped_evidence";
+    } else if (documentRole === "research_literature" || documentRole === "whitepaper" || documentRole === "official_explanation") {
+      legalStatus = "explanation_only";
     } else if (documentRole === "amendment" || authorityLayer === "core" || authorityLayer === "method" || authorityLayer === "local") {
       legalStatus = "current_effective";
     }
   }
 
   return { authorityLayer, legalStatus, documentRole };
+}
+
+function inferEvidenceRole(input: {
+  authorityLayer?: string;
+  legalStatus?: string;
+  documentRole?: string;
+}): NonNullable<SearchResult["evidenceRole"]> {
+  if (input.documentRole === "statistics" || input.legalStatus === "time_scoped_evidence") {
+    return "statistics";
+  }
+  if (input.documentRole === "research_literature") {
+    return "research";
+  }
+  if (input.authorityLayer === "evolution" || input.documentRole === "draft" || input.documentRole === "compilation_explanation") {
+    return "evolution";
+  }
+  if (input.authorityLayer === "local" || input.documentRole === "local_reference") {
+    return "local_adaptation";
+  }
+  if (input.documentRole === "technical_guide" || input.documentRole === "official_explanation" || input.documentRole === "whitepaper") {
+    return "official_explanation";
+  }
+  if (input.authorityLayer === "method" || input.documentRole === "monitoring_method" || input.documentRole === "qa_qc") {
+    return "method";
+  }
+  if (
+    input.authorityLayer === "core" ||
+    input.documentRole === "standard" ||
+    input.documentRole === "law" ||
+    input.documentRole === "regulation" ||
+    input.documentRole === "amendment"
+  ) {
+    return "current_authority";
+  }
+  return "background";
 }
 
 function buildSearchChunks(input: {
@@ -523,11 +598,18 @@ export async function rebuildSearchIndex(
       jurisdiction TEXT NOT NULL,
       region TEXT NOT NULL,
       standard_code TEXT NOT NULL,
+      standard_identity TEXT NOT NULL,
       standard_code_normalized TEXT NOT NULL,
       standard_family TEXT NOT NULL,
       standard_number TEXT NOT NULL,
       standard_year TEXT NOT NULL,
       pollutants TEXT NOT NULL,
+      evidence_role TEXT NOT NULL,
+      reporting_period TEXT NOT NULL,
+      evidence_period TEXT NOT NULL,
+      visibility TEXT NOT NULL,
+      tenant_id TEXT NOT NULL,
+      source_scope TEXT NOT NULL,
       search_terms TEXT NOT NULL,
       project_ids TEXT NOT NULL,
       project_key TEXT NOT NULL
@@ -545,8 +627,18 @@ export async function rebuildSearchIndex(
     CREATE TABLE IF NOT EXISTS facts (
       id TEXT PRIMARY KEY,
       page_id TEXT NOT NULL,
+      fact_ordinal INTEGER NOT NULL,
+      fact_stable_id TEXT NOT NULL,
+      fact_legacy_ids TEXT NOT NULL,
       fact_type TEXT NOT NULL,
       table_name TEXT NOT NULL,
+      standard_identity TEXT NOT NULL,
+      evidence_role TEXT NOT NULL,
+      source_authority_layer TEXT NOT NULL,
+      source_document_role TEXT NOT NULL,
+      source_legal_status TEXT NOT NULL,
+      reporting_period TEXT NOT NULL,
+      evidence_period TEXT NOT NULL,
       pollutant TEXT NOT NULL,
       metric TEXT NOT NULL,
       averaging_period TEXT NOT NULL,
@@ -583,13 +675,13 @@ export async function rebuildSearchIndex(
   `);
 
   const insertPage = db.prepare(
-    "INSERT INTO pages (id, path, title, body, kind, status, source_type, source_class, authority_layer, legal_status, document_role, jurisdiction, region, standard_code, standard_code_normalized, standard_family, standard_number, standard_year, pollutants, search_terms, project_ids, project_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    "INSERT INTO pages (id, path, title, body, kind, status, source_type, source_class, authority_layer, legal_status, document_role, jurisdiction, region, standard_code, standard_identity, standard_code_normalized, standard_family, standard_number, standard_year, pollutants, evidence_role, reporting_period, evidence_period, visibility, tenant_id, source_scope, search_terms, project_ids, project_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
   );
   const insertChunk = db.prepare(
     "INSERT INTO chunks (id, page_id, ordinal, heading, kind, location, text, search_terms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
   );
   const insertFact = db.prepare(
-    "INSERT INTO facts (id, page_id, fact_type, table_name, pollutant, metric, averaging_period, value, unit, raw_text, search_terms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    "INSERT INTO facts (id, page_id, fact_ordinal, fact_stable_id, fact_legacy_ids, fact_type, table_name, standard_identity, evidence_role, source_authority_layer, source_document_role, source_legal_status, reporting_period, evidence_period, pollutant, metric, averaging_period, value, unit, raw_text, search_terms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
   );
   const rootDir = path.dirname(wikiDir);
 
@@ -623,6 +715,23 @@ export async function rebuildSearchIndex(
         }
       }
       const standardCode = typeof parsed.data.standard_code === "string" ? parsed.data.standard_code : "";
+      const reportingPeriod = typeof parsed.data.reporting_period === "string" ? parsed.data.reporting_period : "";
+      const evidencePeriod = typeof parsed.data.evidence_period === "string" ? parsed.data.evidence_period : reportingPeriod;
+      const visibility =
+        parsed.data.visibility === "tenant" || parsed.data.visibility === "project" || parsed.data.visibility === "public"
+          ? parsed.data.visibility
+          : page.projectIds.length
+            ? "project"
+            : "public";
+      const tenantId = typeof parsed.data.tenant_id === "string" ? parsed.data.tenant_id : "";
+      const sourceScope =
+        typeof parsed.data.source_scope === "string"
+          ? parsed.data.source_scope
+          : visibility === "public"
+            ? "public_authority"
+            : visibility === "tenant"
+              ? "tenant_private"
+              : "project_private";
       const inferredMetadata = inferEnvAirMetadata({
         title: page.title,
         body,
@@ -633,6 +742,8 @@ export async function rebuildSearchIndex(
       });
       const standards = extractStandardReferences([page.title, standardCode, body].join("\n"));
       const firstStandard = standards[0];
+      const standardIdentity = standardIdentityKey(standardCode || firstStandard);
+      const evidenceRole = inferEvidenceRole(inferredMetadata);
       const pollutants = Array.isArray(parsed.data.pollutants)
         ? (parsed.data.pollutants as unknown[]).filter((item): item is string => typeof item === "string")
         : typeof parsed.data.pollutants === "string"
@@ -657,11 +768,18 @@ export async function rebuildSearchIndex(
         typeof parsed.data.jurisdiction === "string" ? parsed.data.jurisdiction : "",
         typeof parsed.data.region === "string" ? parsed.data.region : "",
         standardCode,
+        standardIdentity,
         standardCode ? normalizeStandardCode(standardCode) : (firstStandard?.normalized ?? ""),
         firstStandard?.family ?? "",
         firstStandard?.number ?? "",
         firstStandard?.year ?? "",
         pollutants.join("|"),
+        evidenceRole,
+        reportingPeriod,
+        evidencePeriod,
+        visibility,
+        tenantId,
+        sourceScope,
         searchTerms,
         JSON.stringify(page.projectIds),
         page.projectIds.map((projectId) => `|${projectId}|`).join("")
@@ -684,8 +802,18 @@ export async function rebuildSearchIndex(
           insertFact.run(
             `${page.id}:${fact.id}`,
             page.id,
+            fact.ordinal,
+            fact.stableId,
+            JSON.stringify(fact.legacyIds ?? []),
             fact.type,
             fact.tableName ?? "",
+            fact.standardCode ? standardIdentityKey(fact.standardCode) : standardIdentity,
+            inferEvidenceRole(inferredMetadata),
+            inferredMetadata.authorityLayer,
+            inferredMetadata.documentRole,
+            inferredMetadata.legalStatus,
+            reportingPeriod,
+            evidencePeriod,
             fact.pollutant ?? "",
             fact.metric ?? "",
             fact.averagingPeriod ?? "",
@@ -807,6 +935,13 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
         pages.jurisdiction AS jurisdiction,
         pages.region AS region,
         pages.standard_code AS standardCode,
+        pages.standard_identity AS standardIdentity,
+        pages.evidence_role AS evidenceRole,
+        pages.reporting_period AS reportingPeriod,
+        pages.evidence_period AS evidencePeriod,
+        pages.visibility AS visibility,
+        pages.tenant_id AS tenantId,
+        pages.source_scope AS sourceScope,
         pages.pollutants AS pollutants,
         pages.project_ids AS projectIds,
         NULL AS chunkId,
@@ -815,6 +950,9 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
         NULL AS chunkKind,
         NULL AS chunkLocation,
         NULL AS factId,
+        NULL AS factStableId,
+        NULL AS factOrdinal,
+        NULL AS factLegacyIds,
         NULL AS factType,
         NULL AS factTable,
         NULL AS factRawText,
@@ -840,6 +978,13 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
         pages.jurisdiction AS jurisdiction,
         pages.region AS region,
         pages.standard_code AS standardCode,
+        pages.standard_identity AS standardIdentity,
+        pages.evidence_role AS evidenceRole,
+        pages.reporting_period AS reportingPeriod,
+        pages.evidence_period AS evidencePeriod,
+        pages.visibility AS visibility,
+        pages.tenant_id AS tenantId,
+        pages.source_scope AS sourceScope,
         pages.pollutants AS pollutants,
         pages.project_ids AS projectIds,
         chunks.id AS chunkId,
@@ -848,6 +993,9 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
         chunks.kind AS chunkKind,
         chunks.location AS chunkLocation,
         NULL AS factId,
+        NULL AS factStableId,
+        NULL AS factOrdinal,
+        NULL AS factLegacyIds,
         NULL AS factType,
         NULL AS factTable,
         NULL AS factRawText,
@@ -873,6 +1021,13 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
         pages.jurisdiction AS jurisdiction,
         pages.region AS region,
         pages.standard_code AS standardCode,
+        pages.standard_identity AS standardIdentity,
+        facts.evidence_role AS evidenceRole,
+        facts.reporting_period AS reportingPeriod,
+        facts.evidence_period AS evidencePeriod,
+        pages.visibility AS visibility,
+        pages.tenant_id AS tenantId,
+        pages.source_scope AS sourceScope,
         pages.pollutants AS pollutants,
         pages.project_ids AS projectIds,
         facts.id AS chunkId,
@@ -881,6 +1036,9 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
         'table' AS chunkKind,
         facts.table_name AS chunkLocation,
         facts.id AS factId,
+        facts.fact_stable_id AS factStableId,
+        facts.fact_ordinal AS factOrdinal,
+        facts.fact_legacy_ids AS factLegacyIds,
         facts.fact_type AS factType,
         facts.table_name AS factTable,
         facts.raw_text AS factRawText,
@@ -913,7 +1071,7 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
     const clauses: string[] = [];
     addScalarOrListFilter(clauses, params, "pages.kind", options.kind);
     addScalarOrListFilter(clauses, params, "pages.status", options.status);
-    if (options.project && options.project !== "all") {
+    if (options.project && options.project !== "all" && options.scope !== "mixed_public_private") {
       if (options.project === "unassigned") {
         clauses.push("pages.project_key = ''");
       } else {
@@ -934,6 +1092,25 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
     if (options.region && options.region !== "all") {
       clauses.push("pages.region LIKE ?");
       params.push(`%${options.region}%`);
+    }
+    if (options.scope === "mixed_public_private") {
+      const mixedClauses = ["pages.visibility = 'public'"];
+      if (options.tenantId) {
+        mixedClauses.push("pages.tenant_id = ?");
+        params.push(options.tenantId);
+      }
+      if (options.project && options.project !== "all") {
+        mixedClauses.push("pages.project_key LIKE ?");
+        params.push(`%|${options.project}|%`);
+      }
+      clauses.push(`(${mixedClauses.join(" OR ")})`);
+    } else if (options.visibility) {
+      clauses.push("pages.visibility = ?");
+      params.push(options.visibility);
+    }
+    if (options.tenantId && options.scope !== "mixed_public_private") {
+      clauses.push("pages.tenant_id = ?");
+      params.push(options.tenantId);
     }
     if (options.pollutant && options.pollutant !== "all") {
       clauses.push("LOWER(pages.pollutants) LIKE ?");
@@ -1041,6 +1218,8 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
     const title = String(row.title ?? "");
     const standardCode = String(row.standardCode ?? "");
     const documentRole = String(row.documentRole ?? "");
+    const evidenceRole = String(row.evidenceRole ?? "");
+    const authorityLayer = String(row.authorityLayer ?? "");
     const retrievalStage = String(row.retrievalStage ?? "");
     if (hasExactStandards && retrievalStage === "standard_exact") {
       if (amendmentIntent && (documentRole === "amendment" || title.includes("修改单") || standardCode.includes("修改单"))) {
@@ -1059,6 +1238,14 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
     }
     if (amendmentIntent && (documentRole === "amendment" || title.includes("修改单") || standardCode.includes("修改单"))) {
       return -80;
+    }
+    if (currentBasisIntent) {
+      if (evidenceRole === "current_authority" || evidenceRole === "method" || evidenceRole === "local_adaptation") {
+        return -45;
+      }
+      if (authorityLayer === "evidence" || evidenceRole === "statistics" || evidenceRole === "research" || evidenceRole === "background") {
+        return 55;
+      }
     }
     return 0;
   }
@@ -1323,6 +1510,22 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
     jurisdiction: String(row.jurisdiction ?? "") || undefined,
     region: String(row.region ?? "") || undefined,
     standardCode: String(row.standardCode ?? "") || undefined,
+    standardIdentity: String(row.standardIdentity ?? "") || undefined,
+    evidenceRole: normalizeEvidenceRole(row.evidenceRole),
+    reportingPeriod: String(row.reportingPeriod ?? "") || undefined,
+    evidencePeriod: String(row.evidencePeriod ?? "") || undefined,
+    visibility:
+      row.visibility === "public" || row.visibility === "tenant" || row.visibility === "project"
+        ? (row.visibility as SearchResult["visibility"])
+        : undefined,
+    tenantId: String(row.tenantId ?? "") || undefined,
+    sourceScope:
+      row.sourceScope === "public_authority" ||
+      row.sourceScope === "tenant_private" ||
+      row.sourceScope === "project_private" ||
+      row.sourceScope === "generated_report"
+        ? (row.sourceScope as SearchResult["sourceScope"])
+        : undefined,
     pollutants: String(row.pollutants ?? "")
       .split("|")
       .map((item) => item.trim())
@@ -1339,6 +1542,14 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
     chunkLocation: String(row.chunkLocation ?? "") || undefined,
     retrievalStage: normalizeRetrievalStage(row.retrievalStage),
     factId: String(row.factId ?? "") || undefined,
+    factStableId: String(row.factStableId ?? "") || undefined,
+    factOrdinal:
+      row.factOrdinal === null || typeof row.factOrdinal === "undefined" || row.factOrdinal === ""
+        ? undefined
+        : Number.isFinite(Number(row.factOrdinal))
+          ? Number(row.factOrdinal)
+          : undefined,
+    factLegacyIds: parseJsonStringList(row.factLegacyIds),
     factType: String(row.factType ?? "") || undefined,
     factTable: String(row.factTable ?? "") || undefined,
     factRawText: String(row.factRawText ?? "") || undefined,

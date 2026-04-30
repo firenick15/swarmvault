@@ -151,8 +151,11 @@ describe("web search gap-fill", () => {
     expect(result.savedPath).toBeTruthy();
 
     const saved = matter(await fs.readFile(result.savedPath as string, "utf8"));
-    const citationList = saved.data.source_ids as string[] | undefined;
-    expect(citationList).toBeDefined();
+    const sourceIds = saved.data.source_ids as string[] | undefined;
+    const citationList = saved.data.citations as string[] | undefined;
+    expect(sourceIds).toBeDefined();
+    expect(sourceIds?.some((id) => id.startsWith("gap-fill"))).toBe(true);
+    expect(sourceIds).not.toContain("https://example.com/evidence");
     expect(citationList).toContain("https://example.com/evidence");
   });
 

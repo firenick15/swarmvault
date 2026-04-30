@@ -29,7 +29,7 @@ import { runDeepLint } from "./deep-lint.js";
 import {
   buildEnvAirQueryPlan,
   buildEnvironmentDataToolHints,
-  classifyRecommendedNextTool,
+  classifyEnvAirToolRouting,
   pollutantAliasGroupsForQuery,
   standardAliasGroupsForQuery,
   standardIdentityKey,
@@ -96,6 +96,7 @@ import {
 import { mergeSearchResults, rebuildSearchIndex, type SearchQueryOptions, searchPages } from "./search.js";
 import { ALL_SOURCE_CLASSES, aggregateManifestSourceClass } from "./source-classification.js";
 import { listGuidedSourceSessions, updateGuidedSourceSessionStatus } from "./source-sessions.js";
+import { synthesizeEnvAirTopics } from "./topic-synthesis.js";
 import type {
   AgentMemoryTask,
   ApprovalBundleType,
@@ -154,6 +155,7 @@ import type {
   SourceClass,
   SourceManifest,
   StandardCoverage,
+  ToolRoutingDecision,
   VaultConfig
 } from "./types.js";
 import {
@@ -190,10 +192,12 @@ type QueryExecutionResult = {
   groundingWarnings?: string[];
   invalidCitations?: string[];
   recommendedNextTool?: QueryResult["recommendedNextTool"];
+  toolRouting?: QueryResult["toolRouting"];
   answerBasis?: QueryResult["answerBasis"];
   currentStatus?: string;
   dataToolHints?: string[];
   agentDecision?: QueryResult["agentDecision"];
+  evidenceSet?: QueryResult["evidenceSet"];
   standardCoverage?: QueryResult["standardCoverage"];
   evidenceCompleteness?: QueryResult["evidenceCompleteness"];
   retrievalDebug?: RetrievalDebugInfo;
@@ -876,7 +880,50 @@ function jaccardSimilarity(left: string[], right: string[]): number {
   return intersection.length / union.size;
 }
 
-function shouldPromoteCandidate(previous: CandidateHistoryEntry | undefined, sourceIds: string[]): boolean {
+function aggregateTopicQuality(
+  name: string,
+  sourceAnalyses: SourceAnalysis[]
+): { score: number; flags: string[]; decision: "promote" | "candidate_only" | "index_only" | "reject" } {
+  const slug = slugifyKnowledgeLabel(name).toLowerCase();
+  const flags: string[] = [];
+  if (/^[a-z0-9]{1,3}$/.test(slug) && !/^(co|o3|so2|no2|nox|pm10|pm2-5|aqi|iaqi|vocs|nmhc)$/i.test(slug)) {
+    flags.push("ambiguous_short_slug");
+  }
+  if (/^\d{4}.*(目录|清单|公告|公报|报告)/.test(name)) {
+    flags.push("file_title_artifact");
+  }
+  const authorityLayers = new Set(sourceAnalyses.map((analysis) => analysis.domain?.authorityLayer ?? "unknown"));
+  if (sourceAnalyses.length > 40 && authorityLayers.size > 3) {
+    flags.push("god_node_source_spread");
+  }
+  const claimMatches = sourceAnalyses.reduce(
+    (total, analysis) => total + analysis.claims.filter((claim) => claim.text.toLowerCase().includes(name.toLowerCase())).length,
+    0
+  );
+  if (claimMatches === 0 && name.length > 4 && sourceAnalyses.length > 12) {
+    flags.push("low_claim_coherence");
+  }
+  const score = Math.max(0, 1 - flags.length * 0.25);
+  const decision = flags.includes("file_title_artifact")
+    ? "reject"
+    : flags.includes("god_node_source_spread")
+      ? "index_only"
+      : flags.includes("ambiguous_short_slug")
+        ? "candidate_only"
+        : "promote";
+  return { score, flags, decision };
+}
+
+function shouldPromoteCandidate(
+  previous: CandidateHistoryEntry | undefined,
+  sourceIds: string[],
+  name: string,
+  sourceAnalyses: SourceAnalysis[]
+): boolean {
+  const quality = aggregateTopicQuality(name, sourceAnalyses);
+  if (quality.decision !== "promote") {
+    return false;
+  }
   return Boolean(previous && previous.status === "candidate" && jaccardSimilarity(previous.sourceIds, sourceIds) >= 0.5);
 }
 
@@ -2922,6 +2969,7 @@ async function syncVaultArtifacts(
     previousState: CompileState | null;
     approve?: boolean;
     promoteCandidates?: boolean;
+    topicSynthesis?: boolean;
   }
 ): Promise<{
   graph: GraphArtifact;
@@ -3077,7 +3125,13 @@ async function syncVaultArtifacts(
       const projectIds = scopedProjectIdsFromSources(sourceIds, input.sourceProjects);
       const schemaHash = effectiveHashForProject(input.schemas, projectIds[0] ?? null);
       const previousEntry = input.previousState?.candidateHistory?.[pageId];
-      const promoted = previousEntry?.status === "active" || (promoteCandidates && shouldPromoteCandidate(previousEntry, sourceIds));
+      const topicQuality = aggregateTopicQuality(aggregate.name, aggregate.sourceAnalyses);
+      if (topicQuality.decision === "reject") {
+        continue;
+      }
+      const promoted =
+        previousEntry?.status === "active" ||
+        (promoteCandidates && shouldPromoteCandidate(previousEntry, sourceIds, aggregate.name, aggregate.sourceAnalyses));
       const relativePath = promoted ? activeAggregatePath(itemKind, slug) : candidatePagePathFor(itemKind, slug);
       const aggregateSourceClass = aggregateManifestSourceClass(input.manifests, sourceIds);
       const fallbackPaths = [
@@ -3140,6 +3194,90 @@ async function syncVaultArtifacts(
         status: promoted ? "active" : "candidate"
       };
       records.push(pageRecord);
+    }
+  }
+
+  if (input.topicSynthesis) {
+    const topicProvider = await getProviderForTask(rootDir, "compileProvider");
+    const topicPages = await synthesizeEnvAirTopics({
+      analyses: input.analyses,
+      provider: topicProvider,
+      schemaContent: input.schemas.effective.global.content
+    });
+    for (const topic of topicPages) {
+      const sourceIds = uniqueStrings(topic.sourceIds);
+      const sourceHashes = Object.fromEntries(
+        input.analyses
+          .filter((analysis) => sourceIds.includes(analysis.sourceId))
+          .map((analysis) => [analysis.sourceId, analysis.sourceHash])
+      );
+      const sourceSemanticHashes = Object.fromEntries(
+        input.analyses
+          .filter((analysis) => sourceIds.includes(analysis.sourceId))
+          .map((analysis) => [analysis.sourceId, analysis.semanticHash])
+      );
+      const projectIds = scopedProjectIdsFromSources(sourceIds, input.sourceProjects);
+      const pageId = `concept:${topic.slug}`;
+      const relativePath = `concepts/${topic.slug}.md`;
+      const page = emptyGraphPage({
+        id: pageId,
+        path: relativePath,
+        title: topic.title,
+        kind: "concept",
+        sourceIds,
+        projectIds,
+        nodeIds: [pageId],
+        schemaHash: globalSchemaHash,
+        sourceHashes,
+        sourceSemanticHashes,
+        confidence: 0.88,
+        status: "active"
+      });
+      const content = await buildManagedContent(
+        path.join(paths.wikiDir, relativePath),
+        {
+          managedBy: "system",
+          compiledFrom: sourceIds
+        },
+        (metadata) =>
+          matter.stringify(topic.body, {
+            page_id: pageId,
+            kind: "concept",
+            cssclasses: ["sv-concept"],
+            title: topic.title,
+            tags: ["concept", "topic-synthesis", "env-air"],
+            source_ids: sourceIds,
+            project_ids: projectIds,
+            node_ids: [pageId],
+            freshness: "fresh",
+            status: metadata.status,
+            confidence: 0.88,
+            created_at: metadata.createdAt,
+            updated_at: metadata.updatedAt,
+            compiled_from: metadata.compiledFrom,
+            managed_by: metadata.managedBy,
+            backlinks: sourceIds.map((sourceId) => `source:${sourceId}`),
+            schema_hash: globalSchemaHash,
+            synthesis: true,
+            synthesis_version: 1,
+            topic_id: topic.topicId,
+            input_token_estimate: topic.inputTokenEstimate,
+            prompt_hash: topic.promptHash,
+            source_hashes: sourceHashes,
+            source_semantic_hashes: sourceSemanticHashes
+          })
+      );
+      records.push({ page, content });
+      await writeJsonFile(path.join(paths.stateDir, "topic-synthesis", `${topic.topicId}.json`), {
+        topicId: topic.topicId,
+        title: topic.title,
+        sourceIds,
+        promptHash: topic.promptHash,
+        inputTokenEstimate: topic.inputTokenEstimate,
+        outputPagePath: relativePath,
+        providerId: topicProvider.id,
+        providerModel: topicProvider.model
+      });
     }
   }
 
@@ -3895,7 +4033,9 @@ function buildQuerySearchOptions(queryOptions?: QueryOptions): SearchQueryOption
     intent: queryOptions?.intent,
     requireCurrentBasis: queryOptions?.requireCurrentBasis,
     strictGrounding: queryOptions?.strictGrounding || queryOptions?.evidenceMode === "strict",
-    project: queryOptions?.projectId
+    project: queryOptions?.projectId,
+    scope: queryOptions?.scope,
+    tenantId: queryOptions?.tenantId
   };
   const queryIntent = queryOptions?.intent;
   if (queryIntent === "current_basis" || queryOptions?.requireCurrentBasis) {
@@ -3912,15 +4052,15 @@ function buildQuerySearchOptions(queryOptions?: QueryOptions): SearchQueryOption
   } else if (queryIntent === "local") {
     searchOptions.authorityLayer = ["local", "core", "method"];
   } else if (queryIntent === "statistics") {
-    searchOptions.documentRole = ["statistics", "report", "white_paper", "research"];
+    searchOptions.documentRole = ["statistics", "whitepaper", "research_literature", "official_explanation"];
   } else if (queryIntent === "authority_boundary") {
     searchOptions.authorityLayer = ["core", "method", "evidence", "evolution", "local"];
     searchOptions.documentRole = [
       "standard",
       "technical_guide",
-      "research",
-      "report",
-      "white_paper",
+      "research_literature",
+      "statistics",
+      "whitepaper",
       "draft",
       "compilation_explanation",
       "amendment"
@@ -3929,6 +4069,15 @@ function buildQuerySearchOptions(queryOptions?: QueryOptions): SearchQueryOption
     searchOptions.includeSuperseded = true;
   } else if (queryIntent === "operational_guidance") {
     searchOptions.authorityLayer = ["core", "method", "local", "evidence"];
+  }
+  if (queryOptions?.scope === "public_only") {
+    searchOptions.visibility = "public";
+  } else if (queryOptions?.scope === "tenant_only") {
+    searchOptions.visibility = "tenant";
+    searchOptions.tenantId = queryOptions.tenantId ?? "__missing_tenant__";
+  } else if (queryOptions?.scope === "project_only") {
+    searchOptions.visibility = "project";
+    searchOptions.project = queryOptions.projectId ?? "__missing_project__";
   }
   return searchOptions;
 }
@@ -3972,9 +4121,10 @@ function inferAuthorityBoundary(evidenceItems: EvidenceItem[]): NonNullable<Quer
   const hasReference = evidenceItems.some(
     (item) =>
       item.authorityLayer === "evidence" ||
-      item.documentRole === "research" ||
-      item.documentRole === "report" ||
-      item.documentRole === "white_paper" ||
+      item.documentRole === "research_literature" ||
+      item.documentRole === "statistics" ||
+      item.documentRole === "whitepaper" ||
+      item.documentRole === "official_explanation" ||
       item.documentRole === "technical_guide"
   );
   const hasDraftOrHistorical = evidenceItems.some(
@@ -4024,6 +4174,7 @@ function buildAgentDecision(input: {
   return {
     reportUsability,
     mustCallTools,
+    shouldCallEnvironmentDataMcp: mustCallTools.includes("environment_data_mcp"),
     authorityBoundary: inferAuthorityBoundary(input.evidenceItems),
     privateKnowledgeUsed: input.projectIds.length > 0 || input.evidenceItems.some((item) => item.authorityLayer === "project"),
     publicAuthorityUsed: input.evidenceItems.some(
@@ -4039,6 +4190,23 @@ function buildAgentDecision(input: {
         : mustCallTools.length
           ? ["basis", "method", "interpretation", "draft_text"]
           : ["basis", "method", "interpretation", "draft_text", "data_conclusion"]
+  };
+}
+
+function finalizeToolRouting(
+  base: ToolRoutingDecision,
+  modelRecommendedNextTool?: QueryResult["recommendedNextTool"]
+): ToolRoutingDecision {
+  return {
+    ...base,
+    modelRecommendedNextTool,
+    finalNextTool: base.finalNextTool,
+    conflictResolvedBy:
+      modelRecommendedNextTool && modelRecommendedNextTool === base.finalNextTool ? "model_agreement" : base.conflictResolvedBy,
+    reasons:
+      modelRecommendedNextTool && modelRecommendedNextTool !== base.finalNextTool
+        ? uniqueStrings([...base.reasons, `model_suggested_${modelRecommendedNextTool}_but_policy_kept_${base.finalNextTool}`])
+        : base.reasons
   };
 }
 
@@ -4066,12 +4234,19 @@ function formatEvidenceSet(evidenceItems: EvidenceItem[]): string {
         item.legalStatus ? `legal_status=${item.legalStatus}` : undefined,
         item.documentRole ? `document_role=${item.documentRole}` : undefined,
         item.standardCode ? `standard_code=${item.standardCode}` : undefined,
+        item.standardIdentity ? `standard_identity=${item.standardIdentity}` : undefined,
+        item.evidenceRole ? `evidence_role=${item.evidenceRole}` : undefined,
+        item.reportingPeriod ? `reporting_period=${item.reportingPeriod}` : undefined,
+        item.visibility ? `visibility=${item.visibility}` : undefined,
         item.region ? `region=${item.region}` : undefined,
         item.chunkId ? `chunk_id=${item.chunkId}` : undefined,
         item.chunkHeading ? `chunk_heading=${item.chunkHeading}` : undefined,
         item.chunkKind ? `chunk_kind=${item.chunkKind}` : undefined,
         item.chunkLocation ? `chunk_location=${item.chunkLocation}` : undefined,
         item.factId ? `fact_id=${item.factId}` : undefined,
+        item.factStableId ? `fact_stable_id=${item.factStableId}` : undefined,
+        item.factOrdinal ? `fact_ordinal=${item.factOrdinal}` : undefined,
+        item.factLegacyIds?.length ? `fact_legacy_ids=${item.factLegacyIds.join("|")}` : undefined,
         item.factType ? `fact_type=${item.factType}` : undefined,
         item.factTable ? `fact_table=${item.factTable}` : undefined,
         "",
@@ -4138,6 +4313,7 @@ function evidenceContainsExactTerms(evidenceItems: EvidenceItem[], terms: string
       [
         item.title,
         item.standardCode,
+        item.standardIdentity,
         item.citation,
         item.chunkId,
         item.chunkHeading,
@@ -4165,6 +4341,7 @@ function evidenceContainsRequiredAliases(evidenceItems: EvidenceItem[], aliasGro
       [
         item.title,
         item.standardCode,
+        item.standardIdentity,
         item.citation,
         item.chunkId,
         item.chunkHeading,
@@ -4189,7 +4366,7 @@ function requiredStandardLabels(queryPlan: ReturnType<typeof buildEnvAirQueryPla
 
 function buildStandardCoverage(requiredStandards: string[], evidenceItems: EvidenceItem[]): StandardCoverage[] {
   return requiredStandards.map((standard) => {
-    const matchingEvidence = evidenceItems.filter((item) => standardIdentityKey(item.standardCode) === standard);
+    const matchingEvidence = evidenceItems.filter((item) => (item.standardIdentity || standardIdentityKey(item.standardCode)) === standard);
     const evidenceIds = matchingEvidence.map((item) => item.id);
     const statuses = uniqueStrings(matchingEvidence.map((item) => item.legalStatus ?? ""));
     return {
@@ -4248,7 +4425,38 @@ function evaluateGrounding(input: { evidenceItems: EvidenceItem[]; answer: strin
   const evidenceById = new Map(input.evidenceItems.map((item) => [item.id, item]));
   const evidenceAliases = new Map<string, string>();
   for (const item of input.evidenceItems) {
-    const aliases = [item.id, item.citation, item.pageId, item.sourceId, item.chunkId].filter((alias): alias is string => Boolean(alias));
+    const aliases = [
+      item.id,
+      `[${item.id}]`,
+      item.citation,
+      item.pageId,
+      item.sourceId,
+      item.chunkId,
+      item.factId,
+      item.factStableId,
+      ...(item.factLegacyIds ?? []),
+      ...(item.canonicalAliases ?? [])
+    ].filter((alias): alias is string => Boolean(alias));
+    if (item.factOrdinal) {
+      aliases.push(`fact:${item.factOrdinal}`);
+      if (item.factType) {
+        aliases.push(`fact:${item.factOrdinal}:${item.factType}`);
+      }
+    }
+    for (const factAlias of [item.factId, item.factStableId, ...(item.factLegacyIds ?? [])].filter((alias): alias is string =>
+      Boolean(alias)
+    )) {
+      if (item.sourceId) {
+        aliases.push(`${item.sourceId}#${factAlias}`);
+        aliases.push(`source:${item.sourceId}:${factAlias}`);
+        if (/^fact:[0-9]+(?::[a-z_]+)?$/i.test(factAlias)) {
+          aliases.push(`${item.sourceId}#source:${item.sourceId}:${factAlias}`);
+        }
+      }
+      if (item.pageId) {
+        aliases.push(`${item.pageId}#${factAlias}`);
+      }
+    }
     for (const alias of aliases) {
       evidenceAliases.set(alias, item.id);
     }
@@ -4332,7 +4540,8 @@ async function executeQuery(
       .map((page) => [page.sourceIds[0], page.projectIds[0] ?? null])
   );
   const searchOptions = buildQuerySearchOptions(options.queryOptions);
-  const recommendedNextTool = classifyRecommendedNextTool(question);
+  const baseToolRouting = classifyEnvAirToolRouting(question);
+  const recommendedNextTool = baseToolRouting.finalNextTool;
   const dataToolHints = buildEnvironmentDataToolHints(question);
   const queryPlan = buildEnvAirQueryPlan(question);
   const currentBasisQuery =
@@ -4384,6 +4593,7 @@ async function executeQuery(
     authorityPinnedEvidenceCount: 0,
     rankingSignals: queryPlan.rankingSignals,
     recommendedNextTool,
+    toolRouting: baseToolRouting,
     stages: queryPlan.stages
   };
   const excerpts = await Promise.all(
@@ -4467,11 +4677,26 @@ async function executeQuery(
       legalStatus: result.legalStatus,
       documentRole: result.documentRole,
       standardCode: result.standardCode,
+      standardIdentity: result.standardIdentity,
+      evidenceRole: result.evidenceRole,
+      reportingPeriod: result.reportingPeriod,
+      evidencePeriod: result.evidencePeriod,
+      visibility: result.visibility,
+      tenantId: result.tenantId,
+      sourceScope: result.sourceScope,
       factId: result.factId,
+      factStableId: result.factStableId,
+      factOrdinal: result.factOrdinal,
+      factLegacyIds: result.factLegacyIds,
       factType: result.factType,
       factTable: result.factTable,
       factRawText: result.factRawText,
       region: result.region,
+      canonicalAliases: uniqueStrings(
+        [result.factId, result.factStableId, ...(result.factLegacyIds ?? []), result.chunkId, result.pageId, sourceId].filter(
+          (alias): alias is string => Boolean(alias)
+        )
+      ),
       excerpt: truncate(normalizeWhitespace(excerpts[index] ?? result.snippet), 1800)
     });
   });
@@ -4530,6 +4755,7 @@ async function executeQuery(
       groundingWarnings: ["no_retrieved_evidence"],
       invalidCitations: [],
       recommendedNextTool,
+      toolRouting: baseToolRouting,
       answerBasis: inferAnswerBasis(options.queryOptions, recommendedNextTool),
       currentStatus: undefined,
       dataToolHints,
@@ -4542,6 +4768,7 @@ async function executeQuery(
         blockingReasons: ["no_retrieved_evidence"]
       }),
       standardCoverage,
+      evidenceSet: evidenceItems,
       evidenceCompleteness,
       retrievalDebug: options.queryOptions?.debugContext
         ? {
@@ -4565,7 +4792,7 @@ async function executeQuery(
   const missingStandardGroups = strictGrounding ? evidenceContainsRequiredAliases(evidenceItems, standardAliasGroups) : [];
   const strictMissingTerms = uniqueStrings([...missingExactTerms, ...missingAliasGroups]);
   const strictMissingStandards = uniqueStrings(missingStandardGroups);
-  const strictMissingShouldBlock = recommendedNextTool === "knowledge_base";
+  const strictMissingShouldBlock = recommendedNextTool !== "environment_data_mcp";
   if ((strictMissingTerms.length || strictMissingStandards.length) && strictMissingShouldBlock) {
     const warnings = [
       ...(strictMissingTerms.length ? [`strict_exact_terms_not_found:${strictMissingTerms.join(",")}`] : []),
@@ -4584,6 +4811,7 @@ async function executeQuery(
       groundingWarnings: warnings,
       invalidCitations: [],
       recommendedNextTool,
+      toolRouting: baseToolRouting,
       answerBasis: inferAnswerBasis(options.queryOptions, recommendedNextTool),
       currentStatus: summarizeCurrentStatus(evidenceItems),
       dataToolHints,
@@ -4596,6 +4824,7 @@ async function executeQuery(
         blockingReasons: warnings
       }),
       standardCoverage,
+      evidenceSet: evidenceItems,
       evidenceCompleteness,
       retrievalDebug: options.queryOptions?.debugContext
         ? {
@@ -4644,7 +4873,7 @@ async function executeQuery(
         "When a user asks about a named historical standard, explain that standard and its replacement status instead of answering only with the current replacement.",
         "For current-basis questions, prioritize current effective standards and explicitly mark drafts/history as non-binding.",
         "For local questions, state jurisdiction boundaries and do not generalize local口径 to other regions.",
-        "If monitor data, rankings, concentration calculations,同比/环比, abnormal time-series diagnosis, or process analysis are needed, say the environment_data_mcp tool should be used.",
+        "Only recommend environment_data_mcp when the user asks for actual monitoring data, station/city/time-window values, rankings,同比/环比, abnormal time-series diagnosis, or process analysis. Do not recommend it for pure standard limits, formulas, methods, version relationships, or authority-boundary questions.",
         "Do not apply knowledge-base standard limit values directly to proxy metrics or derived values produced by a data MCP unless the evidence states that the calculation and averaging period are the same compliance metric.",
         "For report-writing answers, separate standard basis, monitoring data, statistical conclusion, professional interpretation, and caveats.",
         "If evidence is insufficient, say so instead of filling gaps from general knowledge.",
@@ -4703,6 +4932,7 @@ async function executeQuery(
   const groundingWarnings = uniqueBy([...grounding.groundingWarnings, ...providerWarnings], (item) => item);
   const evidenceState =
     grounding.evidenceState === "insufficient" ? "insufficient" : groundingWarnings.length ? "partial" : grounding.evidenceState;
+  const finalToolRouting = finalizeToolRouting(baseToolRouting, structuredAnswer?.recommendedNextTool);
 
   return {
     answer,
@@ -4716,19 +4946,21 @@ async function executeQuery(
     evidenceState,
     groundingWarnings,
     invalidCitations: grounding.invalidCitations,
-    recommendedNextTool: structuredAnswer?.recommendedNextTool ?? recommendedNextTool,
-    answerBasis: inferAnswerBasis(options.queryOptions, structuredAnswer?.recommendedNextTool ?? recommendedNextTool),
+    recommendedNextTool,
+    toolRouting: finalToolRouting,
+    answerBasis: inferAnswerBasis(options.queryOptions, recommendedNextTool),
     currentStatus: summarizeCurrentStatus(evidenceItems),
     dataToolHints,
     agentDecision: buildAgentDecision({
       evidenceState,
-      recommendedNextTool: structuredAnswer?.recommendedNextTool ?? recommendedNextTool,
+      recommendedNextTool,
       evidenceItems,
       projectIds: pageProjectIds,
       standardCoverage,
       blockingReasons: groundingWarnings
     }),
     standardCoverage,
+    evidenceSet: evidenceItems,
     evidenceCompleteness,
     retrievalDebug: options.queryOptions?.debugContext
       ? {
@@ -6122,6 +6354,7 @@ async function compileVaultUnlocked(rootDir: string, options: CompileOptions = {
     !memoryChanged &&
     !pendingCandidatePromotion &&
     artifactsExist &&
+    !options.topicSynthesis &&
     !options.approve
   ) {
     const graph = await readJsonFile<GraphArtifact>(paths.graphPath);
@@ -6171,7 +6404,7 @@ async function compileVaultUnlocked(rootDir: string, options: CompileOptions = {
   }
 
   const analysisProgress = createCompileProgressReporter("analyze", manifests.length);
-  const analysisConcurrency = 8;
+  const analysisConcurrency = Math.max(1, config.analysis?.concurrency ?? 8);
   const analyses = await runWithConcurrency(
     manifests.map(
       (manifest) => async () =>
@@ -6181,7 +6414,10 @@ async function compileVaultUnlocked(rootDir: string, options: CompileOptions = {
           provider,
           paths,
           getEffectiveSchema(schemas, sourceProjects[manifest.sourceId] ?? null),
-          forceAnalysis ? { bypassCache: true } : undefined
+          {
+            bypassCache: forceAnalysis,
+            domainProfileHash: nextDomainProfileHash
+          }
         ).then((analysis) => {
           analysisProgress.tick(manifest.title);
           return analysis;
@@ -6247,7 +6483,8 @@ async function compileVaultUnlocked(rootDir: string, options: CompileOptions = {
     memoryHashes: currentMemoryHashes,
     domainProfileHash: nextDomainProfileHash,
     previousState,
-    approve: options.approve
+    approve: options.approve,
+    topicSynthesis: options.topicSynthesis
   });
   let postPassApprovalId: string | undefined;
   let postPassApprovalDir: string | undefined;
@@ -6714,10 +6951,12 @@ export async function queryVault(rootDir: string, options: QueryOptions): Promis
     groundingWarnings: query.groundingWarnings,
     invalidCitations: query.invalidCitations,
     recommendedNextTool: query.recommendedNextTool,
+    toolRouting: query.toolRouting,
     answerBasis: query.answerBasis,
     currentStatus: query.currentStatus,
     dataToolHints: query.dataToolHints,
     agentDecision: query.agentDecision,
+    evidenceSet: query.evidenceSet,
     standardCoverage: query.standardCoverage,
     evidenceCompleteness: query.evidenceCompleteness,
     retrievalDebug: query.retrievalDebug

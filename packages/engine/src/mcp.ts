@@ -256,7 +256,7 @@ export async function createMcpServer(rootDir: string): Promise<McpServer> {
     "query_vault",
     {
       description:
-        "Ask a question against the compiled vault. For environmental air work, returns grounded citations, evidenceState, answerBasis, agentDecision, current-status hints, retrieval diagnostics when requested, and suggestions for when the environment data MCP should be called. Treat evidenceState=grounded as report-ready only when agentDecision.reportUsability=direct; partial is draft-only; insufficient requires more evidence; needs_data_mcp means the environment data MCP must be called before making data conclusions.",
+        "Ask a question against the compiled vault. For environmental air work, returns grounded citations, evidenceState, answerBasis, toolRouting, evidenceSet, agentDecision, current-status hints, retrieval diagnostics when requested, and explicit guidance for when the environment data MCP should be called. Treat evidenceState=grounded as report-ready only when agentDecision.reportUsability=direct; partial is draft-only; insufficient requires more evidence; needs_data_mcp means the environment data MCP must be called before making data conclusions.",
       inputSchema: {
         question: z.string().min(1).describe("Question to ask the vault"),
         save: z.boolean().optional().describe("Persist the answer to wiki/outputs"),
@@ -283,7 +283,7 @@ export async function createMcpServer(rootDir: string): Promise<McpServer> {
         evidenceMode: z.enum(["strict", "balanced", "exploratory"]).optional().describe("Grounding strictness for the answer"),
         strictGrounding: z.boolean().optional().describe("Only answer when retrieved evidence is sufficient"),
         debugContext: z.boolean().optional().describe("Return retrieval evidence items and grounding diagnostics"),
-        returnDecisionContract: z.boolean().optional().describe("Keep agentDecision in the output; defaults to true for DeerFlow planners"),
+        returnDecisionContract: z.boolean().optional().describe("Compatibility flag; DeerFlow decision fields are returned by default"),
         scope: z.enum(["public_only", "tenant_only", "project_only", "mixed_public_private"]).optional(),
         tenantId: z.string().optional(),
         projectId: z.string().optional()

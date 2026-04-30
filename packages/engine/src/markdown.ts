@@ -107,6 +107,16 @@ function uniqueStrings(values: string[]): string[] {
   return uniqueBy(values.filter(Boolean), (value) => value);
 }
 
+function normalizeCitationSourceIds(citations: string[]): string[] {
+  return uniqueStrings(
+    citations
+      .map((citation) => citation.trim())
+      .filter((citation) => citation && !/^https?:\/\//i.test(citation))
+      .map((citation) => citation.replace(/^source:/, "").split("#")[0])
+      .filter((citation) => citation && !citation.includes(":") && citation !== "E")
+  );
+}
+
 const GUIDED_SOURCE_MARKER_PREFIX = "<!-- swarmvault-guided-source:";
 const GUIDED_SOURCE_START_SUFFIX = ":start -->";
 const GUIDED_SOURCE_END_SUFFIX = ":end -->";
@@ -337,9 +347,15 @@ export function buildSourcePage(
           ...(analysis.domain.standardCode ? { standard_code: analysis.domain.standardCode } : {}),
           ...(analysis.domain.publishDate ? { publish_date: analysis.domain.publishDate } : {}),
           ...(analysis.domain.effectiveDate ? { effective_date: analysis.domain.effectiveDate } : {}),
+          ...(analysis.domain.reportingPeriod ? { reporting_period: analysis.domain.reportingPeriod } : {}),
+          ...(analysis.domain.evidencePeriod ? { evidence_period: analysis.domain.evidencePeriod } : {}),
           ...(analysis.domain.replaces?.length ? { replaces: analysis.domain.replaces } : {}),
           ...(analysis.domain.replacedBy?.length ? { replaced_by: analysis.domain.replacedBy } : {}),
           ...(analysis.domain.pollutants?.length ? { pollutants: analysis.domain.pollutants } : {}),
+          ...(analysis.domain.visibility ? { visibility: analysis.domain.visibility } : {}),
+          ...(analysis.domain.tenantId ? { tenant_id: analysis.domain.tenantId } : {}),
+          ...(analysis.domain.projectId ? { project_id: analysis.domain.projectId } : {}),
+          ...(analysis.domain.sourceScope ? { source_scope: analysis.domain.sourceScope } : {}),
           ...(analysis.domain.metadataSource ? { metadata_source: analysis.domain.metadataSource } : {}),
           ...(analysis.domain.verificationState ? { verification_state: analysis.domain.verificationState } : {})
         }
@@ -679,7 +695,7 @@ export function buildAggregatePage(
 ): { page: GraphPage; content: string } {
   const slug = slugifyKnowledgeLabel(name);
   const pageId = `${kind}:${slug}`;
-  const sourceIds = sourceAnalyses.map((item) => item.sourceId);
+  const sourceIds = uniqueStrings(sourceAnalyses.map((item) => item.sourceId));
   const otherPages = [...sourceAnalyses.map((item) => `source:${item.sourceId}`), ...relatedOutputs.map((page) => page.id)];
   const summary = descriptions.find(Boolean) ?? `${kind} aggregated from ${sourceIds.length} source(s).`;
   const leaderTags = metadata.status === "candidate" ? [kind, "candidate"] : [kind];
@@ -707,31 +723,7 @@ export function buildAggregatePage(
     ...sourceHashFrontmatter(sourceHashes, sourceSemanticHashes)
   };
 
-  const body = appendGuidedSourceBlocks(
-    [
-      `# ${name}`,
-      "",
-      "## Summary",
-      "",
-      summary,
-      "",
-      "## Seen In",
-      "",
-      ...sourceAnalyses.map((item) => `- [[${pagePathFor("source", item.sourceId).replace(/\.md$/, "")}|${item.title}]]`),
-      "",
-      "## Source Claims",
-      "",
-      ...sourceAnalyses.flatMap((item) =>
-        item.claims
-          .filter((claim) => claim.text.toLowerCase().includes(name.toLowerCase()))
-          .map((claim) => `- ${claim.text} [source:${claim.citation}]`)
-      ),
-      "",
-      ...relatedOutputsSection(relatedOutputs),
-      ""
-    ].join("\n"),
-    existingContent
-  );
+  const body = appendGuidedSourceBlocks(renderAggregateExpertBody(kind, name, summary, sourceAnalyses, relatedOutputs), existingContent);
 
   return {
     page: {
@@ -760,6 +752,114 @@ export function buildAggregatePage(
     },
     content: matter.stringify(body, frontmatter)
   };
+}
+
+function renderAggregateExpertBody(
+  kind: "concept" | "entity",
+  name: string,
+  summary: string,
+  sourceAnalyses: SourceAnalysis[],
+  relatedOutputs: GraphPage[]
+): string {
+  const lowerName = name.toLowerCase();
+  const claimsByRole = new Map<string, string[]>();
+  for (const analysis of sourceAnalyses) {
+    const role = aggregateEvidenceRole(analysis);
+    const bucket = claimsByRole.get(role) ?? [];
+    for (const claim of analysis.claims) {
+      if (bucket.length >= 12) {
+        break;
+      }
+      if (claim.text.toLowerCase().includes(lowerName) || name.length <= 4) {
+        bucket.push(`${claim.text} [source:${claim.citation}]`);
+      }
+    }
+    claimsByRole.set(role, bucket);
+  }
+  const sourceGroups = groupAnalysesByRole(sourceAnalyses);
+  const lines = [
+    `# ${name}`,
+    "",
+    "## Summary",
+    "",
+    summary,
+    "",
+    "## Professional Boundary",
+    "",
+    `${name} is compiled as a ${kind} from ${sourceAnalyses.length} source(s). Treat source-backed statements according to their authority layer; reports and research explain context but do not automatically create execution requirements.`,
+    "",
+    renderRoleSection("Current Execution Basis", claimsByRole.get("current_authority")),
+    renderRoleSection("Methods, Calculations, And QA/QC", claimsByRole.get("method")),
+    renderRoleSection("Evidence, Statistics, And Research Background", [
+      ...(claimsByRole.get("statistics") ?? []),
+      ...(claimsByRole.get("research") ?? []),
+      ...(claimsByRole.get("official_explanation") ?? [])
+    ]),
+    renderRoleSection("Evolution And Historical Context", claimsByRole.get("evolution")),
+    renderRoleSection("Local Adaptation", claimsByRole.get("local_adaptation")),
+    "## Source Index",
+    "",
+    ...renderSourceIndex(sourceGroups),
+    "",
+    ...relatedOutputsSection(relatedOutputs),
+    ""
+  ];
+  return lines.filter((line) => line !== undefined).join("\n");
+}
+
+function aggregateEvidenceRole(analysis: SourceAnalysis): string {
+  const domain = analysis.domain;
+  if (domain?.documentRole === "statistics" || domain?.legalStatus === "time_scoped_evidence") return "statistics";
+  if (domain?.documentRole === "research_literature") return "research";
+  if (domain?.authorityLayer === "evolution" || domain?.documentRole === "draft" || domain?.documentRole === "compilation_explanation") {
+    return "evolution";
+  }
+  if (domain?.authorityLayer === "local" || domain?.documentRole === "local_reference") return "local_adaptation";
+  if (domain?.authorityLayer === "method" || domain?.documentRole === "monitoring_method" || domain?.documentRole === "qa_qc")
+    return "method";
+  if (domain?.authorityLayer === "core" || domain?.documentRole === "standard" || domain?.documentRole === "amendment") {
+    return "current_authority";
+  }
+  if (
+    domain?.documentRole === "official_explanation" ||
+    domain?.documentRole === "whitepaper" ||
+    domain?.documentRole === "technical_guide"
+  ) {
+    return "official_explanation";
+  }
+  return "background";
+}
+
+function renderRoleSection(title: string, claims: string[] | undefined): string {
+  const uniqueClaims = uniqueBy(claims ?? [], (item) => item).slice(0, 12);
+  if (!uniqueClaims.length) {
+    return [`## ${title}`, "", "No directly scoped source claims were selected for this view.", ""].join("\n");
+  }
+  return [`## ${title}`, "", ...uniqueClaims.map((claim) => `- ${claim}`), ""].join("\n");
+}
+
+function groupAnalysesByRole(sourceAnalyses: SourceAnalysis[]): Map<string, SourceAnalysis[]> {
+  const groups = new Map<string, SourceAnalysis[]>();
+  for (const analysis of sourceAnalyses) {
+    const role = aggregateEvidenceRole(analysis);
+    groups.set(role, [...(groups.get(role) ?? []), analysis]);
+  }
+  return groups;
+}
+
+function renderSourceIndex(groups: Map<string, SourceAnalysis[]>): string[] {
+  const lines: string[] = [];
+  for (const [role, analyses] of [...groups.entries()].sort((left, right) => left[0].localeCompare(right[0]))) {
+    lines.push(`### ${role}`, "");
+    for (const analysis of analyses.slice(0, 12)) {
+      lines.push(`- [[${pagePathFor("source", analysis.sourceId).replace(/\.md$/, "")}|${analysis.title}]]`);
+    }
+    if (analyses.length > 12) {
+      lines.push(`- ... ${analyses.length - 12} more source(s) omitted from this index view.`);
+    }
+    lines.push("");
+  }
+  return lines;
 }
 
 export function buildIndexPage(
@@ -1884,8 +1984,9 @@ export function buildOutputPage(input: {
   const pathValue = pagePathFor("output", slug);
   const relatedPageIds = input.relatedPageIds ?? [];
   const relatedNodeIds = input.relatedNodeIds ?? [];
-  const relatedSourceIds = input.relatedSourceIds ?? input.citations;
+  const relatedSourceIds = uniqueStrings(input.relatedSourceIds ?? normalizeCitationSourceIds(input.citations));
   const outputAssets = input.outputAssets ?? [];
+  const visibility = input.projectIds?.length ? "project" : "public";
   const backlinks = [...new Set([...relatedPageIds, ...relatedSourceIds.map((sourceId) => `source:${sourceId}`)])];
   const frontmatter = {
     page_id: pageId,
@@ -1893,8 +1994,11 @@ export function buildOutputPage(input: {
     cssclasses: cssclassesFor("output"),
     title: input.title ?? input.question,
     tags: decoratedTags(["output"], { projectIds: input.projectIds, extraTags: input.extraTags }),
-    source_ids: input.citations,
+    source_ids: relatedSourceIds,
+    citations: input.citations,
     project_ids: input.projectIds ?? [],
+    visibility,
+    source_scope: visibility === "project" ? "generated_report" : "public_authority",
     node_ids: relatedNodeIds,
     freshness: "fresh" satisfies Freshness,
     status: input.metadata.status,
@@ -1924,8 +2028,9 @@ export function buildOutputPage(input: {
       path: pathValue,
       title: input.title ?? input.question,
       kind: "output",
-      sourceIds: input.citations,
+      sourceIds: relatedSourceIds,
       projectIds: input.projectIds ?? [],
+      visibility,
       nodeIds: relatedNodeIds,
       freshness: "fresh",
       status: input.metadata.status,

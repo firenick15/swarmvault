@@ -2,6 +2,9 @@ import { buildEnvAirSearchText, normalizePollutantName, type StandardReference }
 
 export interface EnvAirStructuredFact {
   id: string;
+  ordinal: number;
+  stableId: string;
+  legacyIds: string[];
   type: "limit_value" | "formula" | "definition" | "technical_parameter" | "other";
   tableName?: string;
   pollutant?: string;
@@ -79,11 +82,11 @@ function htmlTableRows(body: string): Array<{ cells: string[]; heading: string }
 }
 
 function classifyFact(rawText: string): EnvAirStructuredFact["type"] {
+  if (/(公式|计算|IAQI|AQI|=|＝|按式)/iu.test(rawText)) {
+    return "formula";
+  }
   if (/(限值|一级|二级|浓度|标准值|μg\/m|µg\/m|mg\/m|ug\/m)/iu.test(rawText) && POLLUTANT_PATTERN.test(rawText)) {
     return "limit_value";
-  }
-  if (/(公式|计算|IAQI|AQI|=|按式)/iu.test(rawText)) {
-    return "formula";
   }
   if (/(定义|术语|指|是指)/u.test(rawText)) {
     return "definition";
@@ -120,6 +123,9 @@ function factFromRow(input: {
   const standardCode = input.standardCode || input.standardRefs[0]?.normalized;
   return {
     id: `fact:${input.rowIndex}`,
+    ordinal: input.rowIndex,
+    stableId: `fact:${input.rowIndex}`,
+    legacyIds: [],
     type,
     tableName: input.heading || undefined,
     pollutant,
@@ -155,11 +161,16 @@ export function extractEnvAirStructuredFacts(input: {
     if (fact) {
       facts.push({
         ...fact,
-        id: `fact:${index + 1}:${fact.type}`
+        id: fact.stableId,
+        legacyIds: uniqueFactIds([fact.stableId, `fact:${index + 1}:${fact.type}`])
       });
     }
   });
   return facts;
+}
+
+function uniqueFactIds(values: string[]): string[] {
+  return [...new Set(values.filter(Boolean))];
 }
 
 export function renderStructuredFactSnippet(fact: {

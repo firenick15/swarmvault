@@ -37,6 +37,10 @@ type ResponsesApiPayload = {
       text?: string;
     }>;
   }>;
+  status?: string;
+  incomplete_details?: {
+    reason?: string;
+  };
   usage?: {
     input_tokens?: number;
     output_tokens?: number;
@@ -44,6 +48,10 @@ type ResponsesApiPayload = {
 };
 
 type JsonSchema = Record<string, unknown>;
+type StructuredProviderText = {
+  text: string;
+  finishReason?: string;
+};
 
 function extractResponsesText(payload: ResponsesApiPayload): string {
   if (typeof payload.output_text === "string" && payload.output_text.trim()) {
@@ -149,6 +157,19 @@ function truncateErrorBody(value: string): string {
   return truncate(value.replace(/\s+/g, " ").trim(), 360);
 }
 
+function structuredErrorMessage(
+  providerId: string,
+  attempt: "initial" | "repair",
+  result: StructuredProviderText,
+  error: unknown,
+  jsonLength?: number
+): string {
+  const reason = result.finishReason ? ` finishReason=${result.finishReason}` : "";
+  const parsedLength = typeof jsonLength === "number" ? ` jsonChars=${jsonLength}` : "";
+  const detail = error instanceof Error ? error.message : String(error);
+  return `Provider ${providerId} structured ${attempt} response could not be parsed: rawChars=${result.text.length}${parsedLength}${reason} error=${truncateErrorBody(detail)}`;
+}
+
 export class OpenAiCompatibleProviderAdapter extends BaseProviderAdapter {
   private readonly baseUrl: string;
   private readonly apiKey?: string;
@@ -180,7 +201,21 @@ export class OpenAiCompatibleProviderAdapter extends BaseProviderAdapter {
 
   public async generateStructured<T>(request: GenerationRequest, schema: z.ZodType<T>): Promise<T> {
     const structuredFormat = buildStructuredFormat(schema);
-    const readStructured = async (repair = false): Promise<string> => {
+    const parseStructured = (result: StructuredProviderText, attempt: "initial" | "repair"): T => {
+      let jsonText = "";
+      try {
+        jsonText = extractJson(result.text);
+      } catch (error) {
+        throw new Error(structuredErrorMessage(this.id, attempt, result, error));
+      }
+      try {
+        return schema.parse(stripNullObjectProperties(JSON.parse(jsonText)));
+      } catch (error) {
+        throw new Error(structuredErrorMessage(this.id, attempt, result, error, jsonText.length));
+      }
+    };
+
+    const readStructured = async (repair = false): Promise<StructuredProviderText> => {
       const repairHint = repair ? "\n\nYour previous response was not valid JSON. Return ONLY valid JSON matching the schema." : "";
       const schemaPrompt = `JSON schema:\n${JSON.stringify(structuredFormat.schema)}`;
       const mergedSystem = [request.system, this.structuredOutputMode === "json_schema" ? "" : schemaPrompt].filter(Boolean).join("\n\n");
@@ -197,14 +232,16 @@ export class OpenAiCompatibleProviderAdapter extends BaseProviderAdapter {
     };
 
     try {
-      const text = await readStructured(false);
-      return schema.parse(stripNullObjectProperties(JSON.parse(extractJson(text))));
+      const result = await readStructured(false);
+      return parseStructured(result, "initial");
     } catch (error) {
-      const text = await readStructured(true);
+      const initialMessage = error instanceof Error ? error.message : String(error);
+      const result = await readStructured(true);
       try {
-        return schema.parse(stripNullObjectProperties(JSON.parse(extractJson(text))));
-      } catch {
-        throw error;
+        return parseStructured(result, "repair");
+      } catch (repairError) {
+        const repairMessage = repairError instanceof Error ? repairError.message : String(repairError);
+        throw new Error(`${initialMessage}; repair failed: ${repairMessage}`);
       }
     }
   }
@@ -373,7 +410,7 @@ export class OpenAiCompatibleProviderAdapter extends BaseProviderAdapter {
     request: GenerationRequest,
     format: ReturnType<typeof buildStructuredFormat>,
     mode: "json_schema" | "json_object" | "prompt_json"
-  ): Promise<string> {
+  ): Promise<StructuredProviderText> {
     const encodedAttachments = await this.encodeAttachments(request.attachments);
     const input = encodedAttachments.length
       ? [
@@ -403,7 +440,10 @@ export class OpenAiCompatibleProviderAdapter extends BaseProviderAdapter {
           }
         : {})
     })) as ResponsesApiPayload;
-    return extractResponsesText(payload);
+    return {
+      text: extractResponsesText(payload),
+      finishReason: payload.incomplete_details?.reason ?? payload.status
+    };
   }
 
   private async generateViaChatCompletions(request: GenerationRequest): Promise<GenerationResponse> {
@@ -442,7 +482,7 @@ export class OpenAiCompatibleProviderAdapter extends BaseProviderAdapter {
     request: GenerationRequest,
     format: ReturnType<typeof buildStructuredFormat>,
     mode: "json_schema" | "json_object" | "prompt_json"
-  ): Promise<string> {
+  ): Promise<StructuredProviderText> {
     const encodedAttachments = await this.encodeAttachments(request.attachments);
     const content = encodedAttachments.length
       ? [
@@ -477,9 +517,13 @@ export class OpenAiCompatibleProviderAdapter extends BaseProviderAdapter {
             }
           : {})
     })) as {
-      choices?: Array<{ message?: { content?: string | Array<{ type?: string; text?: string }> } }>;
+      choices?: Array<{ finish_reason?: string; message?: { content?: string | Array<{ type?: string; text?: string }> } }>;
     };
-    const contentValue = payload.choices?.[0]?.message?.content;
-    return Array.isArray(contentValue) ? contentValue.map((item) => item.text ?? "").join("\n") : (contentValue ?? "");
+    const choice = payload.choices?.[0];
+    const contentValue = choice?.message?.content;
+    return {
+      text: Array.isArray(contentValue) ? contentValue.map((item) => item.text ?? "").join("\n") : (contentValue ?? ""),
+      finishReason: choice?.finish_reason
+    };
   }
 }
