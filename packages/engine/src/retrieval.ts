@@ -40,7 +40,7 @@ function graphHash(graph: GraphArtifact): string {
 export async function writeRetrievalManifest(rootDir: string, graph: GraphArtifact): Promise<RetrievalManifest> {
   const { paths } = await loadVaultConfig(rootDir);
   const manifest: RetrievalManifest = {
-    version: 1,
+    version: 2,
     backend: "sqlite",
     generatedAt: new Date().toISOString(),
     graphGeneratedAt: graph.generatedAt,

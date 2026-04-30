@@ -18,16 +18,22 @@ export {
   buildEnvAirQueryPlan,
   buildEnvAirSearchText,
   buildEnvironmentDataToolHints,
+  canonicalTitleForStandard,
   classifyRecommendedNextTool,
   compactStandardCode,
+  ENV_AIR_STANDARD_CATALOG,
   envAirSearchTerms,
   extractStandardReferences,
   inferCurrentBasisIntent,
   normalizePollutantName,
   normalizeStandardCode,
   searchLikeTerms,
+  standardAliasGroupsForQuery,
+  standardIdentityKey,
+  standardRefsForExactRetrieval,
   standardSearchTokens
 } from "./domain/env-air.js";
+export { extractEnvAirStructuredFacts, renderStructuredFactSnippet } from "./domain/env-air-facts.js";
 export { applyStandardRelationOverrides } from "./domain/standard-relations.js";
 export {
   applyDecayToPages,

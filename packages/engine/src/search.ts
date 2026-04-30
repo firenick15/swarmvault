@@ -7,10 +7,22 @@ import {
   extractStandardReferences,
   inferCurrentBasisIntent,
   normalizeStandardCode,
-  searchLikeTerms
+  pollutantFocusTermsForQuery,
+  searchLikeTerms,
+  standardRefsForExactRetrieval
 } from "./domain/env-air.js";
+import { extractEnvAirStructuredFacts, renderStructuredFactSnippet } from "./domain/env-air-facts.js";
 import { searchTokens } from "./tokenize.js";
-import type { GraphPage, PageKind, PageStatus, SearchResult, SourceCaptureType, SourceClass, SourceManifest } from "./types.js";
+import type {
+  GraphPage,
+  PageKind,
+  PageStatus,
+  QueryIntent,
+  SearchResult,
+  SourceCaptureType,
+  SourceClass,
+  SourceManifest
+} from "./types.js";
 import { ensureDir } from "./utils.js";
 
 export interface SearchPageFilters {
@@ -27,6 +39,9 @@ export interface SearchPageFilters {
   pollutant?: string;
   includeDrafts?: boolean;
   includeSuperseded?: boolean;
+  intent?: QueryIntent;
+  requireCurrentBasis?: boolean;
+  strictGrounding?: boolean;
 }
 
 export interface SearchQueryOptions extends SearchPageFilters {
@@ -134,6 +149,7 @@ function normalizeChunkKind(value: unknown): SearchResult["chunkKind"] | undefin
 
 function normalizeRetrievalStage(value: unknown): SearchResult["retrievalStage"] | undefined {
   return value === "standard_exact" ||
+    value === "structured_fact" ||
     value === "fts" ||
     value === "chunk_fts" ||
     value === "like" ||
@@ -160,6 +176,24 @@ function normalizedStandardQuery(query: string): string {
     .replace(/\bpm\s*2\s*\.?\s*5\b/gi, "pm2.5")
     .replace(/\bpm\s*1\s*0\b/gi, "pm10")
     .trim();
+}
+
+function shouldExtractEnvAirFacts(input: {
+  kind: PageKind;
+  title: string;
+  body: string;
+  standardCode: string;
+  standardRefCount: number;
+}): boolean {
+  if (input.kind !== "source" && input.kind !== "module") {
+    return false;
+  }
+  if (input.standardCode || input.standardRefCount > 0) {
+    return true;
+  }
+  return /(环境空气|空气质量|大气污染|PM\s*2\.?5|PM\s*10|臭氧|二氧化硫|二氧化氮|一氧化碳|VOCs|非甲烷总烃|AQI|IAQI)/i.test(
+    `${input.title}\n${input.body.slice(0, 5000)}`
+  );
 }
 
 interface SearchChunk {
@@ -205,8 +239,85 @@ function sourceExcerptBody(text: string): string {
   return excerpt || text;
 }
 
+function includesFocusTerm(text: string, focusTerms: string[]): boolean {
+  const compact = text.toLowerCase().replace(/\s+/g, "");
+  return focusTerms.some((term) => compact.includes(term.toLowerCase().replace(/\s+/g, "")));
+}
+
+function requiredAmbientPeriodGroups(query: string): string[][] {
+  const compact = query.toLowerCase().replace(/\s+/g, "");
+  const groups: string[][] = [];
+  if (/日最大8小时|8小时|mda8/.test(compact)) {
+    groups.push(["日最大8小时平均", "8小时平均", "8小时", "MDA8"]);
+  }
+  if (/1小时|一小时/.test(compact)) {
+    groups.push(["1小时平均", "1小时", "一小时"]);
+  }
+  if (/24小时|日平均|日均/.test(compact)) {
+    groups.push(["24小时平均", "24小时", "日平均", "日均"]);
+  }
+  if (/年平均|年均/.test(compact)) {
+    groups.push(["年平均", "年均"]);
+  }
+  return groups;
+}
+
+function focusedTableRowsSnippet(text: string, focusTerms: string[], maxChars = 2200): string {
+  const sourceText = sourceExcerptBody(text).trim();
+  const htmlRows = sourceText.match(/<tr[\s\S]*?<\/tr>/gi) ?? [];
+  if (htmlRows.length) {
+    const selected = new Set<number>();
+    const pollutantTerms = focusTerms.filter((term) => !/(平均|限值|一级|二级|表)/.test(term));
+    htmlRows.forEach((row, index) => {
+      if (includesFocusTerm(row, pollutantTerms)) {
+        selected.add(index - 1);
+        selected.add(index);
+        selected.add(index + 1);
+        selected.add(index + 2);
+      } else if (includesFocusTerm(row, focusTerms)) {
+        selected.add(index);
+      }
+    });
+    const selectedRows = [...selected].filter((index) => index >= 0 && index < htmlRows.length).sort((left, right) => left - right);
+    if (selectedRows.length) {
+      return [...htmlRows.slice(0, Math.min(2, htmlRows.length)), ...selectedRows.map((index) => htmlRows[index])]
+        .filter((row, index, all) => all.indexOf(row) === index)
+        .join("\n")
+        .slice(0, maxChars)
+        .trim();
+    }
+  }
+
+  const tableLines = sourceText.split(/\r?\n/).filter((line) => line.includes("|"));
+  if (tableLines.length >= 2) {
+    const selected = new Set<number>();
+    tableLines.forEach((line, index) => {
+      if (includesFocusTerm(line, focusTerms)) {
+        selected.add(index - 1);
+        selected.add(index);
+        selected.add(index + 1);
+      }
+    });
+    const selectedRows = [...selected].filter((index) => index >= 0 && index < tableLines.length).sort((left, right) => left - right);
+    if (selectedRows.length) {
+      return [...tableLines.slice(0, 2), ...selectedRows.map((index) => tableLines[index])]
+        .filter((line, index, all) => all.indexOf(line) === index)
+        .join("\n")
+        .slice(0, maxChars)
+        .trim();
+    }
+  }
+  return "";
+}
+
 function focusedChunkSnippet(text: string, focusTerms: string[], maxChars = 1800): string {
   const sourceText = sourceExcerptBody(text).trim();
+  if (/<table[\s>]/i.test(sourceText) || sourceText.includes("|")) {
+    const tableSnippet = focusedTableRowsSnippet(sourceText, focusTerms, maxChars);
+    if (tableSnippet) {
+      return tableSnippet;
+    }
+  }
   let firstPosition = -1;
   for (const term of focusTerms) {
     const position = sourceText.indexOf(term);
@@ -227,8 +338,13 @@ function focusedChunkSnippet(text: string, focusTerms: string[], maxChars = 1800
   return sourceText.slice(start, start + maxChars).trim();
 }
 
-function hasUsefulAmbientLimitSnippet(snippet: string): boolean {
-  return snippet.includes("PM2.5") && (snippet.includes("年平均") || snippet.includes("浓度限值"));
+function hasUsefulAmbientLimitSnippet(snippet: string, query: string): boolean {
+  const focusTerms = pollutantFocusTermsForQuery(query);
+  const pollutantTerms = focusTerms.filter((term) => !/(平均|限值|一级|二级|表)/.test(term));
+  const hasPollutant = includesFocusTerm(snippet, pollutantTerms.length ? pollutantTerms : focusTerms);
+  const hasLimitContext = /(平均|浓度限值|一级|二级)/.test(snippet);
+  const hasRequestedPeriods = requiredAmbientPeriodGroups(query).every((group) => includesFocusTerm(snippet, group));
+  return hasPollutant && hasLimitContext && hasRequestedPeriods;
 }
 
 function hasUsefulAmendmentSnippet(snippet: string): boolean {
@@ -310,6 +426,7 @@ function buildSearchChunks(input: {
   overlapChars?: number;
 }): SearchChunk[] {
   const maxChars = Math.max(400, input.maxChars ?? 1600);
+  const tableMaxChars = Math.max(maxChars, 6000);
   const overlapChars = Math.max(0, Math.min(input.overlapChars ?? 160, Math.floor(maxChars / 3)));
   const chunks: SearchChunk[] = [];
   let heading = input.title;
@@ -355,7 +472,9 @@ function buildSearchChunks(input: {
       heading = headingMatch[1].trim();
     }
     const next = buffer ? `${buffer}\n\n${trimmed}` : trimmed;
-    if (next.length > maxChars && buffer) {
+    const nextKind = classifyChunkKind(next);
+    const effectiveMaxChars = nextKind === "table" ? tableMaxChars : maxChars;
+    if (next.length > effectiveMaxChars && buffer) {
       flush();
       bufferHeading = heading;
       buffer = trimmed;
@@ -363,7 +482,7 @@ function buildSearchChunks(input: {
       bufferHeading = bufferHeading || heading;
       buffer = next;
     }
-    if (buffer.length >= maxChars) {
+    if (buffer.length >= effectiveMaxChars) {
       flush();
       bufferHeading = heading;
     }
@@ -385,6 +504,8 @@ export async function rebuildSearchIndex(
   db.exec(`
     DROP TABLE IF EXISTS page_search;
     DROP TABLE IF EXISTS chunk_search;
+    DROP TABLE IF EXISTS fact_search;
+    DROP TABLE IF EXISTS facts;
     DROP TABLE IF EXISTS chunks;
     DROP TABLE IF EXISTS pages;
     CREATE TABLE IF NOT EXISTS pages (
@@ -421,6 +542,19 @@ export async function rebuildSearchIndex(
       text TEXT NOT NULL,
       search_terms TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS facts (
+      id TEXT PRIMARY KEY,
+      page_id TEXT NOT NULL,
+      fact_type TEXT NOT NULL,
+      table_name TEXT NOT NULL,
+      pollutant TEXT NOT NULL,
+      metric TEXT NOT NULL,
+      averaging_period TEXT NOT NULL,
+      value TEXT NOT NULL,
+      unit TEXT NOT NULL,
+      raw_text TEXT NOT NULL,
+      search_terms TEXT NOT NULL
+    );
     CREATE VIRTUAL TABLE IF NOT EXISTS page_search USING fts5(
       title,
       body,
@@ -434,6 +568,14 @@ export async function rebuildSearchIndex(
       content='chunks',
       content_rowid='rowid'
     );
+    CREATE VIRTUAL TABLE IF NOT EXISTS fact_search USING fts5(
+      raw_text,
+      search_terms,
+      content='facts',
+      content_rowid='rowid'
+    );
+    DELETE FROM fact_search;
+    DELETE FROM facts;
     DELETE FROM chunk_search;
     DELETE FROM chunks;
     DELETE FROM page_search;
@@ -445,6 +587,9 @@ export async function rebuildSearchIndex(
   );
   const insertChunk = db.prepare(
     "INSERT INTO chunks (id, page_id, ordinal, heading, kind, location, text, search_terms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+  );
+  const insertFact = db.prepare(
+    "INSERT INTO facts (id, page_id, fact_type, table_name, pollutant, metric, averaging_period, value, unit, raw_text, search_terms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
   );
   const rootDir = path.dirname(wikiDir);
 
@@ -534,10 +679,28 @@ export async function rebuildSearchIndex(
           insertChunk.run(chunk.chunkId, page.id, chunk.ordinal, chunk.heading, chunk.kind, chunk.location, chunk.text, chunk.searchTerms);
         }
       }
+      if (shouldExtractEnvAirFacts({ kind: page.kind, title: page.title, body, standardCode, standardRefCount: standards.length })) {
+        for (const fact of extractEnvAirStructuredFacts({ body, standardRefs: standards, standardCode })) {
+          insertFact.run(
+            `${page.id}:${fact.id}`,
+            page.id,
+            fact.type,
+            fact.tableName ?? "",
+            fact.pollutant ?? "",
+            fact.metric ?? "",
+            fact.averagingPeriod ?? "",
+            fact.value ?? "",
+            fact.unit ?? "",
+            fact.rawText,
+            fact.searchText
+          );
+        }
+      }
     }
 
     db.exec("INSERT INTO page_search (rowid, title, body, search_terms) SELECT rowid, title, body, search_terms FROM pages;");
     db.exec("INSERT INTO chunk_search (rowid, text, search_terms) SELECT rowid, text, search_terms FROM chunks;");
+    db.exec("INSERT INTO fact_search (rowid, raw_text, search_terms) SELECT rowid, raw_text, search_terms FROM facts;");
     db.exec("COMMIT;");
   } catch (error) {
     db.exec("ROLLBACK;");
@@ -605,10 +768,15 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
   if (!ftsQuery && likeTerms.length === 0) {
     return [];
   }
-  const currentBasisIntent = inferCurrentBasisIntent(normalizedQuery);
-  const pinnedStandard = extractStandardReferences(domainPlan.pinnedStandards.join(" "))[0];
-  const explicitStandard = domainPlan.standardRefs[0] ?? pinnedStandard;
+  const currentBasisIntent =
+    inferCurrentBasisIntent(normalizedQuery) ||
+    options.requireCurrentBasis === true ||
+    options.intent === "current_basis" ||
+    options.intent === "report_writing";
+  const exactStandards = standardRefsForExactRetrieval(domainPlan);
+  const explicitStandard = exactStandards[0];
   const hasUserExplicitStandard = domainPlan.standardRefs.length > 0;
+  const hasExactStandards = exactStandards.length > 0;
   const explicitStandardCompact = explicitStandard?.compact ?? "";
   const explicitStandardFamily = explicitStandard?.family ?? "";
   const explicitStandardNumber = explicitStandard?.number ?? "";
@@ -620,6 +788,7 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
   const limit = options.limit ?? 5;
   const candidateLimit = Math.max(limit * 3, limit + 5);
   const seen = new Set<string>();
+  const seenPageIds = new Set<string>();
   const rows: Array<Record<string, unknown>> = [];
 
   function selectedColumns(rankExpression: string, snippetExpression: string, stage: SearchResult["retrievalStage"]): string {
@@ -645,6 +814,10 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
         NULL AS chunkHeading,
         NULL AS chunkKind,
         NULL AS chunkLocation,
+        NULL AS factId,
+        NULL AS factType,
+        NULL AS factTable,
+        NULL AS factRawText,
         '${stage}' AS retrievalStage,
         ${snippetExpression} AS snippet,
         ${rankExpression} AS rank
@@ -674,7 +847,44 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
         chunks.heading AS chunkHeading,
         chunks.kind AS chunkKind,
         chunks.location AS chunkLocation,
+        NULL AS factId,
+        NULL AS factType,
+        NULL AS factTable,
+        NULL AS factRawText,
         'chunk_fts' AS retrievalStage,
+        ${snippetExpression} AS snippet,
+        ${rankExpression} AS rank
+    `;
+  }
+
+  function selectedFactColumns(rankExpression: string, snippetExpression: string): string {
+    return `
+      SELECT
+        pages.id AS pageId,
+        pages.path AS path,
+        pages.title AS title,
+        pages.kind AS kind,
+        pages.status AS status,
+        pages.source_type AS sourceType,
+        pages.source_class AS sourceClass,
+        pages.authority_layer AS authorityLayer,
+        pages.legal_status AS legalStatus,
+        pages.document_role AS documentRole,
+        pages.jurisdiction AS jurisdiction,
+        pages.region AS region,
+        pages.standard_code AS standardCode,
+        pages.pollutants AS pollutants,
+        pages.project_ids AS projectIds,
+        facts.id AS chunkId,
+        NULL AS chunkOrdinal,
+        facts.table_name AS chunkHeading,
+        'table' AS chunkKind,
+        facts.table_name AS chunkLocation,
+        facts.id AS factId,
+        facts.fact_type AS factType,
+        facts.table_name AS factTable,
+        facts.raw_text AS factRawText,
+        'structured_fact' AS retrievalStage,
         ${snippetExpression} AS snippet,
         ${rankExpression} AS rank
     `;
@@ -810,10 +1020,16 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
   function appendRows(nextRows: Array<Record<string, unknown>>): void {
     for (const row of nextRows) {
       const pageId = String(row.pageId ?? "");
-      if (!pageId || seen.has(pageId)) {
+      const stage = String(row.retrievalStage ?? "");
+      const rowKey =
+        stage === "structured_fact" ? `${stage}:${String(row.factId ?? row.chunkId ?? pageId)}` : stage === "chunk_fts" ? pageId : pageId;
+      if (!pageId || seen.has(rowKey)) {
         continue;
       }
-      seen.add(pageId);
+      seen.add(rowKey);
+      if (stage !== "structured_fact") {
+        seenPageIds.add(pageId);
+      }
       rows.push(row);
       if (rows.length >= candidateLimit) {
         break;
@@ -826,11 +1042,14 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
     const standardCode = String(row.standardCode ?? "");
     const documentRole = String(row.documentRole ?? "");
     const retrievalStage = String(row.retrievalStage ?? "");
-    if (hasUserExplicitStandard && retrievalStage === "standard_exact") {
+    if (hasExactStandards && retrievalStage === "standard_exact") {
       if (amendmentIntent && (documentRole === "amendment" || title.includes("修改单") || standardCode.includes("修改单"))) {
         return -120;
       }
       return -100;
+    }
+    if ((ambientLimitIntent || retrievalStage === "structured_fact") && retrievalStage === "structured_fact") {
+      return -95;
     }
     if (ambientLimitIntent && /GB\s*3095/i.test(standardCode)) {
       if (documentRole === "standard" || title.includes("环境空气质量标准") || title === "中华人民共和国国家标准") {
@@ -846,6 +1065,9 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
 
   function hydrateRowsWithDomainChunks(): void {
     const targetRows = rows.filter((row) => {
+      if (String(row.retrievalStage ?? "") === "structured_fact") {
+        return false;
+      }
       const title = String(row.title ?? "");
       const standardCode = String(row.standardCode ?? "");
       const snippet = String(row.snippet ?? "");
@@ -858,14 +1080,14 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
         return true;
       }
       if (isAmbientLimitTarget) {
-        return !hasUsefulAmbientLimitSnippet(snippet);
+        return !hasUsefulAmbientLimitSnippet(snippet, normalizedQuery);
       }
       return isAmendmentTarget && !hasUsefulAmendmentSnippet(snippet);
     });
     if (!targetRows.length) {
       return;
     }
-    const ambientTerms = ["PM2.5", "细颗粒物", "年平均", "浓度限值", "一级", "二级", "表"];
+    const ambientTerms = pollutantFocusTermsForQuery(normalizedQuery);
     const amendmentTerms = ["修改单", "甲醛吸收", "副玫瑰苯胺", "修订", "替换"];
     for (const row of targetRows) {
       const terms = ambientLimitIntent && /GB\s*3095/i.test(String(row.standardCode ?? "")) ? ambientTerms : amendmentTerms;
@@ -884,8 +1106,8 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
           const matchScore = terms.reduce((score, term) => score + (text.includes(term) ? 1 : 0), 0);
           const domainScore =
             ambientLimitIntent && /GB\s*3095/i.test(String(row.standardCode ?? ""))
-              ? (text.includes("PM2.5") || text.includes("细颗粒物") ? 6 : 0) +
-                (text.includes("年平均") ? 4 : 0) +
+              ? (includesFocusTerm(text, ambientTerms) ? 6 : 0) +
+                (/(年平均|日平均|1小时平均|日最大8小时平均)/.test(text) ? 4 : 0) +
                 (text.includes("浓度限值") || text.includes("一级") || text.includes("二级") ? 3 : 0)
               : (text.includes("修改单") ? 5 : 0) +
                 (text.includes("甲醛吸收") ? 3 : 0) +
@@ -913,7 +1135,7 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
       row.snippet = focusedChunkSnippet(
         String(chunk.text ?? ""),
         ambientLimitIntent && /GB\s*3095/i.test(String(row.standardCode ?? ""))
-          ? ["PM2.5", "细颗粒物", "年平均", "浓度限值"]
+          ? ambientTerms
           : ["将", "修改为", "结果表示", "按式", "式中"]
       );
       row.retrievalStage = row.retrievalStage ?? "chunk_fts";
@@ -921,49 +1143,75 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
   }
 
   try {
-    if (explicitStandard && hasUserExplicitStandard) {
-      const params: Array<number | string> = [];
-      const clauses = buildFilterClauses(params, { relaxAuthority: true });
-      if (!options.kind) {
-        clauses.push("pages.kind IN ('source', 'module')");
+    if (hasExactStandards) {
+      for (const exactStandard of exactStandards) {
+        if (rows.length >= candidateLimit) {
+          break;
+        }
+        const params: Array<number | string> = [];
+        const clauses = buildFilterClauses(params, { relaxAuthority: true });
+        if (!options.kind) {
+          clauses.push("pages.kind IN ('source', 'module')");
+        }
+        clauses.push(
+          `(
+            ${standardCodeExpr("pages.standard_code_normalized")} = ?
+            OR ${standardCodeExpr("pages.standard_code")} = ?
+            OR (pages.standard_family = ? AND pages.standard_number = ? AND (? = '' OR pages.standard_year = ?))
+          )`
+        );
+        params.push(
+          exactStandard.compact,
+          exactStandard.compact,
+          exactStandard.family,
+          exactStandard.number,
+          exactStandard.year ?? "",
+          exactStandard.year ?? ""
+        );
+        appendOrderParams(params);
+        params.push(Math.min(candidateLimit - rows.length, hasUserExplicitStandard ? 12 : 6));
+        const exactRankExpression = amendmentIntent
+          ? "CASE WHEN pages.document_role = 'amendment' OR pages.title LIKE '%修改单%' OR pages.standard_code LIKE '%修改单%' THEN -4 WHEN pages.legal_status = 'current_effective' THEN -2 ELSE -1 END"
+          : "CASE WHEN pages.legal_status = 'current_effective' THEN -2 ELSE -1 END";
+        const statement = db.prepare(`
+          ${selectedColumns(exactRankExpression, "substr(pages.body, 1, 240)", "standard_exact")}
+          FROM pages
+          WHERE ${clauses.join(" AND ")}
+          ${orderBy()}
+          LIMIT ?
+        `);
+        appendRows(statement.all(...params) as Array<Record<string, unknown>>);
       }
-      clauses.push(
-        `(
-          ${standardCodeExpr("pages.standard_code_normalized")} = ?
-          OR ${standardCodeExpr("pages.standard_code")} = ?
-          OR (pages.standard_family = ? AND pages.standard_number = ? AND (? = '' OR pages.standard_year = ?))
-        )`
-      );
-      params.push(
-        explicitStandardCompact,
-        explicitStandardCompact,
-        explicitStandardFamily,
-        explicitStandardNumber,
-        explicitStandardYear,
-        explicitStandardYear
-      );
-      appendOrderParams(params);
-      params.push(Math.min(candidateLimit, 12));
-      const exactRankExpression = amendmentIntent
-        ? "CASE WHEN pages.document_role = 'amendment' OR pages.title LIKE '%修改单%' OR pages.standard_code LIKE '%修改单%' THEN -4 WHEN pages.legal_status = 'current_effective' THEN -2 ELSE -1 END"
-        : "CASE WHEN pages.legal_status = 'current_effective' THEN -2 ELSE -1 END";
-      const statement = db.prepare(`
-        ${selectedColumns(exactRankExpression, "substr(pages.body, 1, 240)", "standard_exact")}
-        FROM pages
-        WHERE ${clauses.join(" AND ")}
-        ${orderBy()}
-        LIMIT ?
-      `);
-      appendRows(statement.all(...params) as Array<Record<string, unknown>>);
+    }
+
+    if (rows.length < candidateLimit && ftsQuery) {
+      try {
+        const params: Array<number | string> = [ftsQuery];
+        const clauses = ["fact_search MATCH ?", ...buildFilterClauses(params)];
+        appendOrderParams(params);
+        params.push(candidateLimit - rows.length);
+        const statement = db.prepare(`
+          ${selectedFactColumns("bm25(fact_search) - CASE facts.fact_type WHEN 'limit_value' THEN 4.0 WHEN 'formula' THEN 3.0 WHEN 'technical_parameter' THEN 2.0 ELSE 0 END", "snippet(fact_search, 0, '[', ']', '...', 28)")}
+          FROM fact_search
+          JOIN facts ON facts.rowid = fact_search.rowid
+          JOIN pages ON pages.id = facts.page_id
+          WHERE ${clauses.join(" AND ")}
+          ${orderBy()}
+          LIMIT ?
+        `);
+        appendRows(statement.all(...params) as Array<Record<string, unknown>>);
+      } catch {
+        // Structured facts are additive; older indexes can still use chunk/page retrieval.
+      }
     }
 
     if (rows.length < candidateLimit && ftsQuery && options.chunking?.enabled !== false) {
       try {
         const params: Array<number | string> = [ftsQuery];
         const clauses = ["chunk_search MATCH ?", ...buildFilterClauses(params)];
-        if (seen.size) {
-          clauses.push(`pages.id NOT IN (${[...seen].map(() => "?").join(", ")})`);
-          params.push(...[...seen]);
+        if (seenPageIds.size) {
+          clauses.push(`pages.id NOT IN (${[...seenPageIds].map(() => "?").join(", ")})`);
+          params.push(...[...seenPageIds]);
         }
         appendOrderParams(params);
         params.push(candidateLimit - rows.length);
@@ -987,9 +1235,9 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
       try {
         const params: Array<number | string> = [ftsQuery];
         const clauses = ["page_search MATCH ?", ...buildFilterClauses(params)];
-        if (seen.size) {
-          clauses.push(`pages.id NOT IN (${[...seen].map(() => "?").join(", ")})`);
-          params.push(...[...seen]);
+        if (seenPageIds.size) {
+          clauses.push(`pages.id NOT IN (${[...seenPageIds].map(() => "?").join(", ")})`);
+          params.push(...[...seenPageIds]);
         }
         appendOrderParams(params);
         params.push(candidateLimit - rows.length);
@@ -1020,9 +1268,9 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
         params.push(pattern, pattern, pattern, pattern);
       }
       clauses.push(`(${likeClauses.join(" OR ")})`);
-      if (seen.size) {
-        clauses.push(`pages.id NOT IN (${[...seen].map(() => "?").join(", ")})`);
-        params.push(...[...seen]);
+      if (seenPageIds.size) {
+        clauses.push(`pages.id NOT IN (${[...seenPageIds].map(() => "?").join(", ")})`);
+        params.push(...[...seenPageIds]);
       }
       appendOrderParams(params);
       params.push(candidateLimit - rows.length);
@@ -1090,8 +1338,15 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
     chunkKind: normalizeChunkKind(row.chunkKind),
     chunkLocation: String(row.chunkLocation ?? "") || undefined,
     retrievalStage: normalizeRetrievalStage(row.retrievalStage),
+    factId: String(row.factId ?? "") || undefined,
+    factType: String(row.factType ?? "") || undefined,
+    factTable: String(row.factTable ?? "") || undefined,
+    factRawText: String(row.factRawText ?? "") || undefined,
     rankingSignals: domainPlan.rankingSignals,
-    snippet: String(row.snippet ?? ""),
+    snippet:
+      String(row.retrievalStage ?? "") === "structured_fact"
+        ? renderStructuredFactSnippet({ rawText: String(row.factRawText ?? ""), pollutant: String(row.pollutants ?? "") })
+        : String(row.snippet ?? ""),
     rank: Number(row.rank ?? 0)
   }));
 }

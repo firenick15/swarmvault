@@ -3,7 +3,7 @@ import path from "node:path";
 import matter from "gray-matter";
 import { z } from "zod";
 import { loadVaultConfig } from "./config.js";
-import { extractStandardReferences } from "./domain/env-air.js";
+import { extractStandardReferences, standardIdentityKey } from "./domain/env-air.js";
 import { normalizeFindingSeverity } from "./findings.js";
 import { listManifests } from "./ingest.js";
 import { runConfiguredRoles, summarizeRoleQuestions } from "./orchestration.js";
@@ -44,15 +44,92 @@ type DeepLintContextPage = {
   excerpt: string;
 };
 
+type StandardInventory = {
+  byIdentity: Map<string, Array<{ pageId: string; title: string; path: string; legalStatus?: string; authorityLayer?: string }>>;
+};
+
 function isUnknown(value: unknown): boolean {
   return typeof value !== "string" || !value.trim() || value.trim() === "unknown";
+}
+
+function sourceTitleLooksLikeAmendment(title: string, sourcePath?: string, standardCode?: unknown): boolean {
+  return /(修改单|amendment)/i.test(
+    [title, sourcePath ?? "", typeof standardCode === "string" ? standardCode : ""].filter(Boolean).join("\n")
+  );
+}
+
+async function buildStandardInventory(rootDir: string, graph: GraphArtifact): Promise<StandardInventory> {
+  const { paths } = await loadVaultConfig(rootDir);
+  const byIdentity = new Map<
+    string,
+    Array<{ pageId: string; title: string; path: string; legalStatus?: string; authorityLayer?: string }>
+  >();
+  for (const page of graph.pages.filter((item) => item.kind === "source" || item.kind === "module")) {
+    const absolutePath = path.join(paths.wikiDir, page.path);
+    const raw = await fs.readFile(absolutePath, "utf8").catch(() => "");
+    if (!raw) {
+      continue;
+    }
+    const parsed = matter(raw);
+    const refs = extractStandardReferences(
+      [
+        page.title,
+        typeof parsed.data.standard_code === "string" ? parsed.data.standard_code : "",
+        typeof parsed.data.title === "string" ? parsed.data.title : "",
+        parsed.content.slice(0, 2000)
+      ].join("\n")
+    );
+    for (const ref of refs) {
+      const identity = standardIdentityKey(ref);
+      const items = byIdentity.get(identity) ?? [];
+      items.push({
+        pageId: page.id,
+        title: page.title,
+        path: page.path,
+        legalStatus: typeof parsed.data.legal_status === "string" ? parsed.data.legal_status : undefined,
+        authorityLayer: typeof parsed.data.authority_layer === "string" ? parsed.data.authority_layer : undefined
+      });
+      byIdentity.set(identity, items);
+    }
+  }
+  return { byIdentity };
+}
+
+function findingContradictsInventory(finding: LintFinding, inventory: StandardInventory): boolean {
+  if (finding.code !== "coverage_gap") {
+    return false;
+  }
+  const refs = extractStandardReferences(finding.message);
+  return refs.some((ref) => inventory.byIdentity.has(standardIdentityKey(ref)));
+}
+
+function finalizeDeepLintFindings(findings: LintFinding[], inventory: StandardInventory): LintFinding[] {
+  return uniqueBy(
+    findings.filter((finding) => !findingContradictsInventory(finding, inventory)),
+    (item) => `${item.code}:${item.message}`
+  );
+}
+
+function collapsedKnowledgeSlug(pathValue: string): { collapsed: boolean; severity: LintFinding["severity"]; slug: string } {
+  const slug = path.basename(pathValue, ".md").toLowerCase();
+  if (slug === "item") {
+    return { collapsed: true, severity: "error", slug };
+  }
+  if (/^(gb|hj|db)-?[a-z0-9-]*\d/i.test(slug)) {
+    return { collapsed: false, severity: "info", slug };
+  }
+  if (/^\d+(?:-\d+)*$/.test(slug) || /^[a-z0-9]{1,3}$/i.test(slug)) {
+    return { collapsed: true, severity: "warning", slug };
+  }
+  return { collapsed: false, severity: "info", slug };
 }
 
 async function deterministicEnvAirFindings(rootDir: string, graph: GraphArtifact): Promise<LintFinding[]> {
   const { paths } = await loadVaultConfig(rootDir);
   const findings: LintFinding[] = [];
   const pages = graph.pages.filter(
-    (page) => page.kind === "source" || page.kind === "module" || page.kind === "concept" || page.kind === "entity"
+    (page) =>
+      page.kind === "source" || page.kind === "module" || page.kind === "concept" || page.kind === "entity" || page.kind === "output"
   );
   for (const page of pages) {
     const absolutePath = path.join(paths.wikiDir, page.path);
@@ -62,11 +139,27 @@ async function deterministicEnvAirFindings(rootDir: string, graph: GraphArtifact
     }
     const parsed = matter(raw);
     const title = typeof parsed.data.title === "string" ? parsed.data.title : page.title;
-    if ((page.kind === "concept" || page.kind === "entity") && /^(item|8)$/i.test(path.basename(page.path, ".md"))) {
+    if (page.kind === "output") {
+      const invalidSourceIds = page.sourceIds.filter(
+        (sourceId) => sourceId.includes("#") || sourceId.includes(":") || /^https?:\/\//i.test(sourceId)
+      );
+      if (invalidSourceIds.length) {
+        findings.push({
+          severity: "error",
+          code: "output_lineage_gap",
+          message: `Output ${page.title} has citation-like values in source_ids instead of raw source IDs.`,
+          pagePath: absolutePath,
+          relatedPageIds: [page.id]
+        });
+      }
+      continue;
+    }
+    const slugState = collapsedKnowledgeSlug(page.path);
+    if ((page.kind === "concept" || page.kind === "entity") && slugState.collapsed) {
       findings.push({
-        severity: "warning",
+        severity: slugState.severity,
         code: "knowledge_slug_collision",
-        message: `${page.kind} page ${page.title} still uses a collapsed slug (${path.basename(page.path, ".md")}).`,
+        message: `${page.kind} page ${page.title} still uses a collapsed or ambiguous slug (${slugState.slug}).`,
         pagePath: absolutePath,
         relatedPageIds: [page.id]
       });
@@ -92,7 +185,7 @@ async function deterministicEnvAirFindings(rootDir: string, graph: GraphArtifact
         suggestedQuery: `标准编号 ${refs[0]?.normalized ?? title} 在知识库中如何解析？`
       });
     }
-    if (/(修改单|amendment)/i.test(combined.slice(0, 2000)) && parsed.data.document_role !== "amendment") {
+    if (sourceTitleLooksLikeAmendment(title, page.path, parsed.data.standard_code) && parsed.data.document_role !== "amendment") {
       findings.push({
         severity: "warning",
         code: "amendment_without_role",
@@ -117,6 +210,20 @@ async function deterministicEnvAirFindings(rootDir: string, graph: GraphArtifact
         severity: "warning",
         code: "core_role_unknown",
         message: `Core/method source ${title} has unknown document_role.`,
+        pagePath: absolutePath,
+        relatedSourceIds,
+        relatedPageIds: [page.id]
+      });
+    }
+    if (
+      typeof parsed.data.legal_status === "string" &&
+      parsed.data.legal_status === "current_effective" &&
+      /(^|\/)(evolution|历史|废止|superseded|draft|征求意见)(\/|$)/i.test(page.path)
+    ) {
+      findings.push({
+        severity: "warning",
+        code: "status_path_mismatch",
+        message: `Source ${title} is marked current_effective but lives under an evolution/history-like path.`,
         pagePath: absolutePath,
         relatedSourceIds,
         relatedPageIds: [page.id]
@@ -268,6 +375,7 @@ export async function runDeepLint(
   const manifests = await listManifests(rootDir);
   const contextPages = await loadContextPages(rootDir, graph);
   const deterministicFindings = await deterministicEnvAirFindings(rootDir, graph);
+  const standardInventory = await buildStandardInventory(rootDir, graph);
 
   let findings: LintFinding[];
   if (provider.type === "heuristic") {
@@ -352,7 +460,7 @@ export async function runDeepLint(
       ].join("\n")
     });
     const roleQuestions = summarizeRoleQuestions(roleResults);
-    return uniqueBy(
+    return finalizeDeepLintFindings(
       [
         ...findings,
         ...roleResults.flatMap((result) =>
@@ -372,7 +480,7 @@ export async function runDeepLint(
           suggestedQuery: question
         }))
       ],
-      (item) => `${item.code}:${item.message}`
+      standardInventory
     );
   }
 
@@ -398,7 +506,7 @@ export async function runDeepLint(
     ].join("\n")
   });
   const roleQuestions = summarizeRoleQuestions(roleResults);
-  return uniqueBy(
+  return finalizeDeepLintFindings(
     [
       ...findings,
       ...roleResults.flatMap((result) =>
@@ -418,6 +526,6 @@ export async function runDeepLint(
         suggestedQuery: question
       }))
     ],
-    (item) => `${item.code}:${item.message}`
+    standardInventory
   );
 }

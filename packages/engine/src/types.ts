@@ -260,6 +260,7 @@ export interface ProviderAdapter {
   readonly capabilities: Set<ProviderCapability>;
   generateText(request: GenerationRequest): Promise<GenerationResponse>;
   generateStructured<T>(request: GenerationRequest, schema: z.ZodType<T>): Promise<T>;
+  dispose?(): Promise<void> | void;
   embedTexts?(texts: string[]): Promise<number[][]>;
   generateImage?(request: ImageGenerationRequest): Promise<ImageGenerationResponse>;
   transcribeAudio?(request: AudioTranscriptionRequest): Promise<AudioTranscriptionResponse>;
@@ -1458,6 +1459,19 @@ export interface CompileOptions {
   forceAnalysis?: boolean;
   topicSynthesis?: boolean;
   topicReview?: boolean;
+  skipBenchmark?: boolean;
+  debugLifecycle?: boolean;
+  lockMode?: "wait" | "fail" | "skip";
+  lifecycleTimeoutMs?: number;
+}
+
+export interface CompileLifecycleStep {
+  phase: string;
+  startedAt: string;
+  finishedAt: string;
+  durationMs: number;
+  ok: boolean;
+  details?: Record<string, string | number | boolean | null>;
 }
 
 export interface InitOptions {
@@ -1501,6 +1515,12 @@ export interface CompileResult {
     fallbackRatio: number;
     failedSourceIds: string[];
   };
+  benchmark?: {
+    ok: boolean;
+    skipped?: boolean;
+    error?: string;
+  };
+  lifecycle?: CompileLifecycleStep[];
 }
 
 export interface ProviderSmokeTestResult {
@@ -1537,7 +1557,11 @@ export interface SearchResult {
   chunkHeading?: string;
   chunkKind?: "paragraph" | "table" | "formula" | "heading";
   chunkLocation?: string;
-  retrievalStage?: "standard_exact" | "fts" | "chunk_fts" | "like" | "semantic" | "rerank";
+  retrievalStage?: "standard_exact" | "structured_fact" | "fts" | "chunk_fts" | "like" | "semantic" | "rerank";
+  factId?: string;
+  factType?: string;
+  factTable?: string;
+  factRawText?: string;
   rankingSignals?: string[];
 }
 
@@ -1557,7 +1581,7 @@ export interface RetrievalConfig {
 }
 
 export interface RetrievalManifest {
-  version: 1;
+  version: 1 | 2;
   backend: "sqlite";
   generatedAt: string;
   graphGeneratedAt?: string;
@@ -1590,6 +1614,17 @@ export interface RetrievalDoctorResult {
   actions: string[];
 }
 
+export type QueryIntent =
+  | "current_basis"
+  | "explanation"
+  | "evolution"
+  | "local"
+  | "statistics"
+  | "report_writing"
+  | "research"
+  | "authority_boundary"
+  | "operational_guidance";
+
 export interface QueryOptions {
   question: string;
   save?: boolean;
@@ -1597,7 +1632,7 @@ export interface QueryOptions {
   review?: boolean;
   gapFill?: boolean;
   memoryTaskId?: string;
-  intent?: "current_basis" | "explanation" | "evolution" | "local" | "statistics" | "report_writing" | "research";
+  intent?: QueryIntent;
   region?: string;
   pollutants?: string[];
   includeDrafts?: boolean;
@@ -1609,10 +1644,30 @@ export interface QueryOptions {
   evidenceMode?: "strict" | "balanced" | "exploratory";
   strictGrounding?: boolean;
   debugContext?: boolean;
+  returnDecisionContract?: boolean;
 }
 
 export type EvidenceState = "grounded" | "partial" | "insufficient";
 export type RecommendedNextTool = "knowledge_base" | "environment_data_mcp" | "both";
+
+export interface AgentDecision {
+  reportUsability: "direct" | "draft_only" | "needs_data_mcp" | "insufficient";
+  mustCallTools: Array<"environment_data_mcp">;
+  authorityBoundary: "current_mandatory" | "recommended_guidance" | "draft_or_historical" | "mixed" | "unknown";
+  privateKnowledgeUsed: boolean;
+  publicAuthorityUsed: boolean;
+  standardCoverage?: StandardCoverage[];
+  blockingReasons?: string[];
+  safeForReportSection?: Array<"basis" | "method" | "interpretation" | "draft_text" | "data_conclusion">;
+}
+
+export interface StandardCoverage {
+  standard: string;
+  required: boolean;
+  covered: boolean;
+  evidenceIds: string[];
+  status?: string;
+}
 
 export interface RetrievalDebugEvidenceItem {
   id: string;
@@ -1629,6 +1684,10 @@ export interface RetrievalDebugEvidenceItem {
   legalStatus?: string;
   documentRole?: string;
   standardCode?: string;
+  factId?: string;
+  factType?: string;
+  factTable?: string;
+  factRawText?: string;
   region?: string;
   excerpt: string;
 }
@@ -1644,11 +1703,15 @@ export interface RetrievalDebugInfo {
 
 export interface QueryRetrievalPlan {
   normalizedQuery: string;
-  intent?: QueryOptions["intent"];
+  intent?: QueryIntent;
   scope?: QueryOptions["scope"];
   standardRefs: string[];
   expandedTerms: string[];
   pinnedStandards: string[];
+  requiredStandards?: string[];
+  coveredStandards?: string[];
+  missingStandards?: string[];
+  authorityPinnedEvidenceCount?: number;
   rankingSignals: string[];
   recommendedNextTool: RecommendedNextTool;
   stages: Array<{
@@ -1681,6 +1744,14 @@ export interface QueryResult {
   answerBasis?: "current_effective" | "historical_or_evolution" | "local_adaptation" | "evidence_explanation" | "data_required";
   currentStatus?: string;
   dataToolHints?: string[];
+  agentDecision?: AgentDecision;
+  standardCoverage?: StandardCoverage[];
+  evidenceCompleteness?: {
+    requiredStandards: string[];
+    coveredStandards: string[];
+    missingStandards: string[];
+    authorityPinnedEvidenceCount: number;
+  };
   retrievalDebug?: RetrievalDebugInfo;
 }
 
@@ -1884,6 +1955,7 @@ export interface GitHookStatus {
 export interface CompileState {
   generatedAt: string;
   rootSchemaHash: string;
+  domainProfileHash?: string;
   projectSchemaHashes: Record<string, string>;
   effectiveSchemaHashes: {
     global: string;

@@ -187,6 +187,18 @@ function emitJson(data: unknown): void {
   process.stdout.write(`${JSON.stringify(data)}\n`);
 }
 
+function emitActiveHandles(label: string): void {
+  const getActiveHandles = (process as typeof process & { _getActiveHandles?: () => unknown[] })._getActiveHandles;
+  if (!getActiveHandles) {
+    return;
+  }
+  const handles = getActiveHandles().map((handle) => {
+    const ctor = (handle as { constructor?: { name?: string } }).constructor?.name ?? typeof handle;
+    return ctor;
+  });
+  process.stderr.write(`${label}: ${handles.join(", ") || "none"}\n`);
+}
+
 function log(message: string): void {
   if (isJson()) {
     process.stderr.write(`${message}\n`);
@@ -824,15 +836,36 @@ program
   .option("--max-tokens <n>", "Cap wiki output by trimming lower-priority pages")
   .option("--fail-on-fallback", "Fail compile when provider analysis falls back to heuristics", false)
   .option("--force-analysis", "Re-run source analysis for all sources regardless of cache", false)
+  .option("--skip-benchmark", "Skip configured benchmark after compile", false)
+  .option("--debug-lifecycle", "Emit compile lifecycle timing in JSON output and active-handle diagnostics on stderr", false)
+  .addOption(new Option("--lock-mode <mode>", "Compile lock behavior").choices(["wait", "fail", "skip"]).default("wait"))
   .action(
-    async (options: { approve?: boolean; commit?: boolean; maxTokens?: string; failOnFallback?: boolean; forceAnalysis?: boolean }) => {
+    async (options: {
+      approve?: boolean;
+      commit?: boolean;
+      maxTokens?: string;
+      failOnFallback?: boolean;
+      forceAnalysis?: boolean;
+      skipBenchmark?: boolean;
+      debugLifecycle?: boolean;
+      lockMode?: "wait" | "fail" | "skip";
+    }) => {
       const maxTokens = options.maxTokens ? parsePositiveInt(options.maxTokens, 0) || undefined : undefined;
+      if (options.debugLifecycle) {
+        emitActiveHandles("compile.activeHandles.before");
+      }
       const result = await compileVault(process.cwd(), {
         approve: options.approve ?? false,
         maxTokens,
         failOnFallback: options.failOnFallback ?? false,
-        forceAnalysis: options.forceAnalysis ?? false
+        forceAnalysis: options.forceAnalysis ?? false,
+        skipBenchmark: options.skipBenchmark ?? false,
+        debugLifecycle: options.debugLifecycle ?? false,
+        lockMode: options.lockMode ?? "wait"
       });
+      if (options.debugLifecycle) {
+        emitActiveHandles("compile.activeHandles.after");
+      }
       if (isJson()) {
         emitJson(result);
       } else {
@@ -850,6 +883,14 @@ program
           log(
             `Analysis: total=${result.analysisStats.total}, provider=${result.analysisStats.provider}, heuristic=${result.analysisStats.heuristic}, fallback=${result.analysisStats.fallbackCount} (${(result.analysisStats.fallbackRatio * 100).toFixed(2)}%).`
           );
+        }
+        if (result.benchmark?.skipped) {
+          log("Benchmark: skipped.");
+        } else if (result.benchmark && !result.benchmark.ok) {
+          log(`Benchmark: error=${result.benchmark.error ?? "unknown"}.`);
+        }
+        if (result.lifecycle?.length) {
+          log(`Lifecycle: ${result.lifecycle.map((step) => `${step.phase}=${step.durationMs}ms`).join(", ")}.`);
         }
       }
       if (options.commit) {
@@ -889,7 +930,10 @@ program
   .option("--gap-fill", "Pull external web-search evidence when the local wiki has gaps (requires webSearch.tasks.queryProvider).")
   .option("--task <id>", "Attach this query output to an agent task")
   .option("--memory <id>", "Compatibility alias for --task")
-  .option("--intent <intent>", "Query intent (current_basis|explanation|evolution|local|statistics|report_writing|research)")
+  .option(
+    "--intent <intent>",
+    "Query intent (current_basis|explanation|evolution|local|statistics|report_writing|research|authority_boundary|operational_guidance)"
+  )
   .option("--region <region>", "Region/city/province for local applicability filtering")
   .option("--pollutant <name>", "Primary pollutant focus (for example PM2.5, O3)")
   .option("--include-drafts", "Include draft consultation materials in retrieval", false)
@@ -898,6 +942,7 @@ program
   .option("--evidence-mode <mode>", "Grounding mode (strict|balanced|exploratory)")
   .option("--strict-grounding", "Only answer when retrieved evidence is sufficient", false)
   .option("--debug-context", "Return retrieval evidence and grounding diagnostics in JSON output", false)
+  .option("--return-decision-contract", "Include DeerFlow-facing decision metadata in query output", false)
   .option("--scope <scope>", "Access scope (public_only|tenant_only|project_only|mixed_public_private)")
   .option("--tenant-id <id>", "Tenant id for scoped retrieval")
   .option("--project-id <id>", "Project id for scoped retrieval")
@@ -914,7 +959,16 @@ program
         task?: string;
         memory?: string;
         format?: "markdown" | "report" | "slides" | "chart" | "image";
-        intent?: "current_basis" | "explanation" | "evolution" | "local" | "statistics" | "report_writing" | "research";
+        intent?:
+          | "current_basis"
+          | "explanation"
+          | "evolution"
+          | "local"
+          | "statistics"
+          | "report_writing"
+          | "research"
+          | "authority_boundary"
+          | "operational_guidance";
         region?: string;
         pollutant?: string;
         includeDrafts?: boolean;
@@ -923,6 +977,7 @@ program
         evidenceMode?: "strict" | "balanced" | "exploratory";
         strictGrounding?: boolean;
         debugContext?: boolean;
+        returnDecisionContract?: boolean;
         scope?: "public_only" | "tenant_only" | "project_only" | "mixed_public_private";
         tenantId?: string;
         projectId?: string;
@@ -943,6 +998,7 @@ program
         evidenceMode: options.evidenceMode,
         strictGrounding: options.strictGrounding ?? false,
         debugContext: options.debugContext ?? false,
+        returnDecisionContract: options.returnDecisionContract ?? false,
         scope: options.scope,
         tenantId: options.tenantId,
         projectId: options.projectId

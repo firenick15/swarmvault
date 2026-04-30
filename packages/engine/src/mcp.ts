@@ -256,13 +256,23 @@ export async function createMcpServer(rootDir: string): Promise<McpServer> {
     "query_vault",
     {
       description:
-        "Ask a question against the compiled vault. For environmental air work, returns grounded citations, answer basis, current-status hints, retrieval diagnostics when requested, and suggestions for when the environment data MCP should be called.",
+        "Ask a question against the compiled vault. For environmental air work, returns grounded citations, evidenceState, answerBasis, agentDecision, current-status hints, retrieval diagnostics when requested, and suggestions for when the environment data MCP should be called. Treat evidenceState=grounded as report-ready only when agentDecision.reportUsability=direct; partial is draft-only; insufficient requires more evidence; needs_data_mcp means the environment data MCP must be called before making data conclusions.",
       inputSchema: {
         question: z.string().min(1).describe("Question to ask the vault"),
         save: z.boolean().optional().describe("Persist the answer to wiki/outputs"),
         format: z.enum(["markdown", "report", "slides", "chart", "image"]).optional().describe("Output format"),
         intent: z
-          .enum(["current_basis", "explanation", "evolution", "local", "statistics", "report_writing", "research"])
+          .enum([
+            "current_basis",
+            "explanation",
+            "evolution",
+            "local",
+            "statistics",
+            "report_writing",
+            "research",
+            "authority_boundary",
+            "operational_guidance"
+          ])
           .optional()
           .describe("Business intent for authority-aware retrieval and answer framing"),
         region: z.string().optional().describe("Region/city/province filter"),
@@ -273,6 +283,7 @@ export async function createMcpServer(rootDir: string): Promise<McpServer> {
         evidenceMode: z.enum(["strict", "balanced", "exploratory"]).optional().describe("Grounding strictness for the answer"),
         strictGrounding: z.boolean().optional().describe("Only answer when retrieved evidence is sufficient"),
         debugContext: z.boolean().optional().describe("Return retrieval evidence items and grounding diagnostics"),
+        returnDecisionContract: z.boolean().optional().describe("Keep agentDecision in the output; defaults to true for DeerFlow planners"),
         scope: z.enum(["public_only", "tenant_only", "project_only", "mixed_public_private"]).optional(),
         tenantId: z.string().optional(),
         projectId: z.string().optional()
@@ -292,6 +303,7 @@ export async function createMcpServer(rootDir: string): Promise<McpServer> {
         evidenceMode,
         strictGrounding,
         debugContext,
+        returnDecisionContract,
         scope,
         tenantId,
         projectId
@@ -309,6 +321,7 @@ export async function createMcpServer(rootDir: string): Promise<McpServer> {
           evidenceMode,
           strictGrounding,
           debugContext,
+          returnDecisionContract,
           scope,
           tenantId,
           projectId
@@ -589,15 +602,21 @@ export async function createMcpServer(rootDir: string): Promise<McpServer> {
         approve: z.boolean().optional().describe("Stage a review bundle without applying active page changes"),
         maxTokens: z.number().int().min(1000).optional().describe("Maximum token budget for wiki output"),
         failOnFallback: z.boolean().optional().describe("Fail compile when provider analysis falls back to heuristics"),
-        forceAnalysis: z.boolean().optional().describe("Re-run analysis for all sources regardless of cache")
+        forceAnalysis: z.boolean().optional().describe("Re-run analysis for all sources regardless of cache"),
+        skipBenchmark: z.boolean().optional().describe("Skip configured benchmark after compile"),
+        debugLifecycle: z.boolean().optional().describe("Return compile lifecycle timings"),
+        lockMode: z.enum(["wait", "fail", "skip"]).optional().describe("Compile lock behavior")
       }
     },
-    safeHandler(async ({ approve, maxTokens, failOnFallback, forceAnalysis }) => {
+    safeHandler(async ({ approve, maxTokens, failOnFallback, forceAnalysis, skipBenchmark, debugLifecycle, lockMode }) => {
       const result = await compileVault(rootDir, {
         approve: approve ?? false,
         maxTokens,
         failOnFallback: failOnFallback ?? false,
-        forceAnalysis: forceAnalysis ?? false
+        forceAnalysis: forceAnalysis ?? false,
+        skipBenchmark: skipBenchmark ?? false,
+        debugLifecycle: debugLifecycle ?? false,
+        lockMode: lockMode ?? "wait"
       });
       return asToolText(result);
     })

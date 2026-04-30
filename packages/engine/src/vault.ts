@@ -21,11 +21,21 @@ import {
   sortDecisionsForPromotion
 } from "./candidate-promotion.js";
 import { buildCodeIndex, enrichResolvedCodeImports, modulePageTitle } from "./code-analysis.js";
+import { withCompileLock } from "./compile-lock.js";
 import { conflictConfidence, edgeConfidence, nodeConfidence } from "./confidence.js";
 import { defaultVaultSchema, initWorkspace, loadVaultConfig, PRIMARY_SCHEMA_FILENAME } from "./config.js";
 import { runConsolidation } from "./consolidate.js";
 import { runDeepLint } from "./deep-lint.js";
-import { buildEnvAirQueryPlan, buildEnvironmentDataToolHints, classifyRecommendedNextTool } from "./domain/env-air.js";
+import {
+  buildEnvAirQueryPlan,
+  buildEnvironmentDataToolHints,
+  classifyRecommendedNextTool,
+  pollutantAliasGroupsForQuery,
+  standardAliasGroupsForQuery,
+  standardIdentityKey,
+  standardRefsForExactRetrieval
+} from "./domain/env-air.js";
+import { domainProfileHash } from "./domain/profile.js";
 import { applyStandardRelationOverrides } from "./domain/standard-relations.js";
 import { embeddingSimilarityEdges, filterGraphBySourceClass, semanticGraphMatches, semanticPageSearch } from "./embeddings.js";
 import { markSuperseded, resolveDecayConfig, runDecayPass } from "./freshness.js";
@@ -107,6 +117,7 @@ import type {
   CandidatePromotionConfig,
   CandidateRecord,
   CodeIndexArtifact,
+  CompileLifecycleStep,
   CompileOptions,
   CompileResult,
   CompileState,
@@ -142,6 +153,7 @@ import type {
   SourceAnalysis,
   SourceClass,
   SourceManifest,
+  StandardCoverage,
   VaultConfig
 } from "./types.js";
 import {
@@ -153,6 +165,7 @@ import {
   readJsonFile,
   sha256,
   slugify,
+  slugifyKnowledgeLabel,
   toPosix,
   truncate,
   uniqueBy,
@@ -180,6 +193,9 @@ type QueryExecutionResult = {
   answerBasis?: QueryResult["answerBasis"];
   currentStatus?: string;
   dataToolHints?: string[];
+  agentDecision?: QueryResult["agentDecision"];
+  standardCoverage?: QueryResult["standardCoverage"];
+  evidenceCompleteness?: QueryResult["evidenceCompleteness"];
   retrievalDebug?: RetrievalDebugInfo;
 };
 
@@ -891,6 +907,39 @@ function candidateActivePath(page: Pick<GraphPage, "kind" | "id">): string {
     throw new Error(`Only concept and entity candidates can be promoted: ${page.id}`);
   }
   return activeAggregatePath(page.kind, pageSlug(page));
+}
+
+async function cleanupStaleAggregatePages(wikiDir: string, activePageIds: Set<string>): Promise<string[]> {
+  const aggregateRoots = ["concepts", "entities", path.join("candidates", "concepts"), path.join("candidates", "entities")];
+  const archived: string[] = [];
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  for (const root of aggregateRoots) {
+    const absoluteRoot = path.join(wikiDir, root);
+    const files = await listFilesRecursive(absoluteRoot).catch(() => []);
+    for (const absolutePath of files) {
+      if (!absolutePath.endsWith(".md")) {
+        continue;
+      }
+      const raw = await fs.readFile(absolutePath, "utf8").catch(() => "");
+      if (!raw) {
+        continue;
+      }
+      const parsed = matter(raw);
+      const kind = parsed.data.kind;
+      const pageId = typeof parsed.data.page_id === "string" ? parsed.data.page_id : "";
+      if ((kind !== "concept" && kind !== "entity") || parsed.data.managed_by !== "system" || !pageId || activePageIds.has(pageId)) {
+        continue;
+      }
+      const relativePath = toPosix(path.relative(wikiDir, absolutePath));
+      const archivePath = path.join(wikiDir, ".stale", stamp, relativePath);
+      await ensureDir(path.dirname(archivePath));
+      await fs.rename(absolutePath, archivePath).catch(async () => {
+        await fs.rm(absolutePath, { force: true });
+      });
+      archived.push(relativePath);
+    }
+  }
+  return archived;
 }
 
 function buildCommunityId(seed: string, index: number): string {
@@ -2039,7 +2088,7 @@ function buildGraph(
         id: concept.id,
         type: "concept",
         label: concept.name,
-        pageId: `concept:${slugify(concept.name)}`,
+        pageId: `concept:${slugifyKnowledgeLabel(concept.name)}`,
         freshness: "fresh",
         confidence: nodeConfidence(sourceIds.length),
         sourceIds,
@@ -2065,7 +2114,7 @@ function buildGraph(
         id: entity.id,
         type: "entity",
         label: entity.name,
-        pageId: `entity:${slugify(entity.name)}`,
+        pageId: `entity:${slugifyKnowledgeLabel(entity.name)}`,
         freshness: "fresh",
         confidence: nodeConfidence(sourceIds.length),
         sourceIds,
@@ -2869,6 +2918,7 @@ async function syncVaultArtifacts(
     outputHashes: Record<string, string>;
     insightHashes: Record<string, string>;
     memoryHashes: Record<string, string>;
+    domainProfileHash: string;
     previousState: CompileState | null;
     approve?: boolean;
     promoteCandidates?: boolean;
@@ -3021,7 +3071,7 @@ async function syncVaultArtifacts(
   for (const kind of ["concepts", "entities"] as const) {
     for (const aggregate of aggregateItems(input.analyses, kind)) {
       const itemKind = kind === "concepts" ? "concept" : "entity";
-      const slug = slugify(aggregate.name);
+      const slug = slugifyKnowledgeLabel(aggregate.name);
       const pageId = `${itemKind}:${slug}`;
       const sourceIds = uniqueStrings(aggregate.sourceAnalyses.map((item) => item.sourceId));
       const projectIds = scopedProjectIdsFromSources(sourceIds, input.sourceProjects);
@@ -3340,6 +3390,8 @@ async function syncVaultArtifacts(
   for (const relativePath of obsoletePaths) {
     await fs.rm(path.join(paths.wikiDir, relativePath), { force: true });
   }
+  const archivedAggregatePages = await cleanupStaleAggregatePages(paths.wikiDir, new Set(allPages.map((page) => page.id)));
+  changedPages.push(...archivedAggregatePages.filter((relativePath) => !changedPages.includes(relativePath)));
 
   await writeJsonFile(paths.graphPath, graph);
   await writeJsonFile(path.join(paths.wikiDir, "graph", "report.json"), graphOrientation.report);
@@ -3349,6 +3401,7 @@ async function syncVaultArtifacts(
   await writeJsonFile(paths.compileStatePath, {
     generatedAt: graph.generatedAt,
     rootSchemaHash: input.schemas.root.hash,
+    domainProfileHash: input.domainProfileHash,
     projectSchemaHashes: Object.fromEntries(
       Object.keys(input.schemas.projects)
         .sort((left, right) => left.localeCompare(right))
@@ -3603,6 +3656,7 @@ async function refreshIndexesAndSearch(rootDir: string, pages: GraphPage[]): Pro
       .filter((relativePath) => !allowedDashboardPages.has(relativePath))
       .map((relativePath) => fs.rm(path.join(paths.wikiDir, relativePath), { force: true }))
   );
+  await cleanupStaleAggregatePages(paths.wikiDir, new Set(pagesWithGraph.map((page) => page.id)));
 
   await applyStandardRelationOverrides(paths.wikiDir, pagesWithGraph);
   await rebuildSearchIndex(paths.searchDbPath, pagesWithGraph, paths.wikiDir, { chunking: config.retrieval?.chunking });
@@ -3806,7 +3860,26 @@ const groundedAnswerSchema = z.object({
   usedEvidenceIds: z.array(z.string().min(1)).default([]),
   unsupportedClaims: z.array(z.string()).default([]),
   missingEvidence: z.array(z.string()).default([]),
-  recommendedNextTool: z.enum(["knowledge_base", "environment_data_mcp", "both"]).optional()
+  recommendedNextTool: z.enum(["knowledge_base", "environment_data_mcp", "both"]).optional(),
+  standardCoverage: z
+    .array(
+      z.object({
+        standard: z.string().min(1),
+        required: z.boolean().default(false),
+        covered: z.boolean().default(false),
+        evidenceIds: z.array(z.string().min(1)).default([]),
+        status: z.string().optional()
+      })
+    )
+    .optional(),
+  evidenceCompleteness: z
+    .object({
+      requiredStandards: z.array(z.string()).default([]),
+      coveredStandards: z.array(z.string()).default([]),
+      missingStandards: z.array(z.string()).default([]),
+      authorityPinnedEvidenceCount: z.number().int().nonnegative().default(0)
+    })
+    .optional()
 });
 
 type GroundedAnswer = z.infer<typeof groundedAnswerSchema>;
@@ -3819,6 +3892,9 @@ function buildQuerySearchOptions(queryOptions?: QueryOptions): SearchQueryOption
     pollutant: queryOptions?.pollutants?.[0],
     includeDrafts: queryOptions?.includeDrafts,
     includeSuperseded: queryOptions?.includeSuperseded,
+    intent: queryOptions?.intent,
+    requireCurrentBasis: queryOptions?.requireCurrentBasis,
+    strictGrounding: queryOptions?.strictGrounding || queryOptions?.evidenceMode === "strict",
     project: queryOptions?.projectId
   };
   const queryIntent = queryOptions?.intent;
@@ -3837,6 +3913,22 @@ function buildQuerySearchOptions(queryOptions?: QueryOptions): SearchQueryOption
     searchOptions.authorityLayer = ["local", "core", "method"];
   } else if (queryIntent === "statistics") {
     searchOptions.documentRole = ["statistics", "report", "white_paper", "research"];
+  } else if (queryIntent === "authority_boundary") {
+    searchOptions.authorityLayer = ["core", "method", "evidence", "evolution", "local"];
+    searchOptions.documentRole = [
+      "standard",
+      "technical_guide",
+      "research",
+      "report",
+      "white_paper",
+      "draft",
+      "compilation_explanation",
+      "amendment"
+    ];
+    searchOptions.includeDrafts = true;
+    searchOptions.includeSuperseded = true;
+  } else if (queryIntent === "operational_guidance") {
+    searchOptions.authorityLayer = ["core", "method", "local", "evidence"];
   }
   return searchOptions;
 }
@@ -3859,10 +3951,95 @@ function inferAnswerBasis(
     case "research":
     case "explanation":
     case "report_writing":
+    case "authority_boundary":
+    case "operational_guidance":
       return "evidence_explanation";
     default:
       return options?.requireCurrentBasis ? "current_effective" : "evidence_explanation";
   }
+}
+
+function inferAuthorityBoundary(evidenceItems: EvidenceItem[]): NonNullable<QueryResult["agentDecision"]>["authorityBoundary"] {
+  const hasCurrentAuthority = evidenceItems.some(
+    (item) =>
+      (item.authorityLayer === "core" || item.authorityLayer === "method" || item.authorityLayer === "local") &&
+      (item.legalStatus === "current_effective" || !item.legalStatus) &&
+      (item.documentRole === "standard" ||
+        item.documentRole === "monitoring_method" ||
+        item.documentRole === "amendment" ||
+        !item.documentRole)
+  );
+  const hasReference = evidenceItems.some(
+    (item) =>
+      item.authorityLayer === "evidence" ||
+      item.documentRole === "research" ||
+      item.documentRole === "report" ||
+      item.documentRole === "white_paper" ||
+      item.documentRole === "technical_guide"
+  );
+  const hasDraftOrHistorical = evidenceItems.some(
+    (item) =>
+      item.authorityLayer === "evolution" ||
+      item.legalStatus === "draft_consultation" ||
+      item.legalStatus === "superseded" ||
+      item.documentRole === "draft" ||
+      item.documentRole === "compilation_explanation"
+  );
+  const classes = [hasCurrentAuthority, hasReference, hasDraftOrHistorical].filter(Boolean).length;
+  if (classes > 1) {
+    return "mixed";
+  }
+  if (hasCurrentAuthority) {
+    return "current_mandatory";
+  }
+  if (hasDraftOrHistorical) {
+    return "draft_or_historical";
+  }
+  if (hasReference) {
+    return "recommended_guidance";
+  }
+  return "unknown";
+}
+
+function buildAgentDecision(input: {
+  evidenceState?: QueryResult["evidenceState"];
+  recommendedNextTool?: QueryResult["recommendedNextTool"];
+  evidenceItems: EvidenceItem[];
+  projectIds: string[];
+  standardCoverage?: StandardCoverage[];
+  blockingReasons?: string[];
+}): QueryResult["agentDecision"] {
+  const recommendedNextTool = input.recommendedNextTool ?? "knowledge_base";
+  const mustCallTools: Array<"environment_data_mcp"> =
+    recommendedNextTool === "environment_data_mcp" || recommendedNextTool === "both" ? ["environment_data_mcp"] : [];
+  const evidenceState = input.evidenceState ?? "partial";
+  const reportUsability =
+    evidenceState === "insufficient"
+      ? "insufficient"
+      : mustCallTools.length
+        ? "needs_data_mcp"
+        : evidenceState === "partial"
+          ? "draft_only"
+          : "direct";
+  return {
+    reportUsability,
+    mustCallTools,
+    authorityBoundary: inferAuthorityBoundary(input.evidenceItems),
+    privateKnowledgeUsed: input.projectIds.length > 0 || input.evidenceItems.some((item) => item.authorityLayer === "project"),
+    publicAuthorityUsed: input.evidenceItems.some(
+      (item) =>
+        (item.authorityLayer === "core" || item.authorityLayer === "method" || item.authorityLayer === "local") &&
+        (item.legalStatus === "current_effective" || !item.legalStatus)
+    ),
+    standardCoverage: input.standardCoverage,
+    blockingReasons: input.blockingReasons,
+    safeForReportSection:
+      reportUsability === "insufficient"
+        ? []
+        : mustCallTools.length
+          ? ["basis", "method", "interpretation", "draft_text"]
+          : ["basis", "method", "interpretation", "draft_text", "data_conclusion"]
+  };
 }
 
 function summarizeCurrentStatus(evidenceItems: EvidenceItem[]): string | undefined {
@@ -3894,6 +4071,9 @@ function formatEvidenceSet(evidenceItems: EvidenceItem[]): string {
         item.chunkHeading ? `chunk_heading=${item.chunkHeading}` : undefined,
         item.chunkKind ? `chunk_kind=${item.chunkKind}` : undefined,
         item.chunkLocation ? `chunk_location=${item.chunkLocation}` : undefined,
+        item.factId ? `fact_id=${item.factId}` : undefined,
+        item.factType ? `fact_type=${item.factType}` : undefined,
+        item.factTable ? `fact_table=${item.factTable}` : undefined,
         "",
         item.excerpt
       ]
@@ -3914,21 +4094,148 @@ function parseEvidenceIds(text: string | undefined): string[] {
 }
 
 function strictExactQueryTerms(question: string): string[] {
+  const standardFragments = new Set(
+    extractStandardFragments(question).flatMap((item) => [item.number, item.year, item.compact, item.familyNumberCompact].filter(Boolean))
+  );
   return uniqueBy(
     (question.match(/[a-z0-9][a-z0-9.-]*[0-9][a-z0-9.-]*/gi) ?? [])
       .map((term) => term.toLowerCase().replace(/[^a-z0-9]/g, ""))
-      .filter((term) => term.length >= 3),
+      .filter((term) => term.length >= 3 && !standardFragments.has(term)),
     (item) => item
   ).slice(0, 8);
 }
 
+function extractStandardFragments(
+  question: string
+): Array<{ number: string; year?: string; compact: string; familyNumberCompact: string }> {
+  return buildEnvAirQueryPlan(question).standardRefs.map((ref) => ({
+    number: ref.number.toLowerCase(),
+    year: ref.year?.toLowerCase(),
+    compact: ref.compact.toLowerCase(),
+    familyNumberCompact: `${ref.family}${ref.number}`.toLowerCase()
+  }));
+}
+
+function normalizeEvidenceTerm(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[₀０]/g, "0")
+    .replace(/[₁１]/g, "1")
+    .replace(/[₂２]/g, "2")
+    .replace(/[₃３]/g, "3")
+    .replace(/[₄４]/g, "4")
+    .replace(/[₅５]/g, "5")
+    .replace(/[₆６]/g, "6")
+    .replace(/[₇７]/g, "7")
+    .replace(/[₈８]/g, "8")
+    .replace(/[₉９]/g, "9")
+    .replace(/[^a-z0-9\p{Script=Han}]/gu, "");
+}
+
 function evidenceContainsExactTerms(evidenceItems: EvidenceItem[], terms: string[]): string[] {
   const haystack = evidenceItems
-    .map((item) => [item.title, item.standardCode, item.citation, item.chunkId, item.chunkHeading, item.excerpt].filter(Boolean).join(" "))
+    .map((item) =>
+      [
+        item.title,
+        item.standardCode,
+        item.citation,
+        item.chunkId,
+        item.chunkHeading,
+        item.factId,
+        item.factType,
+        item.factRawText,
+        item.excerpt
+      ]
+        .filter(Boolean)
+        .join(" ")
+    )
     .join("\n")
-    .toLowerCase()
-    .replace(/[^a-z0-9]/g, "");
+    .split(/\n/)
+    .map(normalizeEvidenceTerm)
+    .join("\n");
   return terms.filter((term) => !haystack.includes(term));
+}
+
+function evidenceContainsRequiredAliases(evidenceItems: EvidenceItem[], aliasGroups: string[][]): string[] {
+  if (!aliasGroups.length) {
+    return [];
+  }
+  const haystack = evidenceItems
+    .map((item) =>
+      [
+        item.title,
+        item.standardCode,
+        item.citation,
+        item.chunkId,
+        item.chunkHeading,
+        item.factId,
+        item.factType,
+        item.factRawText,
+        item.excerpt
+      ]
+        .filter(Boolean)
+        .join(" ")
+    )
+    .join("\n");
+  const normalizedHaystack = normalizeEvidenceTerm(haystack);
+  return aliasGroups
+    .filter((group) => !group.some((alias) => normalizedHaystack.includes(normalizeEvidenceTerm(alias))))
+    .map((group) => group[0] ?? "pollutant");
+}
+
+function requiredStandardLabels(queryPlan: ReturnType<typeof buildEnvAirQueryPlan>): string[] {
+  return uniqueStrings(standardRefsForExactRetrieval(queryPlan).map((ref) => standardIdentityKey(ref)));
+}
+
+function buildStandardCoverage(requiredStandards: string[], evidenceItems: EvidenceItem[]): StandardCoverage[] {
+  return requiredStandards.map((standard) => {
+    const matchingEvidence = evidenceItems.filter((item) => standardIdentityKey(item.standardCode) === standard);
+    const evidenceIds = matchingEvidence.map((item) => item.id);
+    const statuses = uniqueStrings(matchingEvidence.map((item) => item.legalStatus ?? ""));
+    return {
+      standard,
+      required: true,
+      covered: evidenceIds.length > 0,
+      evidenceIds,
+      status: statuses.join("|") || undefined
+    };
+  });
+}
+
+function evidenceCompletenessFromCoverage(standardCoverage: StandardCoverage[]): NonNullable<QueryResult["evidenceCompleteness"]> {
+  const requiredStandards = standardCoverage.filter((item) => item.required).map((item) => item.standard);
+  const coveredStandards = standardCoverage.filter((item) => item.required && item.covered).map((item) => item.standard);
+  const missingStandards = standardCoverage.filter((item) => item.required && !item.covered).map((item) => item.standard);
+  const authorityPinnedEvidenceCount = standardCoverage.reduce((total, item) => total + item.evidenceIds.length, 0);
+  return {
+    requiredStandards,
+    coveredStandards,
+    missingStandards,
+    authorityPinnedEvidenceCount
+  };
+}
+
+function answerLooksIncomplete(question: string, answer: string): boolean {
+  const normalized = answer.trim();
+  if (!normalized) {
+    return true;
+  }
+  const compactQuestion = question.replace(/\s+/g, "");
+  const yesNoQuestion = /(是否|能否|可否|是不是|能不能|吗|should|can|whether)/i.test(compactQuestion);
+  if (!yesNoQuestion && normalized.length < 80) {
+    return true;
+  }
+  if (/(如下|包括|分别是|主要|第[0-9一二三四五六七八九十]+章|为|：|:)$/.test(normalized)) {
+    return true;
+  }
+  if (/(多少|哪些|区别|改了什么|怎么处理|分别做什么|是什么)/.test(compactQuestion)) {
+    const sentenceCount = (normalized.match(/[。！？.!?]/g) ?? []).length;
+    const hasStructure = /(^|\n)\s*[-*0-9一二三四五六七八九十]+[、.)．]/m.test(normalized) || normalized.includes("|");
+    if (!hasStructure && sentenceCount < 2) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function evaluateGrounding(input: { evidenceItems: EvidenceItem[]; answer: string; structured?: GroundedAnswer }): {
@@ -4028,7 +4335,12 @@ async function executeQuery(
   const recommendedNextTool = classifyRecommendedNextTool(question);
   const dataToolHints = buildEnvironmentDataToolHints(question);
   const queryPlan = buildEnvAirQueryPlan(question);
-  if (queryPlan.standardRefs.length > 0) {
+  const currentBasisQuery =
+    options.queryOptions?.intent === "current_basis" ||
+    options.queryOptions?.intent === "report_writing" ||
+    options.queryOptions?.requireCurrentBasis ||
+    queryPlan.currentBasisIntent;
+  if (queryPlan.standardRefs.length > 0 && !currentBasisQuery) {
     delete searchOptions.authorityLayer;
     delete searchOptions.documentRole;
     delete searchOptions.legalStatus;
@@ -4043,6 +4355,11 @@ async function executeQuery(
       resultCount: searchResults.filter((result) => result.retrievalStage === "standard_exact").length
     },
     {
+      name: "structured_fact",
+      status: searchResults.some((result) => result.retrievalStage === "structured_fact") ? "used" : "planned",
+      resultCount: searchResults.filter((result) => result.retrievalStage === "structured_fact").length
+    },
+    {
       name: "chunk_fts",
       status: searchResults.some((result) => result.retrievalStage === "chunk_fts") ? "used" : "planned",
       resultCount: searchResults.filter((result) => result.retrievalStage === "chunk_fts").length
@@ -4053,6 +4370,7 @@ async function executeQuery(
       resultCount: searchResults.length
     }
   );
+  const requiredStandards = requiredStandardLabels(queryPlan);
   const retrievalPlan: NonNullable<RetrievalDebugInfo["queryPlan"]> = {
     normalizedQuery: queryPlan.normalizedQuery,
     intent: options.queryOptions?.intent,
@@ -4060,6 +4378,10 @@ async function executeQuery(
     standardRefs: queryPlan.standardRefs.map((ref) => ref.normalized),
     expandedTerms: queryPlan.expandedTerms,
     pinnedStandards: queryPlan.pinnedStandards,
+    requiredStandards,
+    coveredStandards: [],
+    missingStandards: requiredStandards,
+    authorityPinnedEvidenceCount: 0,
     rankingSignals: queryPlan.rankingSignals,
     recommendedNextTool,
     stages: queryPlan.stages
@@ -4099,14 +4421,16 @@ async function executeQuery(
     relatedPageIds.flatMap((pageId) => pageMap.get(pageId)?.sourceIds ?? []),
     (item) => item
   );
-  const schemaProjectIds = schemaProjectIdsFromPages(relatedPageIds, pageMap);
+  const pageProjectIds = scopedProjectIdsFromSources(relatedSourceIds, sourceProjects);
+  const explicitProjectIds =
+    options.queryOptions?.projectId && options.queryOptions.scope !== "public_only" ? [options.queryOptions.projectId] : [];
+  const schemaProjectIds = uniqueStrings([...explicitProjectIds, ...pageProjectIds, ...schemaProjectIdsFromPages(relatedPageIds, pageMap)]);
   const querySchema = composeVaultSchema(
     schemas.root,
     schemaProjectIds
       .map((projectId) => schemas.projects[projectId])
       .filter((schema): schema is NonNullable<typeof schema> => Boolean(schema?.hash))
   );
-  const pageProjectIds = scopedProjectIdsFromSources(relatedSourceIds, sourceProjects);
 
   const manifests = await listManifests(rootDir);
   const rawExcerpts: string[] = [];
@@ -4143,6 +4467,10 @@ async function executeQuery(
       legalStatus: result.legalStatus,
       documentRole: result.documentRole,
       standardCode: result.standardCode,
+      factId: result.factId,
+      factType: result.factType,
+      factTable: result.factTable,
+      factRawText: result.factRawText,
       region: result.region,
       excerpt: truncate(normalizeWhitespace(excerpts[index] ?? result.snippet), 1800)
     });
@@ -4156,6 +4484,30 @@ async function executeQuery(
       excerpt: truncate(normalizeWhitespace(result.snippet), 600)
     });
   });
+  if (queryPlan.rankingSignals.includes("authority_boundary_question")) {
+    evidenceItems.push({
+      id: `E${evidenceItems.length + 1}`,
+      kind: "source",
+      citation: `schema:${querySchema.hash}`,
+      title: "Vault schema authority-boundary rules",
+      excerpt: truncate(
+        normalizeWhitespace(
+          [
+            "Knowledge-base authority rules for environmental air work:",
+            "mandatory/current-effective standards and regulations are execution basis;",
+            "research papers, reports, gazettes, white papers, interpretations, drafts and compilation notes are explanatory or reference materials unless an effective legal instrument explicitly incorporates them.",
+            querySchema.content
+          ].join("\n")
+        ),
+        1400
+      )
+    });
+  }
+  const standardCoverage = buildStandardCoverage(requiredStandards, evidenceItems);
+  const evidenceCompleteness = evidenceCompletenessFromCoverage(standardCoverage);
+  retrievalPlan.coveredStandards = evidenceCompleteness.coveredStandards;
+  retrievalPlan.missingStandards = evidenceCompleteness.missingStandards;
+  retrievalPlan.authorityPinnedEvidenceCount = evidenceCompleteness.authorityPinnedEvidenceCount;
 
   if (!evidenceItems.length) {
     const answer = [
@@ -4181,6 +4533,16 @@ async function executeQuery(
       answerBasis: inferAnswerBasis(options.queryOptions, recommendedNextTool),
       currentStatus: undefined,
       dataToolHints,
+      agentDecision: buildAgentDecision({
+        evidenceState: "insufficient",
+        recommendedNextTool,
+        evidenceItems,
+        projectIds: pageProjectIds,
+        standardCoverage,
+        blockingReasons: ["no_retrieved_evidence"]
+      }),
+      standardCoverage,
+      evidenceCompleteness,
       retrievalDebug: options.queryOptions?.debugContext
         ? {
             query: question,
@@ -4194,11 +4556,24 @@ async function executeQuery(
     };
   }
   const strictGrounding = options.queryOptions?.strictGrounding || options.queryOptions?.evidenceMode === "strict";
-  const missingExactTerms = strictGrounding ? evidenceContainsExactTerms(evidenceItems, strictExactQueryTerms(question)) : [];
-  if (missingExactTerms.length) {
-    const warning = `strict_exact_terms_not_found:${missingExactTerms.join(",")}`;
+  const pollutantAliasGroups = pollutantAliasGroupsForQuery(question, options.queryOptions?.pollutants);
+  const standardAliasGroups = standardAliasGroupsForQuery(question);
+  const aliasTerms = new Set(pollutantAliasGroups.flatMap((group) => group.map(normalizeEvidenceTerm)));
+  const exactTerms = strictExactQueryTerms(question).filter((term) => !aliasTerms.has(term));
+  const missingExactTerms = strictGrounding ? evidenceContainsExactTerms(evidenceItems, exactTerms) : [];
+  const missingAliasGroups = strictGrounding ? evidenceContainsRequiredAliases(evidenceItems, pollutantAliasGroups) : [];
+  const missingStandardGroups = strictGrounding ? evidenceContainsRequiredAliases(evidenceItems, standardAliasGroups) : [];
+  const strictMissingTerms = uniqueStrings([...missingExactTerms, ...missingAliasGroups]);
+  const strictMissingStandards = uniqueStrings(missingStandardGroups);
+  const strictMissingShouldBlock = recommendedNextTool === "knowledge_base";
+  if ((strictMissingTerms.length || strictMissingStandards.length) && strictMissingShouldBlock) {
+    const warnings = [
+      ...(strictMissingTerms.length ? [`strict_exact_terms_not_found:${strictMissingTerms.join(",")}`] : []),
+      ...(strictMissingStandards.length ? [`strict_required_standard_not_found:${strictMissingStandards.join(",")}`] : [])
+    ];
+    const missingLabels = [...strictMissingTerms, ...strictMissingStandards];
     return {
-      answer: `知识库检索到了相关背景材料，但没有检索到问题中关键精确项（${missingExactTerms.join(", ")}）的直接证据，因此不能给出有依据的结论。`,
+      answer: `知识库检索到了相关背景材料，但没有检索到问题中关键精确项（${missingLabels.join(", ")}）的直接证据，因此不能给出有依据的结论。`,
       citations: [],
       relatedPageIds,
       relatedNodeIds,
@@ -4206,12 +4581,22 @@ async function executeQuery(
       schemaHash: querySchema.hash,
       projectIds: pageProjectIds,
       evidenceState: "insufficient",
-      groundingWarnings: [warning],
+      groundingWarnings: warnings,
       invalidCitations: [],
       recommendedNextTool,
       answerBasis: inferAnswerBasis(options.queryOptions, recommendedNextTool),
       currentStatus: summarizeCurrentStatus(evidenceItems),
       dataToolHints,
+      agentDecision: buildAgentDecision({
+        evidenceState: "insufficient",
+        recommendedNextTool,
+        evidenceItems,
+        projectIds: pageProjectIds,
+        standardCoverage,
+        blockingReasons: warnings
+      }),
+      standardCoverage,
+      evidenceCompleteness,
       retrievalDebug: options.queryOptions?.debugContext
         ? {
             query: question,
@@ -4219,7 +4604,7 @@ async function executeQuery(
             queryPlan: retrievalPlan,
             evidenceItems,
             usedEvidenceIds: [],
-            warnings: [warning]
+            warnings
           }
         : undefined
     };
@@ -4228,7 +4613,11 @@ async function executeQuery(
   let answer: string;
   let usage: QueryExecutionResult["usage"];
   let structuredAnswer: GroundedAnswer | undefined;
-  const providerWarnings: string[] = [];
+  const providerWarnings: string[] =
+    strictMissingTerms.length && !strictMissingShouldBlock ? [`strict_exact_terms_not_found:${strictMissingTerms.join(",")}`] : [];
+  if (strictMissingStandards.length && !strictMissingShouldBlock) {
+    providerWarnings.push(`strict_required_standard_not_found:${strictMissingStandards.join(",")}`);
+  }
   if (provider.type === "heuristic") {
     answer = formatHeuristicAnswer(question, excerpts, rawExcerpts, searchResults, format);
   } else {
@@ -4249,10 +4638,15 @@ async function executeQuery(
         "Use only the provided evidence set. Cite evidence item IDs like [E1] for every substantive claim.",
         "Evidence items may include chunk_id, chunk_heading, chunk_kind, and chunk_location; prefer table/formula chunks for limits, formulas, and numeric requirements.",
         "Distinguish mandatory/current-effective standards from recommended guides, drafts, explanations, and historical versions.",
+        "Research papers, bulletins, white papers, public interpretations, and technical guides may explain background or method choices, but they cannot by themselves be stated as enforcement or mandatory execution basis.",
+        "Drafts, consultation versions, compilation explanations, and superseded standards must be labeled as draft, explanatory, historical, or superseded unless another current-effective source makes them binding.",
+        "When answering authority-boundary questions, cite the schema/rule evidence if present and state which materials are mandatory basis, recommended guidance, explanatory background, historical/evolution material, or local-only practice.",
         "When a user asks about a named historical standard, explain that standard and its replacement status instead of answering only with the current replacement.",
         "For current-basis questions, prioritize current effective standards and explicitly mark drafts/history as non-binding.",
         "For local questions, state jurisdiction boundaries and do not generalize local口径 to other regions.",
-        "If monitor data, rankings, concentration calculations,同比/环比, or process analysis are needed, say the environment_data_mcp tool should be used.",
+        "If monitor data, rankings, concentration calculations,同比/环比, abnormal time-series diagnosis, or process analysis are needed, say the environment_data_mcp tool should be used.",
+        "Do not apply knowledge-base standard limit values directly to proxy metrics or derived values produced by a data MCP unless the evidence states that the calculation and averaging period are the same compliance metric.",
+        "For report-writing answers, separate standard basis, monitoring data, statistical conclusion, professional interpretation, and caveats.",
         "If evidence is insufficient, say so instead of filling gaps from general knowledge.",
         outputFormatInstruction(format)
       ].join(" ")
@@ -4270,12 +4664,22 @@ async function executeQuery(
               "",
               context,
               "",
-              "Return JSON with: answer, usedEvidenceIds, unsupportedClaims, missingEvidence, recommendedNextTool."
+              "Return JSON with: answer, usedEvidenceIds, unsupportedClaims, missingEvidence, recommendedNextTool, standardCoverage, evidenceCompleteness."
             ].join("\n")
           },
           groundedAnswerSchema
         );
         answer = structuredAnswer.answer;
+        if (answerLooksIncomplete(question, answer)) {
+          providerWarnings.push("structured_answer_incomplete_fallback");
+          const response = await provider.generateText({
+            system,
+            prompt: `Question: ${question}\n\n${context}`
+          });
+          answer = response.text;
+          usage = response.usage;
+          structuredAnswer = undefined;
+        }
       } catch (error) {
         providerWarnings.push(`structured_query_fallback:${error instanceof Error ? error.message : String(error)}`);
         const response = await provider.generateText({
@@ -4316,6 +4720,16 @@ async function executeQuery(
     answerBasis: inferAnswerBasis(options.queryOptions, structuredAnswer?.recommendedNextTool ?? recommendedNextTool),
     currentStatus: summarizeCurrentStatus(evidenceItems),
     dataToolHints,
+    agentDecision: buildAgentDecision({
+      evidenceState,
+      recommendedNextTool: structuredAnswer?.recommendedNextTool ?? recommendedNextTool,
+      evidenceItems,
+      projectIds: pageProjectIds,
+      standardCoverage,
+      blockingReasons: groundingWarnings
+    }),
+    standardCoverage,
+    evidenceCompleteness,
     retrievalDebug: options.queryOptions?.debugContext
       ? {
           query: question,
@@ -4371,6 +4785,7 @@ export async function refreshVaultAfterOutputSave(rootDir: string): Promise<void
   const storedOutputs = await loadSavedOutputPages(paths.wikiDir);
   const storedInsights = await loadInsightPages(paths.wikiDir);
   const storedMemoryPages = await loadMemoryTaskPages(rootDir);
+  const currentDomainProfileHash = await domainProfileHash(rootDir, config);
   await syncVaultArtifacts(rootDir, {
     schemas,
     manifests,
@@ -4384,6 +4799,7 @@ export async function refreshVaultAfterOutputSave(rootDir: string): Promise<void
     outputHashes: pageHashes(storedOutputs),
     insightHashes: pageHashes(storedInsights),
     memoryHashes: memoryTaskHashes(storedMemoryPages),
+    domainProfileHash: currentDomainProfileHash,
     previousState: await readJsonFile<CompileState>(paths.compileStatePath),
     approve: false,
     promoteCandidates: false
@@ -5509,9 +5925,13 @@ export async function initVault(rootDir: string, options: InitOptions = {}): Pro
   }
 }
 
-async function runConfiguredBenchmark(rootDir: string, config: VaultConfig): Promise<{ ok: boolean; error?: string }> {
-  if (config.benchmark?.enabled === false) {
-    return { ok: true };
+async function runConfiguredBenchmark(
+  rootDir: string,
+  config: VaultConfig,
+  options: Pick<CompileOptions, "skipBenchmark"> = {}
+): Promise<NonNullable<CompileResult["benchmark"]>> {
+  if (options.skipBenchmark || config.benchmark?.enabled === false) {
+    return { ok: true, skipped: true };
   }
 
   try {
@@ -5571,9 +5991,55 @@ async function runWithConcurrency<T>(tasks: Array<() => Promise<T>>, maxParallel
   return results;
 }
 
+function createCompileLifecycle(enabled: boolean | undefined): {
+  steps: CompileLifecycleStep[];
+  record(phase: string, startedAt: number, details?: Record<string, string | number | boolean | null>, ok?: boolean): void;
+} {
+  const steps: CompileLifecycleStep[] = [];
+  return {
+    steps,
+    record(phase, startedAt, details, ok = true) {
+      if (!enabled) {
+        return;
+      }
+      const finished = Date.now();
+      steps.push({
+        phase,
+        startedAt: new Date(startedAt).toISOString(),
+        finishedAt: new Date(finished).toISOString(),
+        durationMs: finished - startedAt,
+        ok,
+        details
+      });
+    }
+  };
+}
+
+function attachCompileLifecycle(
+  result: CompileResult,
+  lifecycle: CompileLifecycleStep[],
+  benchmark?: CompileResult["benchmark"]
+): CompileResult {
+  return {
+    ...result,
+    ...(benchmark ? { benchmark } : {}),
+    ...(lifecycle.length ? { lifecycle } : {})
+  };
+}
+
 export async function compileVault(rootDir: string, options: CompileOptions = {}): Promise<CompileResult> {
+  return withCompileLock(rootDir, options, () => compileVaultUnlocked(rootDir, options));
+}
+
+async function compileVaultUnlocked(rootDir: string, options: CompileOptions = {}): Promise<CompileResult> {
   const startedAt = new Date().toISOString();
+  const lifecycle = createCompileLifecycle(options.debugLifecycle);
+  const initStarted = Date.now();
   const { config, paths } = await initWorkspace(rootDir);
+  lifecycle.record("init_workspace", initStarted);
+  const domainHashStarted = Date.now();
+  const nextDomainProfileHash = await domainProfileHash(rootDir, config);
+  lifecycle.record("domain_profile_hash", domainHashStarted, { hash: nextDomainProfileHash.slice(0, 12) });
   const schemas = await loadVaultSchemas(rootDir);
   const provider = await getProviderForTask(rootDir, "compileProvider");
   const manifests = await listManifests(rootDir);
@@ -5599,6 +6065,7 @@ export async function compileVault(rootDir: string, options: CompileOptions = {}
     );
   const nextProjectConfigHash = projectConfigHash(config);
   const projectConfigChanged = !previousState || previousState.projectConfigHash !== nextProjectConfigHash;
+  const domainProfileChanged = !previousState || previousState.domainProfileHash !== nextDomainProfileHash;
   const previousSourceHashes = previousState?.sourceSemanticHashes ?? previousState?.sourceHashes ?? {};
   const previousAnalyses = previousState?.analyses ?? {};
   const previousSourceProjects = previousState?.sourceProjects ?? {};
@@ -5648,6 +6115,7 @@ export async function compileVault(rootDir: string, options: CompileOptions = {}
     !rootSchemaChanged &&
     !effectiveSchemaChanged &&
     !projectConfigChanged &&
+    !domainProfileChanged &&
     !sourcesChanged &&
     !outputsChanged &&
     !insightsChanged &&
@@ -5657,9 +6125,13 @@ export async function compileVault(rootDir: string, options: CompileOptions = {}
     !options.approve
   ) {
     const graph = await readJsonFile<GraphArtifact>(paths.graphPath);
-    const benchmark = await runConfiguredBenchmark(rootDir, config);
+    const benchmarkStarted = Date.now();
+    const benchmark = await runConfiguredBenchmark(rootDir, config, options);
+    lifecycle.record("benchmark", benchmarkStarted, { ok: benchmark.ok, skipped: benchmark.skipped ?? false }, benchmark.ok);
     if (graph && benchmark.ok) {
+      const refreshStarted = Date.now();
       await refreshIndexesAndSearch(rootDir, graph.pages);
+      lifecycle.record("refresh_indexes", refreshStarted, { pages: graph.pages.length });
     }
     await recordSession(rootDir, {
       operation: "compile",
@@ -5680,18 +6152,22 @@ export async function compileVault(rootDir: string, options: CompileOptions = {}
         `insights=${insightPages.length}`,
         `memory=${memoryPages.length}`,
         `schema=${schemas.effective.global.hash.slice(0, 12)}`,
-        `benchmark=${benchmark.ok ? "ok" : `error:${benchmark.error}`}`
+        `benchmark=${benchmark.skipped ? "skipped" : benchmark.ok ? "ok" : `error:${benchmark.error}`}`
       ]
     });
-    return {
-      graphPath: paths.graphPath,
-      pageCount: graph?.pages.length ?? outputPages.length + insightPages.length + memoryPages.length,
-      changedPages: [],
-      sourceCount: manifests.length,
-      staged: false,
-      promotedPageIds: [],
-      candidatePageCount: (graph?.pages ?? []).filter((page) => page.status === "candidate").length
-    };
+    return attachCompileLifecycle(
+      {
+        graphPath: paths.graphPath,
+        pageCount: graph?.pages.length ?? outputPages.length + insightPages.length + memoryPages.length,
+        changedPages: [],
+        sourceCount: manifests.length,
+        staged: false,
+        promotedPageIds: [],
+        candidatePageCount: (graph?.pages ?? []).filter((page) => page.status === "candidate").length
+      },
+      lifecycle.steps,
+      benchmark
+    );
   }
 
   const analysisProgress = createCompileProgressReporter("analyze", manifests.length);
@@ -5769,6 +6245,7 @@ export async function compileVault(rootDir: string, options: CompileOptions = {}
     outputHashes: currentOutputHashes,
     insightHashes: currentInsightHashes,
     memoryHashes: currentMemoryHashes,
+    domainProfileHash: nextDomainProfileHash,
     previousState,
     approve: options.approve
   });
@@ -5858,9 +6335,13 @@ export async function compileVault(rootDir: string, options: CompileOptions = {}
     }
   }
 
-  const benchmark = options.approve ? { ok: true } : await runConfiguredBenchmark(rootDir, config);
+  const benchmarkStarted = Date.now();
+  const benchmark = options.approve ? { ok: true, skipped: true } : await runConfiguredBenchmark(rootDir, config, options);
+  lifecycle.record("benchmark", benchmarkStarted, { ok: benchmark.ok, skipped: benchmark.skipped ?? false }, benchmark.ok);
   if (!options.approve && benchmark.ok) {
+    const refreshStarted = Date.now();
     await refreshIndexesAndSearch(rootDir, sync.allPages);
+    lifecycle.record("refresh_indexes", refreshStarted, { pages: sync.allPages.length });
   }
 
   await recordSession(rootDir, {
@@ -5891,7 +6372,7 @@ export async function compileVault(rootDir: string, options: CompileOptions = {}
       `staged=${sync.staged}`,
       `postPassApproval=${postPassApprovalId ?? "none"}`,
       `schema=${schemas.effective.global.hash.slice(0, 12)}`,
-      `benchmark=${benchmark.ok ? "ok" : `error:${benchmark.error}`}`
+      `benchmark=${benchmark.skipped ? "skipped" : benchmark.ok ? "ok" : `error:${benchmark.error}`}`
     ]
   });
 
@@ -5957,22 +6438,26 @@ export async function compileVault(rootDir: string, options: CompileOptions = {}
     promotedFromAuto.push(...autoRun.promotedPageIds);
   }
 
-  return {
-    graphPath: paths.graphPath,
-    pageCount: sync.allPages.length,
-    changedPages: sync.changedPages,
-    sourceCount: manifests.length,
-    staged: sync.staged,
-    approvalId: sync.approvalId,
-    approvalDir: sync.approvalDir,
-    postPassApprovalId,
-    postPassApprovalDir,
-    promotedPageIds: [...sync.promotedPageIds, ...promotedFromAuto],
-    candidatePageCount: sync.candidatePageCount,
-    autoPromotion: autoPromotionSummary,
-    tokenStats,
-    analysisStats
-  };
+  return attachCompileLifecycle(
+    {
+      graphPath: paths.graphPath,
+      pageCount: sync.allPages.length,
+      changedPages: sync.changedPages,
+      sourceCount: manifests.length,
+      staged: sync.staged,
+      approvalId: sync.approvalId,
+      approvalDir: sync.approvalDir,
+      postPassApprovalId,
+      postPassApprovalDir,
+      promotedPageIds: [...sync.promotedPageIds, ...promotedFromAuto],
+      candidatePageCount: sync.candidatePageCount,
+      autoPromotion: autoPromotionSummary,
+      tokenStats,
+      analysisStats
+    },
+    lifecycle.steps,
+    benchmark
+  );
 }
 
 export async function providerSmokeTest(rootDir: string, providerId: string): Promise<ProviderSmokeTestResult> {
@@ -6232,6 +6717,9 @@ export async function queryVault(rootDir: string, options: QueryOptions): Promis
     answerBasis: query.answerBasis,
     currentStatus: query.currentStatus,
     dataToolHints: query.dataToolHints,
+    agentDecision: query.agentDecision,
+    standardCoverage: query.standardCoverage,
+    evidenceCompleteness: query.evidenceCompleteness,
     retrievalDebug: query.retrievalDebug
   };
 }
@@ -6581,12 +7069,15 @@ async function rerankSearchResults(rootDir: string, query: string, results: Sear
         const rerankIndex = llmPosition.get(result.pageId) ?? originalIndex;
         const retrievalWeight = originalIndex < 3 ? 0.75 : originalIndex < 10 ? 0.6 : 0.4;
         const llmWeight = 1 - retrievalWeight;
-        const exactBoost = result.retrievalStage === "standard_exact" ? 0.25 : 0;
+        const exactBoost = result.retrievalStage === "standard_exact" ? 0.25 : result.retrievalStage === "structured_fact" ? 0.2 : 0;
         const blendedScore = retrievalWeight * (1 / (originalIndex + 1)) + llmWeight * (1 / (rerankIndex + 1)) + exactBoost;
         return {
           ...result,
           rank: -blendedScore,
-          retrievalStage: result.retrievalStage === "standard_exact" ? result.retrievalStage : ("rerank" as const),
+          retrievalStage:
+            result.retrievalStage === "standard_exact" || result.retrievalStage === "structured_fact"
+              ? result.retrievalStage
+              : ("rerank" as const),
           rankingSignals: uniqueBy([...(result.rankingSignals ?? []), "position_aware_llm_rerank"], (item) => item)
         };
       })
