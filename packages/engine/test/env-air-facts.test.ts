@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { extractStandardReferences } from "../src/domain/env-air.js";
 import { extractEnvAirStructuredFacts } from "../src/domain/env-air-facts.js";
+import type { DocumentStructureBlock } from "../src/fact-extraction/document-structure.js";
+import { structuredFactsFromBlocks } from "../src/fact-extraction/facts.js";
 
 describe("environment air structured facts", () => {
   it("uses stable fact ids while preserving typed legacy aliases", () => {
@@ -27,5 +29,29 @@ describe("environment air structured facts", () => {
     expect(tableFact?.legacyIds.some((id) => /^fact:\d+$/.test(id))).toBe(true);
     expect(tableFact?.legacyIds.some((id) => /^fact:\d+:[a-z_]+$/.test(id))).toBe(true);
     expect(tableFact?.provenance).toBe("table");
+  });
+
+  it("dedupes repeated structured facts with the same stable id", () => {
+    const block: DocumentStructureBlock = {
+      id: "source-1:table_row:1",
+      kind: "table_row",
+      sourceId: "source-1",
+      sectionPath: ["表 1 空气质量分指数限值"],
+      tableNo: "表 1",
+      rowIndex: 1,
+      cells: ["PM2.5", "0-35 μg/m3", "0-50"],
+      headers: ["污染物", "浓度范围", "IAQI"],
+      rawText: "| PM2.5 | 0-35 μg/m3 | 0-50 |",
+      normalizedText: "PM2.5 0-35 μg/m3 0-50"
+    };
+
+    const facts = structuredFactsFromBlocks({
+      sourceId: "source-1",
+      standardCode: "HJ 633-2012",
+      blocks: [block, { ...block }]
+    });
+
+    expect(facts).toHaveLength(1);
+    expect(facts[0]?.id).toMatch(/^fact:[a-f0-9]{16}$/);
   });
 });

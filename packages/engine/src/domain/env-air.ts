@@ -1,5 +1,5 @@
-import type { ToolRoutingDecision } from "../types.js";
-import { DEFAULT_ENV_AIR_PROFILE, type EnvAirStandardCatalogEntry } from "./env-air-profile.js";
+import type { EnvAirTemporalIntent, ToolRoutingDecision } from "../types.js";
+import { DEFAULT_ENV_AIR_PROFILE, type EnvAirProfile, type EnvAirStandardCatalogEntry } from "./env-air-profile.js";
 
 export interface StandardReference {
   raw: string;
@@ -18,7 +18,9 @@ export interface EnvAirQueryPlan {
   expandedTerms: string[];
   pinnedStandards: string[];
   rankingSignals: string[];
+  matchedIntentRules: string[];
   currentBasisIntent: boolean;
+  temporalIntent: EnvAirTemporalIntent;
   dataToolHints: string[];
   stages: Array<{
     name: string;
@@ -38,15 +40,6 @@ export const ENV_AIR_STANDARD_CATALOG: EnvAirStandardCatalogEntry[] = DEFAULT_EN
 const ENV_AIR_TERMS = DEFAULT_ENV_AIR_PROFILE.envTerms;
 const TERM_ALIASES: Record<string, string[]> = DEFAULT_ENV_AIR_PROFILE.termAliases;
 const POLLUTANT_FOCUS_TERMS: Record<string, string[]> = DEFAULT_ENV_AIR_PROFILE.pollutantFocusTerms;
-const DATA_OBJECT_TERMS = DEFAULT_ENV_AIR_PROFILE.dataObjectTerms;
-const DATA_TIME_TERMS = DEFAULT_ENV_AIR_PROFILE.dataTimeTerms;
-const DATA_LOCATION_TERMS = DEFAULT_ENV_AIR_PROFILE.dataLocationTerms;
-const DATA_OPERATION_TERMS = DEFAULT_ENV_AIR_PROFILE.dataOperationTerms;
-const EXPLICIT_DATA_TOOL_TERMS = DEFAULT_ENV_AIR_PROFILE.explicitDataToolTerms;
-const KNOWLEDGE_OPERATION_TERMS = DEFAULT_ENV_AIR_PROFILE.knowledgeOperationTerms;
-const KNOWLEDGE_HINTS = DEFAULT_ENV_AIR_PROFILE.knowledgeHints;
-const CURRENT_BASIS_HINTS = DEFAULT_ENV_AIR_PROFILE.currentBasisHints;
-const AUTHORITY_BOUNDARY_HINTS = DEFAULT_ENV_AIR_PROFILE.authorityBoundaryHints;
 
 function normalizeSpace(value: string): string {
   return value.replace(/\s+/g, " ").trim();
@@ -126,9 +119,12 @@ export function standardIdentityKey(value: StandardReference | string | undefine
   return `${ref.family} ${ref.number}`;
 }
 
-export function canonicalTitleForStandard(value: StandardReference | string | undefined): string | undefined {
+export function canonicalTitleForStandard(
+  value: StandardReference | string | undefined,
+  profile: EnvAirProfile = DEFAULT_ENV_AIR_PROFILE
+): string | undefined {
   const identity = standardIdentityKey(value);
-  return ENV_AIR_STANDARD_CATALOG.find((entry) => entry.identity === identity)?.title;
+  return profile.standardCatalog.find((entry) => entry.identity === identity)?.title;
 }
 
 export function standardAliasGroupsForQuery(query: string): string[][] {
@@ -170,9 +166,9 @@ export function standardRefsForExactRetrieval(plan: EnvAirQueryPlan): StandardRe
   return output;
 }
 
-export function inferCurrentBasisIntent(query: string): boolean {
+export function inferCurrentBasisIntent(query: string, profile: EnvAirProfile = DEFAULT_ENV_AIR_PROFILE): boolean {
   const compact = query.toLowerCase().replace(/\s+/g, "");
-  return CURRENT_BASIS_HINTS.some((hint) => compact.includes(hint.toLowerCase().replace(/\s+/g, "")));
+  return profile.currentBasisHints.some((hint) => compact.includes(hint.toLowerCase().replace(/\s+/g, "")));
 }
 
 export function standardSearchTokens(references: StandardReference[]): string[] {
@@ -235,10 +231,10 @@ function includesAnyTerm(text: string, terms: string[]): boolean {
   return terms.some((term) => compact.includes(term.toLowerCase().replace(/\s+/g, "")));
 }
 
-function pollutantFocus(query: string): string[] {
+function pollutantFocus(query: string, profile: EnvAirProfile = DEFAULT_ENV_AIR_PROFILE): string[] {
   const compact = query.toLowerCase().replace(/\s+/g, "");
   const pollutants: string[] = [];
-  for (const [canonical, aliases] of Object.entries(TERM_ALIASES)) {
+  for (const [canonical, aliases] of Object.entries(profile.termAliases)) {
     if (aliases.some((alias) => compact.includes(alias.toLowerCase().replace(/\s+/g, "")))) {
       pollutants.push(canonical);
     }
@@ -259,30 +255,66 @@ export function pollutantFocusTermsForQuery(query: string, pollutants: string[] 
   return uniqueCompact([...terms, "浓度限值", "一级", "二级", "表"]);
 }
 
-export function inferAuthorityBoundaryIntent(query: string): boolean {
+export function inferAuthorityBoundaryIntent(query: string, profile: EnvAirProfile = DEFAULT_ENV_AIR_PROFILE): boolean {
   const compact = query.toLowerCase().replace(/\s+/g, "");
-  return AUTHORITY_BOUNDARY_HINTS.some((hint) => compact.includes(hint.toLowerCase().replace(/\s+/g, "")));
+  return profile.authorityBoundaryHints.some((hint) => compact.includes(hint.toLowerCase().replace(/\s+/g, "")));
 }
 
-export function buildEnvAirQueryPlan(query: string): EnvAirQueryPlan {
+export function inferEnvAirTemporalIntent(
+  query: string,
+  options: { asOfDate?: string; evaluationPeriod?: string; evaluationYear?: number } = {},
+  profile: EnvAirProfile = DEFAULT_ENV_AIR_PROFILE
+): EnvAirTemporalIntent {
+  const currentIntent = inferCurrentBasisIntent(query, profile);
+  const historicalIntent = /(当时|彼时|历史|旧版|老版|废止|替代|代替|版本|沿革|演化)/u.test(query);
+  const explicitYear = options.evaluationYear ?? Number(query.match(/(?:^|[^\d])((?:19|20)\d{2})\s*年/u)?.[1] ?? NaN);
+  const hasEvaluationContext = /(评价|年均|年平均|报告|考核|达标|期间|年度)/u.test(query) || Boolean(options.evaluationPeriod);
+  const evaluationPeriodYear = Number.isFinite(explicitYear) && hasEvaluationContext ? explicitYear : undefined;
+  const asOfYear = options.asOfDate?.match(/^(\d{4})/)?.[1];
+  const mode: EnvAirTemporalIntent["mode"] = evaluationPeriodYear
+    ? "evaluation_period"
+    : historicalIntent
+      ? "historical_as_of"
+      : currentIntent
+        ? "current_now"
+        : "unspecified";
+  return {
+    ...(options.asOfDate ? { asOfDate: options.asOfDate } : {}),
+    ...(asOfYear ? { asOfYear: Number(asOfYear) } : {}),
+    ...(options.evaluationPeriod ? { evaluationPeriod: options.evaluationPeriod } : {}),
+    ...(evaluationPeriodYear ? { evaluationPeriodYear } : {}),
+    mode,
+    ...(currentIntent && evaluationPeriodYear ? { conflict: "current_vs_evaluation_period" as const } : {}),
+    ...(currentIntent && historicalIntent ? { conflict: "current_vs_historical_version" as const } : {})
+  };
+}
+
+export function buildEnvAirQueryPlan(
+  query: string,
+  profile: EnvAirProfile = DEFAULT_ENV_AIR_PROFILE,
+  options: { asOfDate?: string; evaluationPeriod?: string; evaluationYear?: number } = {}
+): EnvAirQueryPlan {
   const normalizedQuery = query
     .replace(STANDARD_DASH_PATTERN, "-")
     .replace(/\bpm\s*2\s*\.?\s*5\b/gi, "PM2.5")
     .replace(/\bpm\s*1\s*0\b/gi, "PM10")
     .trim();
   const standardRefs = extractStandardReferences(normalizedQuery);
-  const pollutants = pollutantFocus(normalizedQuery);
+  const pollutants = pollutantFocus(normalizedQuery, profile);
   const expandedTerms: string[] = [];
   const pinnedStandards: string[] = [];
   const rankingSignals: string[] = [];
+  const matchedIntentRules: string[] = [];
 
   if (standardRefs.length) {
     pinnedStandards.push(...standardRefs.map((ref) => ref.normalized));
-    expandedTerms.push(...standardRefs.map((ref) => canonicalTitleForStandard(ref)).filter((item): item is string => Boolean(item)));
+    expandedTerms.push(
+      ...standardRefs.map((ref) => canonicalTitleForStandard(ref, profile)).filter((item): item is string => Boolean(item))
+    );
     rankingSignals.push("explicit_standard_reference");
   }
 
-  for (const rule of [...DEFAULT_ENV_AIR_PROFILE.intentRules].sort((left, right) => right.priority - left.priority)) {
+  for (const rule of [...profile.intentRules].sort((left, right) => right.priority - left.priority)) {
     const textMatched = !rule.anyText?.length || includesAnyTerm(normalizedQuery, rule.anyText);
     const pollutantMatched = rule.anyPollutant !== true || pollutants.length > 0;
     if (!textMatched || !pollutantMatched) {
@@ -291,6 +323,13 @@ export function buildEnvAirQueryPlan(query: string): EnvAirQueryPlan {
     expandedTerms.push(...(rule.expandedTerms ?? []));
     pinnedStandards.push(...(rule.pinnedStandards ?? []));
     rankingSignals.push(...(rule.rankingSignals ?? []));
+    matchedIntentRules.push(rule.id);
+  }
+  const temporalIntent = inferEnvAirTemporalIntent(normalizedQuery, options, profile);
+  if (temporalIntent.mode === "evaluation_period") {
+    rankingSignals.push("evaluation_period_question");
+  } else if (temporalIntent.mode === "historical_as_of") {
+    rankingSignals.push("historical_as_of_question");
   }
 
   return {
@@ -299,8 +338,10 @@ export function buildEnvAirQueryPlan(query: string): EnvAirQueryPlan {
     expandedTerms: uniqueCompact(expandedTerms),
     pinnedStandards: uniqueCompact(pinnedStandards),
     rankingSignals: uniqueCompact(rankingSignals),
-    currentBasisIntent: inferCurrentBasisIntent(normalizedQuery),
-    dataToolHints: buildEnvironmentDataToolHints(normalizedQuery),
+    matchedIntentRules: uniqueCompact(matchedIntentRules),
+    currentBasisIntent: inferCurrentBasisIntent(normalizedQuery, profile),
+    temporalIntent,
+    dataToolHints: buildEnvironmentDataToolHints(normalizedQuery, profile),
     stages: []
   };
 }
@@ -314,15 +355,16 @@ function matchedTerms(question: string, terms: string[]): string[] {
   return terms.filter((term) => compact.includes(term.toLowerCase().replace(/\s+/g, "")));
 }
 
-export function classifyEnvAirToolRouting(question: string): ToolRoutingDecision {
-  const dataObjects = matchedTerms(question, DATA_OBJECT_TERMS);
-  const dataTimes = matchedTerms(question, DATA_TIME_TERMS);
-  const dataLocations = matchedTerms(question, DATA_LOCATION_TERMS);
-  const dataOperations = matchedTerms(question, DATA_OPERATION_TERMS);
-  const explicitDataTools = matchedTerms(question, EXPLICIT_DATA_TOOL_TERMS);
+export function classifyEnvAirToolRouting(question: string, profile: EnvAirProfile = DEFAULT_ENV_AIR_PROFILE): ToolRoutingDecision {
+  const dataObjects = matchedTerms(question, profile.dataObjectTerms);
+  const dataTimes = matchedTerms(question, profile.dataTimeTerms);
+  const dataLocations = matchedTerms(question, profile.dataLocationTerms);
+  const dataOperations = matchedTerms(question, profile.dataOperationTerms);
+  const explicitDataTools = matchedTerms(question, profile.explicitDataToolTerms);
+  const basisOnlySignals = matchedTerms(question, profile.basisOnlyTerms);
   const knowledgeSignals = uniqueCompact([
-    ...matchedTerms(question, KNOWLEDGE_HINTS),
-    ...matchedTerms(question, KNOWLEDGE_OPERATION_TERMS),
+    ...matchedTerms(question, profile.knowledgeHints),
+    ...matchedTerms(question, profile.knowledgeOperationTerms),
     ...extractStandardReferences(question).map((ref) => ref.normalized)
   ]);
   const dataSignals = uniqueCompact([...dataObjects, ...dataTimes, ...dataLocations, ...dataOperations, ...explicitDataTools]);
@@ -330,7 +372,10 @@ export function classifyEnvAirToolRouting(question: string): ToolRoutingDecision
   const hasConcreteDataObject = dataObjects.length > 0;
   const hasDataFrame = dataTimes.length > 0 || dataLocations.length > 0;
   const hasDataOperation = dataOperations.length > 0;
-  const wantsData = hasExplicitDataTool || hasConcreteDataObject || (hasDataFrame && hasDataOperation);
+  const actualDataAction =
+    hasExplicitDataTool || /实测|实际监测|监测数据|原始数据|站点数据|是否超标|排名|同比|环比|过程分析|异常|查询|统计/u.test(question);
+  const basisOnlyQuestion = basisOnlySignals.length > 0 && !actualDataAction;
+  const wantsData = !basisOnlyQuestion && (hasExplicitDataTool || hasConcreteDataObject || (hasDataFrame && hasDataOperation));
   const wantsKnowledge = knowledgeSignals.length > 0;
   const reasons: string[] = [];
   if (wantsKnowledge) {
@@ -338,10 +383,14 @@ export function classifyEnvAirToolRouting(question: string): ToolRoutingDecision
   }
   if (hasExplicitDataTool) {
     reasons.push("explicit_environment_data_mcp_request");
+  } else if (basisOnlyQuestion) {
+    reasons.push("basis_only_question");
   } else if (hasConcreteDataObject) {
     reasons.push("monitoring_data_object_present");
   } else if (hasDataFrame && hasDataOperation) {
     reasons.push("data_time_or_location_plus_operation");
+  } else if (hasDataFrame) {
+    reasons.push("temporal_context_without_data_request");
   }
   if (!wantsData && dataSignals.length) {
     reasons.push("data_terms_without_concrete_monitoring_request");
@@ -357,8 +406,8 @@ export function classifyEnvAirToolRouting(question: string): ToolRoutingDecision
   };
 }
 
-export function buildEnvironmentDataToolHints(question: string): string[] {
-  const routing = classifyEnvAirToolRouting(question);
+export function buildEnvironmentDataToolHints(question: string, profile: EnvAirProfile = DEFAULT_ENV_AIR_PROFILE): string[] {
+  const routing = classifyEnvAirToolRouting(question, profile);
   if (routing.finalNextTool === "knowledge_base") {
     return [];
   }

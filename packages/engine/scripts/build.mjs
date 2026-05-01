@@ -4,15 +4,35 @@ import path from "node:path";
 import process from "node:process";
 import { spawnSync } from "node:child_process";
 
+function executable(command) {
+  return process.platform === "win32" && !/\.(cmd|exe|bat)$/i.test(command) ? `${command}.cmd` : command;
+}
+
 function run(command, args, cwd) {
-  const result = spawnSync(command, args, {
+  const result = spawnSync(executable(command), args, {
     cwd,
-    stdio: "inherit",
-    shell: process.platform === "win32"
+    stdio: "inherit"
   });
   if (result.status !== 0) {
-    throw new Error(`${command} ${args.join(" ")} failed with exit code ${result.status ?? "unknown"}`);
+    const detail = result.error ? `: ${result.error.message}` : "";
+    throw new Error(`${command} ${args.join(" ")} failed with exit code ${result.status ?? "unknown"}${detail}`);
   }
+}
+
+function runPnpm(args, cwd) {
+  const pnpmCli = process.env.npm_execpath;
+  if (pnpmCli && /pnpm/i.test(pnpmCli)) {
+    const result = spawnSync(process.execPath, [pnpmCli, ...args], {
+      cwd,
+      stdio: "inherit"
+    });
+    if (result.status !== 0) {
+      const detail = result.error ? `: ${result.error.message}` : "";
+      throw new Error(`pnpm ${args.join(" ")} failed with exit code ${result.status ?? "unknown"}${detail}`);
+    }
+    return;
+  }
+  run("pnpm", args, cwd);
 }
 
 async function copyDirectoryContents(sourceDir, targetDir) {
@@ -29,11 +49,11 @@ const distDir = path.resolve(cwd, "dist");
 const viewerTargetDir = path.join(distDir, "viewer");
 
 if (!existsSync(viewerDistIndex)) {
-  run("pnpm", ["--dir", "../viewer", "build"], cwd);
+  runPnpm(["--dir", "../viewer", "build"], cwd);
 }
 
-run("pnpm", ["exec", "tsup", "src/index.ts", "--format", "esm", "--dts"], cwd);
-run("pnpm", ["exec", "tsup", "--config", "tsup.hooks.config.ts"], cwd);
+runPnpm(["exec", "tsup", "src/index.ts", "--format", "esm", "--dts"], cwd);
+runPnpm(["exec", "tsup", "--config", "tsup.hooks.config.ts"], cwd);
 
 await rm(viewerTargetDir, { recursive: true, force: true });
 await copyDirectoryContents(viewerDistDir, viewerTargetDir);

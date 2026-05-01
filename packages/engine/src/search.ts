@@ -993,7 +993,7 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
     return [];
   }
   const currentBasisIntent =
-    inferCurrentBasisIntent(normalizedQuery) ||
+    (options.domainProfile ? inferCurrentBasisIntent(normalizedQuery, options.domainProfile) : inferCurrentBasisIntent(normalizedQuery)) ||
     options.requireCurrentBasis === true ||
     options.intent === "current_basis" ||
     options.intent === "report_writing";
@@ -1006,6 +1006,7 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
   const explicitStandardNumber = explicitStandard?.number ?? "";
   const explicitStandardYear = explicitStandard?.year ?? "";
   const ambientLimitIntent = domainPlan.rankingSignals.includes("ambient_air_quality_limit_question");
+  const assessmentValidityIntent = domainPlan.rankingSignals.includes("ambient_air_assessment_validity_question");
   const amendmentIntent = /修改单|amendment/i.test(normalizedQuery);
   const DatabaseSync = getDatabaseSync();
   const db = withSuppressedSqliteExperimentalWarning(() => new DatabaseSync(dbPath, { readOnly: true }));
@@ -1263,6 +1264,12 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
           ELSE 0
         END,
         CASE
+          WHEN ${assessmentValidityIntent ? 1 : 0} = 1 AND pages.evidence_role = 'current_authority' AND pages.document_role = 'standard' THEN 0
+          WHEN ${assessmentValidityIntent ? 1 : 0} = 1 AND pages.authority_layer IN ('core', 'method', 'local') THEN 1
+          WHEN ${assessmentValidityIntent ? 1 : 0} = 1 THEN 2
+          ELSE 0
+        END,
+        CASE
           WHEN ${ambientLimitIntent ? 1 : 0} = 1 AND pages.evidence_role = 'current_authority' AND pages.document_role = 'standard' THEN 0
           WHEN ${ambientLimitIntent ? 1 : 0} = 1 AND pages.authority_layer IN ('core', 'method', 'local') THEN 1
           WHEN ${ambientLimitIntent ? 1 : 0} = 1 THEN 2
@@ -1350,8 +1357,14 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
       }
       return -100;
     }
-    if ((ambientLimitIntent || retrievalStage === "structured_fact") && retrievalStage === "structured_fact") {
+    if ((ambientLimitIntent || assessmentValidityIntent || retrievalStage === "structured_fact") && retrievalStage === "structured_fact") {
       return -95;
+    }
+    if (assessmentValidityIntent && (evidenceRole === "current_authority" || authorityLayer === "core" || authorityLayer === "method")) {
+      if (documentRole === "standard" || retrievalStage === "structured_fact") {
+        return -92;
+      }
+      return -72;
     }
     if (ambientLimitIntent && (evidenceRole === "current_authority" || authorityLayer === "core" || authorityLayer === "method")) {
       if (documentRole === "standard" || retrievalStage === "structured_fact") {
@@ -1384,8 +1397,14 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
       const isAmbientLimitTarget =
         ambientLimitIntent &&
         (String(row.evidenceRole ?? "") === "current_authority" || String(row.authorityLayer ?? "") === "core" || standardCode.length > 0);
+      const isAssessmentValidityTarget =
+        assessmentValidityIntent &&
+        (String(row.evidenceRole ?? "") === "current_authority" ||
+          String(row.authorityLayer ?? "") === "core" ||
+          String(row.authorityLayer ?? "") === "method" ||
+          standardCode.length > 0);
       const isAmendmentTarget = amendmentIntent && (title.includes("修改单") || standardCode.includes("修改单"));
-      if (!isAmbientLimitTarget && !isAmendmentTarget) {
+      if (!isAmbientLimitTarget && !isAssessmentValidityTarget && !isAmendmentTarget) {
         return false;
       }
       if (!row.chunkId) {
@@ -1394,15 +1413,26 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
       if (isAmbientLimitTarget) {
         return !hasUsefulAmbientLimitSnippet(snippet, normalizedQuery);
       }
+      if (isAssessmentValidityTarget) {
+        return !/(数据有效性|有效数据|有效监测数据|评价项目|评价方法|达标评价)/u.test(snippet);
+      }
       return isAmendmentTarget && !hasUsefulAmendmentSnippet(snippet);
     });
     if (!targetRows.length) {
       return;
     }
     const ambientTerms = pollutantFocusTermsForQuery(normalizedQuery);
+    const assessmentValidityTerms = uniqueCompact([
+      ...domainPlan.expandedTerms,
+      "数据有效性",
+      "有效数据",
+      "有效监测数据",
+      "评价项目",
+      "评价方法"
+    ]);
     const amendmentTerms = uniqueCompact([...domainPlan.expandedTerms, "修改单", "修订", "替换"]);
     for (const row of targetRows) {
-      const terms = ambientLimitIntent ? ambientTerms : amendmentTerms;
+      const terms = assessmentValidityIntent ? assessmentValidityTerms : ambientLimitIntent ? ambientTerms : amendmentTerms;
       const statement = db.prepare(`
         SELECT id, ordinal, heading, kind, location, text
         FROM chunks
@@ -1416,13 +1446,15 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
           const text = String(chunk.text ?? "");
           const kind = String(chunk.kind ?? "");
           const matchScore = terms.reduce((score, term) => score + (text.includes(term) ? 1 : 0), 0);
-          const domainScore = ambientLimitIntent
-            ? (includesFocusTerm(text, ambientTerms) ? 6 : 0) +
-              (/(年平均|日平均|1小时平均|日最大8小时平均)/.test(text) ? 4 : 0) +
-              (text.includes("浓度限值") || text.includes("一级") || text.includes("二级") ? 3 : 0)
-            : (text.includes("修改单") ? 5 : 0) +
-              amendmentTerms.reduce((score, term) => score + (text.includes(term) ? 2 : 0), 0) +
-              (hasUsefulAmendmentSnippet(sourceExcerptBody(text)) ? 8 : 0);
+          const domainScore = assessmentValidityIntent
+            ? (/(数据有效性|有效数据|有效监测数据)/u.test(text) ? 8 : 0) + (/(评价项目|评价方法|达标评价|年评价)/u.test(text) ? 5 : 0)
+            : ambientLimitIntent
+              ? (includesFocusTerm(text, ambientTerms) ? 6 : 0) +
+                (/(年平均|日平均|1小时平均|日最大8小时平均)/.test(text) ? 4 : 0) +
+                (text.includes("浓度限值") || text.includes("一级") || text.includes("二级") ? 3 : 0)
+              : (text.includes("修改单") ? 5 : 0) +
+                amendmentTerms.reduce((score, term) => score + (text.includes(term) ? 2 : 0), 0) +
+                (hasUsefulAmendmentSnippet(sourceExcerptBody(text)) ? 8 : 0);
           const kindScore = kind === "table" || kind === "formula" ? 2 : kind === "paragraph" ? 1 : kind === "heading" ? -1 : 0;
           return { chunk, score: domainScore + matchScore + kindScore, kindScore };
         })
@@ -1444,13 +1476,20 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
       row.chunkLocation = chunk.location;
       row.snippet = focusedChunkSnippet(
         String(chunk.text ?? ""),
-        ambientLimitIntent ? ambientTerms : ["将", "修改为", "结果表示", "按式", "式中"]
+        assessmentValidityIntent
+          ? assessmentValidityTerms
+          : ambientLimitIntent
+            ? ambientTerms
+            : ["将", "修改为", "结果表示", "按式", "式中"]
       );
       row.retrievalStage = row.retrievalStage ?? "chunk_fts";
     }
   }
 
   try {
+    const factBoostExpression = assessmentValidityIntent
+      ? "bm25(fact_search) - CASE facts.fact_type WHEN 'validity_rule' THEN 5.0 WHEN 'limit_value' THEN 2.0 WHEN 'formula' THEN 1.5 WHEN 'technical_parameter' THEN 1.0 ELSE 0 END"
+      : "bm25(fact_search) - CASE facts.fact_type WHEN 'limit_value' THEN 4.0 WHEN 'formula' THEN 3.0 WHEN 'technical_parameter' THEN 2.0 ELSE 0 END";
     if (hasExactStandards) {
       for (const exactStandard of exactStandards) {
         if (rows.length >= candidateLimit) {
@@ -1499,7 +1538,7 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
         appendOrderParams(params);
         params.push(candidateLimit - rows.length);
         const statement = db.prepare(`
-          ${selectedFactColumns("bm25(fact_search) - CASE facts.fact_type WHEN 'limit_value' THEN 4.0 WHEN 'formula' THEN 3.0 WHEN 'technical_parameter' THEN 2.0 ELSE 0 END", "snippet(fact_search, 0, '[', ']', '...', 28)")}
+          ${selectedFactColumns(factBoostExpression, "snippet(fact_search, 0, '[', ']', '...', 28)")}
           FROM fact_search
           JOIN facts ON facts.rowid = fact_search.rowid
           JOIN pages ON pages.id = facts.page_id

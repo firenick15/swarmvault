@@ -37,6 +37,7 @@ export interface EnvAirProfile {
   explicitDataToolTerms: string[];
   knowledgeOperationTerms: string[];
   knowledgeHints: string[];
+  basisOnlyTerms: string[];
   currentBasisHints: string[];
   limitHints: string[];
   aqiHints: string[];
@@ -197,6 +198,7 @@ export const DEFAULT_ENV_AIR_PROFILE: EnvAirProfile = {
   dataLocationTerms: ["站点", "国控站", "省控站", "城市", "区域", "区县", "省", "市"],
   dataOperationTerms: ["查询", "统计", "排名", "同比", "环比", "趋势", "过程分析", "达标率", "超标天数", "连续负值", "异常诊断"],
   explicitDataToolTerms: ["数据mcp", "环境数据mcp", "监测数据mcp", "调用数据"],
+  basisOnlyTerms: ["依据", "标准编号", "适用标准", "采用哪些标准", "评价方法", "计算口径", "技术依据", "报告依据"],
   knowledgeOperationTerms: [
     "标准",
     "规范",
@@ -252,6 +254,14 @@ export const DEFAULT_ENV_AIR_PROFILE: EnvAirProfile = {
     "是否强制"
   ],
   intentRules: [
+    {
+      id: "ambient_air_assessment_validity_question",
+      priority: 110,
+      anyText: ["数据有效性", "有效数据", "有效性要求", "有效监测数据", "评价数据", "达标评价有效性", "评价有效性"],
+      expandedTerms: ["HJ 663", "HJ 663-2026", "环境空气质量评价技术规范", "数据有效性", "有效监测数据", "评价项目和评价方法"],
+      pinnedStandards: ["HJ 663", "HJ 663-2026"],
+      rankingSignals: ["ambient_air_assessment_validity_question"]
+    },
     {
       id: "ambient_air_quality_limit_question",
       priority: 100,

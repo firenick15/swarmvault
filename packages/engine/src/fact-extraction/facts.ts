@@ -108,13 +108,18 @@ export function structuredFactsFromBlocks(input: {
     input.standardCode || input.standardRefs?.[0]?.normalized || extractStandardReferences(input.blocks[0]?.rawText ?? "")[0]?.normalized;
   const standardIdentity = standardCode ? standardIdentityKey(standardCode) : undefined;
   const facts: StructuredFact[] = [];
+  const seenStableIds = new Set<string>();
   input.blocks.forEach((block) => {
     const kind = classifyFactKind(block);
     if (kind === "other" && block.kind !== "table_row" && block.kind !== "formula") {
       return;
     }
+    const stableId = stableFactId({ sourceId: input.sourceId, block, standardCode, ordinal: facts.length + 1 });
+    if (seenStableIds.has(stableId)) {
+      return;
+    }
+    seenStableIds.add(stableId);
     const ordinal = facts.length + 1;
-    const stableId = stableFactId({ sourceId: input.sourceId, block, standardCode, ordinal });
     const fact: StructuredFact = {
       id: stableId,
       ordinal,

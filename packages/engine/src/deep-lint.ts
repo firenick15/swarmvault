@@ -8,8 +8,9 @@ import { normalizeFindingSeverity } from "./findings.js";
 import { listManifests } from "./ingest.js";
 import { runConfiguredRoles, summarizeRoleQuestions } from "./orchestration.js";
 import { getProviderForTask } from "./providers/registry.js";
+import { normalizeDeepLintCode } from "./providers/structured-repair.js";
 import { loadVaultSchema } from "./schema.js";
-import type { GraphArtifact, LintFinding } from "./types.js";
+import type { GraphArtifact, LintFinding, OrchestrationRole } from "./types.js";
 import { normalizeWhitespace, readJsonFile, truncate, uniqueBy } from "./utils.js";
 import { getWebSearchAdapterForTask } from "./web-search/registry.js";
 
@@ -18,15 +19,8 @@ const deepLintResponseSchema = z.object({
     .array(
       z.object({
         severity: z.string().optional().default("info"),
-        code: z.enum([
-          "coverage_gap",
-          "contradiction_candidate",
-          "contradiction",
-          "missing_citation",
-          "candidate_page",
-          "follow_up_question"
-        ]),
-        message: z.string().min(1),
+        code: z.string().min(1),
+        message: z.coerce.string().min(1),
         relatedSourceIds: z.array(z.string()).default([]),
         relatedPageIds: z.array(z.string()).default([]),
         suggestedQuery: z.string().optional()
@@ -47,6 +41,18 @@ type DeepLintContextPage = {
 type StandardInventory = {
   byIdentity: Map<string, Array<{ pageId: string; title: string; path: string; legalStatus?: string; authorityLayer?: string }>>;
 };
+
+async function runConfiguredRolesSafely(
+  rootDir: string,
+  roles: OrchestrationRole[],
+  input: Parameters<typeof runConfiguredRoles>[2]
+): Promise<Awaited<ReturnType<typeof runConfiguredRoles>>> {
+  try {
+    return await runConfiguredRoles(rootDir, roles, input);
+  } catch {
+    return [];
+  }
+}
 
 function isUnknown(value: unknown): boolean {
   return typeof value !== "string" || !value.trim() || value.trim() === "unknown";
@@ -431,72 +437,104 @@ export async function runDeepLint(
     findings = [...deterministicFindings, ...heuristicDeepFindings(contextPages, structuralFindings, graph)];
   } else {
     const graphSummary = graphContextSummary(graph);
-    const response = await provider.generateStructured(
-      {
-        system:
-          "You are an auditor for a local-first LLM knowledge vault. Return advisory findings only. Do not propose direct file edits.",
-        prompt: [
-          "Review this SwarmVault state and return high-signal advisory findings.",
-          "Look for claims that contradict each other across different sources. When you find a genuine contradiction, use code 'contradiction' and include both source IDs in relatedSourceIds.",
-          "",
-          "Schema:",
-          schema.content,
-          "",
-          "Vault summary:",
-          `- sources: ${manifests.length}`,
-          `- pages: ${graph.pages.length}`,
-          `- structural_findings: ${structuralFindings.length}`,
-          `- communities: ${graphSummary.communities.length}`,
-          `- god_nodes: ${graphSummary.godNodes.length}`,
-          "",
-          "Structural findings:",
-          structuralFindings.map((item) => `- [${item.severity}] ${item.code}: ${item.message}`).join("\n") || "- none",
-          "",
-          "Graph metrics:",
-          graphSummary.communities.length
-            ? graphSummary.communities.map((community) => `- ${community.label}: ${community.size} node(s)`).join("\n")
-            : "- no derived communities",
-          graphSummary.godNodes.length
-            ? [
-                "",
-                "God nodes:",
-                ...graphSummary.godNodes.map((node) => `- ${node.label} (degree=${node.degree}, bridge=${node.bridgeScore})`)
-              ].join("\n")
-            : "",
-          "",
-          "Page context:",
-          contextPages
-            .map((page) =>
-              [
-                `## ${page.title}`,
-                `page_id: ${page.id}`,
-                `path: ${page.path}`,
-                `kind: ${page.kind}`,
-                `source_ids: ${page.sourceIds.join(",") || "none"}`,
-                page.excerpt
-              ].join("\n")
-            )
-            .join("\n\n---\n\n")
-        ].join("\n")
-      },
-      deepLintResponseSchema
-    );
+    const repairWarnings: string[] = [];
+    try {
+      const response = await provider.generateStructured(
+        {
+          system:
+            "You are an auditor for a local-first LLM knowledge vault. Return advisory findings only. Do not propose direct file edits.",
+          prompt: [
+            "Review this SwarmVault state and return high-signal advisory findings.",
+            "Look for claims that contradict each other across different sources. When you find a genuine contradiction, use code 'contradiction' and include both source IDs in relatedSourceIds.",
+            "Use only these finding code families when possible: coverage_gap, contradiction_candidate, contradiction, missing_citation, candidate_page, follow_up_question.",
+            "",
+            "Schema:",
+            schema.content,
+            "",
+            "Vault summary:",
+            `- sources: ${manifests.length}`,
+            `- pages: ${graph.pages.length}`,
+            `- structural_findings: ${structuralFindings.length}`,
+            `- communities: ${graphSummary.communities.length}`,
+            `- god_nodes: ${graphSummary.godNodes.length}`,
+            "",
+            "Structural findings:",
+            structuralFindings.map((item) => `- [${item.severity}] ${item.code}: ${item.message}`).join("\n") || "- none",
+            "",
+            "Graph metrics:",
+            graphSummary.communities.length
+              ? graphSummary.communities.map((community) => `- ${community.label}: ${community.size} node(s)`).join("\n")
+              : "- no derived communities",
+            graphSummary.godNodes.length
+              ? [
+                  "",
+                  "God nodes:",
+                  ...graphSummary.godNodes.map((node) => `- ${node.label} (degree=${node.degree}, bridge=${node.bridgeScore})`)
+                ].join("\n")
+              : "",
+            "",
+            "Page context:",
+            contextPages
+              .map((page) =>
+                [
+                  `## ${page.title}`,
+                  `page_id: ${page.id}`,
+                  `path: ${page.path}`,
+                  `kind: ${page.kind}`,
+                  `source_ids: ${page.sourceIds.join(",") || "none"}`,
+                  page.excerpt
+                ].join("\n")
+              )
+              .join("\n\n---\n\n")
+          ].join("\n")
+        },
+        deepLintResponseSchema,
+        { schemaName: "deep_lint", repairWarnings }
+      );
 
-    findings = [
-      ...deterministicFindings,
-      ...response.findings.map((item) => ({
-        severity: normalizeFindingSeverity(item.severity),
-        code: item.code,
-        message: item.message,
-        relatedSourceIds: item.relatedSourceIds,
-        relatedPageIds: item.relatedPageIds,
-        suggestedQuery: item.suggestedQuery
-      }))
-    ];
+      findings = [
+        ...deterministicFindings,
+        ...response.findings.map((item) => {
+          const code = normalizeDeepLintCode(item.code);
+          return {
+            severity: normalizeFindingSeverity(item.severity),
+            code,
+            message: item.message,
+            relatedSourceIds: item.relatedSourceIds,
+            relatedPageIds: item.relatedPageIds,
+            suggestedQuery: item.suggestedQuery,
+            metadata: {
+              providerId: provider.id,
+              providerModel: provider.model,
+              rawCode: item.code,
+              normalizedCode: code,
+              repairWarnings
+            }
+          };
+        })
+      ];
+    } catch (error) {
+      findings = [
+        ...deterministicFindings,
+        {
+          severity: "warning",
+          code: "deep_lint_provider_error",
+          message: `Deep lint provider failed; deterministic lint findings were still returned. ${truncate(
+            error instanceof Error ? error.message : String(error),
+            320
+          )}`,
+          metadata: {
+            providerId: provider.id,
+            providerModel: provider.model,
+            providerError: error instanceof Error ? error.message : String(error)
+          }
+        }
+      ];
+    }
   }
 
   if (!options.web) {
-    const roleResults = await runConfiguredRoles(rootDir, ["audit", "safety"], {
+    const roleResults = await runConfiguredRolesSafely(rootDir, ["audit", "safety"], {
       title: "Deep lint review",
       instructions: "Review the vault state and return advisory audit or safety findings only.",
       context: [
@@ -544,7 +582,7 @@ export async function runDeepLint(
     finding.evidence = queryCache.get(query);
   }
 
-  const roleResults = await runConfiguredRoles(rootDir, ["audit", "safety", "research"], {
+  const roleResults = await runConfiguredRolesSafely(rootDir, ["audit", "safety", "research"], {
     title: "Deep lint review with web search",
     instructions: "Review the vault state and return advisory findings, follow-up questions, and safer search angles.",
     context: [

@@ -219,6 +219,44 @@ describe("environment air retrieval", () => {
     expect(results[0]?.snippet).toContain("200");
   });
 
+  it("uses the generalized assessment-validity intent to retrieve validity-rule facts", async () => {
+    const { wikiDir, dbPath } = await createTempWorkspace();
+    const standardPage = graphPage("source:hj663-validity", "HJ 663-2026 环境空气质量评价技术规范", "sources/hj663-validity.md");
+    await writePage(
+      wikiDir,
+      standardPage.path,
+      {
+        authority_layer: "method",
+        legal_status: "current_effective",
+        document_role: "standard",
+        standard_code: "HJ 663-2026",
+        evidence_role: "current_authority"
+      },
+      [
+        "# HJ 663-2026",
+        "",
+        "## 评价项目和评价方法",
+        "",
+        "| 评价项目 | 评价方法 | 数据有效性要求 |",
+        "|---|---|---|",
+        "| PM2.5 年评价 | 年平均浓度评价 | 有效监测数据应满足年评价的有效数据要求 |",
+        "| O3 年评价 | 日最大8小时平均第90百分位数评价 | 有效监测数据应满足百分位数统计要求 |"
+      ].join("\n")
+    );
+    await rebuildSearchIndex(dbPath, [standardPage], wikiDir);
+
+    const results = searchPages(dbPath, "2023 年环境空气质量评价报告的数据有效性要求是什么？", {
+      limit: 5,
+      authorityLayer: ["core", "method"],
+      includeDrafts: false,
+      includeSuperseded: false
+    });
+
+    expect(results[0]?.pageId).toBe("source:hj663-validity");
+    expect(results.some((result) => result.retrievalStage === "structured_fact")).toBe(true);
+    expect(results[0]?.snippet).toMatch(/数据有效性|有效监测数据|有效数据/);
+  });
+
   it("retrieves Chinese monitoring-method questions without malformed FTS failures", async () => {
     const { wikiDir, dbPath } = await createTempWorkspace();
     const page = graphPage("source:auto", "HJ 193 环境空气气态污染物自动监测系统", "sources/auto.md");
@@ -356,6 +394,61 @@ describe("environment air retrieval", () => {
     expect(result.answer).toContain("不能直接作为执法依据");
     expect(result.retrievalDebug?.evidenceItems.some((item) => item.citation.startsWith("schema:"))).toBe(true);
     expect(result.agentDecision?.reportUsability).toBe("direct");
+  });
+
+  it("normalizes provider citations from source or chunk aliases back to evidence ids", async () => {
+    const { rootDir } = await createTempWorkspace();
+    await initVault(rootDir);
+    await fs.writeFile(
+      path.join(rootDir, "alias-query-provider.mjs"),
+      [
+        "export async function createAdapter(id, config) {",
+        "  return {",
+        "    id,",
+        "    type: 'custom',",
+        "    model: config.model,",
+        "    capabilities: new Set(['chat', 'structured']),",
+        "    async generateText() { return { text: 'fallback [E1]' }; },",
+        "    async generateStructured(request) {",
+        "      const citation = request.prompt.match(/\\[E1\\] kind=[^\\n]* citation=([^\\n]+)/)?.[1] || 'E1';",
+        "      return {",
+        "        answer: `环境空气质量标准提供达标评价依据。[" + "$" + "{citation}]`,",
+        "        usedEvidenceIds: [citation],",
+        "        unsupportedClaims: [],",
+        "        missingEvidence: [],",
+        "        recommendedNextTool: 'knowledge_base'",
+        "      };",
+        "    }",
+        "  };",
+        "}"
+      ].join("\n"),
+      "utf8"
+    );
+    await updateConfig(rootDir, (config) => {
+      config.providers.aliasQuery = {
+        type: "custom",
+        model: "alias-query-test",
+        module: "./alias-query-provider.mjs",
+        capabilities: ["chat", "structured"]
+      };
+      config.tasks.queryProvider = "aliasQuery";
+    });
+    await fs.writeFile(path.join(rootDir, "standard.md"), "# GB 3095\n\n环境空气质量标准提供达标评价依据。", "utf8");
+    await ingestInput(rootDir, "standard.md");
+    await compileVault(rootDir);
+
+    const result = await queryVault(rootDir, {
+      question: "环境空气质量标准能否作为达标评价依据？",
+      save: false,
+      strictGrounding: true,
+      debugContext: true
+    });
+
+    expect(result.answer).toContain("[E1]");
+    expect(result.evidenceState).toBe("grounded");
+    expect(result.invalidCitations).toEqual([]);
+    expect(result.retrievalDebug?.usedEvidenceIds).toEqual(["E1"]);
+    expect(result.groundingWarnings?.some((warning) => warning.startsWith("normalized_citation:"))).toBe(true);
   });
 
   it("keeps SO2 data-quality questions in data-MCP handoff instead of strict literal failure", async () => {

@@ -253,13 +253,22 @@ export interface AudioTranscriptionResponse {
   language?: string;
 }
 
+export interface StructuredGenerationOptions {
+  schemaName?: "source_analysis" | "deep_lint" | "grounded_answer" | "topic_synthesis" | string;
+  coercion?: "strict" | "safe";
+  maxRepairAttempts?: number;
+  allowedEvidenceIds?: string[];
+  evidenceIdAliases?: Record<string, string>;
+  repairWarnings?: string[];
+}
+
 export interface ProviderAdapter {
   readonly id: string;
   readonly type: ProviderType;
   readonly model: string;
   readonly capabilities: Set<ProviderCapability>;
   generateText(request: GenerationRequest): Promise<GenerationResponse>;
-  generateStructured<T>(request: GenerationRequest, schema: z.ZodType<T>): Promise<T>;
+  generateStructured<T>(request: GenerationRequest, schema: z.ZodType<T>, options?: StructuredGenerationOptions): Promise<T>;
   dispose?(): Promise<void> | void;
   embedTexts?(texts: string[]): Promise<number[][]>;
   generateImage?(request: ImageGenerationRequest): Promise<ImageGenerationResponse>;
@@ -681,6 +690,8 @@ export interface SourceExtractionArtifact {
   providerModel?: string;
   warnings?: string[];
   pageCount?: number;
+  emptyReason?: string;
+  textProvenance?: "native" | "ocr" | "vision" | "metadata" | "unknown";
   metadata?: Record<string, string>;
   vision?: ImageVisionExtraction;
 }
@@ -920,9 +931,40 @@ export interface SourceAnalysis {
   providerId?: string;
   providerModel?: string;
   warnings?: string[];
+  providerFailures?: Array<{
+    phase: "initial" | "repair" | "compact_retry" | "fallback";
+    error: string;
+    producedAt: string;
+  }>;
   rationales: SourceRationale[];
   code?: CodeAnalysis;
   producedAt: string;
+}
+
+export interface AnalysisStatusEntry {
+  sourceId: string;
+  title: string;
+  analysisMode: SourceAnalysis["analysisMode"] | "missing";
+  providerId?: string;
+  providerModel?: string;
+  warningCount: number;
+  providerFailureCount: number;
+  analysisPath: string;
+}
+
+export interface AnalysisStatusResult {
+  totalSources: number;
+  analyzedSources: number;
+  missingAnalyses: number;
+  byMode: Record<string, number>;
+  fallbackCount: number;
+  entries: AnalysisStatusEntry[];
+}
+
+export interface AnalysisRetryResult {
+  targetSourceIds: string[];
+  deletedAnalysisCount: number;
+  compile: CompileResult;
 }
 
 export type AuthorityLayer = "core" | "method" | "evidence" | "evolution" | "local" | "international" | "project" | "unknown";
@@ -1652,11 +1694,13 @@ export interface RetrievalConfig {
 }
 
 export interface RetrievalManifest {
-  version: 1 | 2;
+  version: 1 | 2 | 3;
   backend: "sqlite";
   generatedAt: string;
   graphGeneratedAt?: string;
   graphHash?: string;
+  indexSchemaHash?: string;
+  indexSchemaVersion?: number;
   shardCount: number;
   shards: Array<{
     id: string;
@@ -1676,6 +1720,7 @@ export interface RetrievalStatus {
   pageCount: number;
   shardCount: number;
   warnings: string[];
+  schemaOk?: boolean;
 }
 
 export interface RetrievalDoctorResult {
@@ -1712,6 +1757,9 @@ export interface QueryOptions {
   scope?: "public_only" | "tenant_only" | "project_only" | "mixed_public_private";
   tenantId?: string;
   projectId?: string;
+  asOfDate?: string;
+  evaluationPeriod?: string;
+  evaluationYear?: number;
   evidenceMode?: "strict" | "balanced" | "exploratory";
   strictGrounding?: boolean;
   debugContext?: boolean;
@@ -1729,6 +1777,15 @@ export interface ToolRoutingDecision {
   dataSignals: string[];
   knowledgeSignals: string[];
   conflictResolvedBy: "deterministic_policy" | "model_agreement" | "fallback";
+}
+
+export interface EnvAirTemporalIntent {
+  asOfDate?: string;
+  asOfYear?: number;
+  evaluationPeriod?: string;
+  evaluationPeriodYear?: number;
+  mode: "current_now" | "historical_as_of" | "evaluation_period" | "unspecified";
+  conflict?: "current_vs_evaluation_period" | "current_vs_historical_version";
 }
 
 export interface AgentDecision {
@@ -1805,11 +1862,14 @@ export interface RetrievalDebugInfo {
 
 export interface QueryRetrievalPlan {
   normalizedQuery: string;
+  profileId?: string;
   intent?: QueryIntent;
   scope?: QueryOptions["scope"];
   standardRefs: string[];
   expandedTerms: string[];
   pinnedStandards: string[];
+  matchedIntentRules?: string[];
+  temporalIntent?: EnvAirTemporalIntent;
   requiredStandards?: string[];
   coveredStandards?: string[];
   missingStandards?: string[];
@@ -1860,6 +1920,7 @@ export interface QueryResult {
     missingStandards: string[];
     authorityPinnedEvidenceCount: number;
   };
+  temporalIntent?: EnvAirTemporalIntent;
   retrievalDebug?: RetrievalDebugInfo;
 }
 
@@ -1872,6 +1933,7 @@ export interface LintFinding {
   relatedPageIds?: string[];
   suggestedQuery?: string;
   evidence?: WebSearchResult[];
+  metadata?: Record<string, unknown>;
 }
 
 export interface InboxImportSkip {

@@ -101,6 +101,8 @@ import { listGuidedSourceSessions, updateGuidedSourceSessionStatus } from "./sou
 import { synthesizeEnvAirTopics } from "./topic-synthesis.js";
 import type {
   AgentMemoryTask,
+  AnalysisRetryResult,
+  AnalysisStatusResult,
   ApprovalBundleType,
   ApprovalChangeType,
   ApprovalDetail,
@@ -206,6 +208,7 @@ type QueryExecutionResult = {
   excludedEvidenceSet?: QueryResult["excludedEvidenceSet"];
   standardCoverage?: QueryResult["standardCoverage"];
   evidenceCompleteness?: QueryResult["evidenceCompleteness"];
+  temporalIntent?: QueryResult["temporalIntent"];
   retrievalDebug?: RetrievalDebugInfo;
 };
 
@@ -4092,10 +4095,14 @@ function buildQuerySearchOptions(queryOptions?: QueryOptions): SearchQueryOption
 
 function inferAnswerBasis(
   options: QueryOptions | undefined,
-  recommendedNextTool: QueryResult["recommendedNextTool"]
+  recommendedNextTool: QueryResult["recommendedNextTool"],
+  temporalIntent?: QueryResult["temporalIntent"]
 ): QueryResult["answerBasis"] {
   if (recommendedNextTool === "environment_data_mcp") {
     return "data_required";
+  }
+  if (temporalIntent?.mode === "historical_as_of" || temporalIntent?.mode === "evaluation_period") {
+    return "historical_or_evolution";
   }
   switch (options?.intent) {
     case "current_basis":
@@ -4322,6 +4329,82 @@ function formatEvidenceSet(evidenceItems: EvidenceItem[]): string {
         .join("\n")
     )
     .join("\n\n---\n\n");
+}
+
+function evidenceIdAliasMap(evidenceItems: EvidenceItem[]): Map<string, string> {
+  const aliases = new Map<string, string>();
+  const addAlias = (alias: string | undefined, id: string): void => {
+    const normalized = alias?.trim();
+    if (!normalized) {
+      return;
+    }
+    aliases.set(normalized, id);
+    aliases.set(normalized.toLowerCase(), id);
+  };
+  for (const item of evidenceItems) {
+    const itemAliases = [
+      item.id,
+      `[${item.id}]`,
+      item.citation,
+      item.pageId,
+      item.sourceId,
+      item.chunkId,
+      item.factId,
+      item.factStableId,
+      ...(item.factLegacyIds ?? []),
+      ...(item.canonicalAliases ?? [])
+    ];
+    if (item.sourceId && item.chunkId) {
+      itemAliases.push(`${item.sourceId}#${item.chunkId}`);
+    }
+    if (item.factOrdinal) {
+      itemAliases.push(`fact:${item.factOrdinal}`);
+      if (item.factType) {
+        itemAliases.push(`fact:${item.factOrdinal}:${item.factType}`);
+      }
+    }
+    for (const factAlias of [item.factId, item.factStableId, ...(item.factLegacyIds ?? [])].filter((alias): alias is string =>
+      Boolean(alias)
+    )) {
+      if (item.sourceId) {
+        itemAliases.push(`${item.sourceId}#${factAlias}`);
+        itemAliases.push(`source:${item.sourceId}:${factAlias}`);
+        if (/^fact:[0-9]+(?::[a-z_]+)?$/i.test(factAlias)) {
+          itemAliases.push(`${item.sourceId}#source:${item.sourceId}:${factAlias}`);
+        }
+      }
+      if (item.pageId) {
+        itemAliases.push(`${item.pageId}#${factAlias}`);
+      }
+    }
+    for (const alias of itemAliases) {
+      addAlias(alias, item.id);
+    }
+  }
+  return aliases;
+}
+
+function normalizeAnswerEvidenceCitations(
+  answer: string,
+  evidenceItems: EvidenceItem[]
+): { answer: string; evidenceIdAliases: Record<string, string>; warnings: string[] } {
+  const aliasMap = evidenceIdAliasMap(evidenceItems);
+  const evidenceIdAliases = Object.fromEntries(aliasMap.entries());
+  const warnings: string[] = [];
+  const normalizedAnswer = answer.replace(/\[([^\][]+)\]/g, (match, raw: string) => {
+    const key = raw.trim();
+    const id = aliasMap.get(key) ?? aliasMap.get(key.toLowerCase());
+    if (!id || key === id) {
+      return match;
+    }
+    warnings.push(`normalized_citation:${truncate(key, 80)}->${id}`);
+    return `[${id}]`;
+  });
+  return {
+    answer: normalizedAnswer,
+    evidenceIdAliases,
+    warnings: uniqueStrings(warnings)
+  };
 }
 
 function parseEvidenceIds(text: string | undefined): string[] {
@@ -4606,17 +4689,24 @@ async function executeQuery(
       .filter((page) => page.kind === "source" && page.sourceIds.length)
       .map((page) => [page.sourceIds[0], page.projectIds[0] ?? null])
   );
+  const queryPlan = buildDomainQueryPlan(question, domainProfile, options.queryOptions);
   const searchOptions = buildQuerySearchOptions(options.queryOptions);
-  const baseToolRouting = classifyEnvAirToolRouting(question);
+  searchOptions.domainProfile = domainProfile;
+  const temporalNeedsHistorical =
+    queryPlan.temporalIntent.mode === "evaluation_period" || queryPlan.temporalIntent.mode === "historical_as_of";
+  if (temporalNeedsHistorical) {
+    searchOptions.includeSuperseded = true;
+  }
+  const baseToolRouting = classifyEnvAirToolRouting(question, domainProfile);
   const recommendedNextTool = baseToolRouting.finalNextTool;
-  const dataToolHints = buildEnvironmentDataToolHints(question);
-  const queryPlan = buildDomainQueryPlan(question, domainProfile);
-  const currentBasisQuery =
+  const dataToolHints = buildEnvironmentDataToolHints(question, domainProfile);
+  const currentBasisIntent =
     options.queryOptions?.intent === "current_basis" ||
     options.queryOptions?.intent === "report_writing" ||
     options.queryOptions?.requireCurrentBasis ||
     queryPlan.currentBasisIntent;
-  if (queryPlan.standardRefs.length > 0 && !currentBasisQuery) {
+  const currentBasisQuery = currentBasisIntent && !temporalNeedsHistorical;
+  if ((queryPlan.standardRefs.length > 0 || temporalNeedsHistorical) && !currentBasisQuery) {
     delete searchOptions.authorityLayer;
     delete searchOptions.documentRole;
     delete searchOptions.legalStatus;
@@ -4649,11 +4739,14 @@ async function executeQuery(
   const requiredStandards = requiredStandardLabels(queryPlan);
   const retrievalPlan: NonNullable<RetrievalDebugInfo["queryPlan"]> = {
     normalizedQuery: queryPlan.normalizedQuery,
+    profileId: domainProfile.id,
     intent: options.queryOptions?.intent,
     scope: options.queryOptions?.scope,
     standardRefs: queryPlan.standardRefs.map((ref) => ref.normalized),
     expandedTerms: queryPlan.expandedTerms,
     pinnedStandards: queryPlan.pinnedStandards,
+    matchedIntentRules: queryPlan.matchedIntentRules,
+    temporalIntent: queryPlan.temporalIntent,
     requiredStandards,
     coveredStandards: [],
     missingStandards: requiredStandards,
@@ -4834,7 +4927,7 @@ async function executeQuery(
       invalidCitations: [],
       recommendedNextTool,
       toolRouting: baseToolRouting,
-      answerBasis: inferAnswerBasis(options.queryOptions, recommendedNextTool),
+      answerBasis: inferAnswerBasis(options.queryOptions, recommendedNextTool, queryPlan.temporalIntent),
       currentStatus: undefined,
       dataToolHints,
       agentDecision: buildAgentDecision({
@@ -4851,6 +4944,7 @@ async function executeQuery(
       supportingEvidenceSet: evidenceLayers.supporting,
       excludedEvidenceSet: evidenceLayers.excluded,
       evidenceCompleteness,
+      temporalIntent: queryPlan.temporalIntent,
       retrievalDebug: options.queryOptions?.debugContext
         ? {
             query: question,
@@ -4893,7 +4987,7 @@ async function executeQuery(
       invalidCitations: [],
       recommendedNextTool,
       toolRouting: baseToolRouting,
-      answerBasis: inferAnswerBasis(options.queryOptions, recommendedNextTool),
+      answerBasis: inferAnswerBasis(options.queryOptions, recommendedNextTool, queryPlan.temporalIntent),
       currentStatus: summarizeCurrentStatus(currentBasisQuery && evidenceLayers.primary.length ? evidenceLayers.primary : evidenceItems),
       dataToolHints,
       agentDecision: buildAgentDecision({
@@ -4910,6 +5004,7 @@ async function executeQuery(
       supportingEvidenceSet: evidenceLayers.supporting,
       excludedEvidenceSet: evidenceLayers.excluded,
       evidenceCompleteness,
+      temporalIntent: queryPlan.temporalIntent,
       retrievalDebug: options.queryOptions?.debugContext
         ? {
             query: question,
@@ -4926,6 +5021,7 @@ async function executeQuery(
   let answer: string;
   let usage: QueryExecutionResult["usage"];
   let structuredAnswer: GroundedAnswer | undefined;
+  const evidenceIdAliases = Object.fromEntries(evidenceIdAliasMap(evidenceItems).entries());
   const providerWarnings: string[] =
     strictMissingTerms.length && !strictMissingShouldBlock ? [`strict_exact_terms_not_found:${strictMissingTerms.join(",")}`] : [];
   if (strictMissingStandards.length && !strictMissingShouldBlock) {
@@ -4991,7 +5087,13 @@ async function executeQuery(
               "Return JSON with: answer, usedEvidenceIds, unsupportedClaims, missingEvidence, recommendedNextTool, standardCoverage, evidenceCompleteness."
             ].join("\n")
           },
-          groundedAnswerSchema
+          groundedAnswerSchema,
+          {
+            schemaName: "grounded_answer",
+            allowedEvidenceIds: evidenceItems.map((item) => item.id),
+            evidenceIdAliases,
+            repairWarnings: providerWarnings
+          }
         );
         answer = structuredAnswer.answer;
         if (answerLooksIncomplete(question, answer)) {
@@ -5023,15 +5125,33 @@ async function executeQuery(
     }
   }
 
+  const normalizedCitations = normalizeAnswerEvidenceCitations(answer, evidenceItems);
+  answer = normalizedCitations.answer;
+  providerWarnings.push(...normalizedCitations.warnings);
   const grounding = evaluateGrounding({ evidenceItems, answer, structured: structuredAnswer });
+  const heuristicGapFillWebEvidence =
+    options.gapFill && provider.type === "heuristic" ? evidenceItems.filter((item) => item.kind === "web") : [];
+  const finalCitations = uniqueBy(
+    [
+      ...grounding.citations,
+      ...heuristicGapFillWebEvidence.map((item) => item.citation).filter((citation): citation is string => Boolean(citation))
+    ],
+    (item) => item
+  );
+  const finalUsedEvidenceIds = uniqueBy(
+    [...grounding.usedEvidenceIds, ...heuristicGapFillWebEvidence.map((item) => item.id)],
+    (item) => item
+  );
   const groundingWarnings = uniqueBy([...grounding.groundingWarnings, ...providerWarnings], (item) => item);
+  const evidenceStateWarnings = groundingWarnings.filter((warning) => !warning.startsWith("normalized_citation:"));
   const evidenceState =
-    grounding.evidenceState === "insufficient" ? "insufficient" : groundingWarnings.length ? "partial" : grounding.evidenceState;
+    grounding.evidenceState === "insufficient" ? "insufficient" : evidenceStateWarnings.length ? "partial" : grounding.evidenceState;
   const finalToolRouting = finalizeToolRouting(baseToolRouting, structuredAnswer?.recommendedNextTool);
+  const finalRecommendedNextTool = finalToolRouting.finalNextTool;
 
   return {
     answer,
-    citations: grounding.citations,
+    citations: finalCitations,
     relatedPageIds,
     relatedNodeIds,
     relatedSourceIds,
@@ -5041,14 +5161,14 @@ async function executeQuery(
     evidenceState,
     groundingWarnings,
     invalidCitations: grounding.invalidCitations,
-    recommendedNextTool,
+    recommendedNextTool: finalRecommendedNextTool,
     toolRouting: finalToolRouting,
-    answerBasis: inferAnswerBasis(options.queryOptions, recommendedNextTool),
+    answerBasis: inferAnswerBasis(options.queryOptions, finalRecommendedNextTool, queryPlan.temporalIntent),
     currentStatus: summarizeCurrentStatus(currentBasisQuery && evidenceLayers.primary.length ? evidenceLayers.primary : evidenceItems),
     dataToolHints,
     agentDecision: buildAgentDecision({
       evidenceState,
-      recommendedNextTool,
+      recommendedNextTool: finalRecommendedNextTool,
       evidenceItems: currentBasisQuery && evidenceLayers.primary.length ? evidenceLayers.primary : evidenceItems,
       projectIds: pageProjectIds,
       standardCoverage,
@@ -5060,13 +5180,14 @@ async function executeQuery(
     supportingEvidenceSet: evidenceLayers.supporting,
     excludedEvidenceSet: evidenceLayers.excluded,
     evidenceCompleteness,
+    temporalIntent: queryPlan.temporalIntent,
     retrievalDebug: options.queryOptions?.debugContext
       ? {
           query: question,
           searchOptions: searchOptions as unknown as Record<string, unknown>,
           queryPlan: retrievalPlan,
           evidenceItems,
-          usedEvidenceIds: grounding.usedEvidenceIds,
+          usedEvidenceIds: finalUsedEvidenceIds,
           warnings: groundingWarnings
         }
       : undefined
@@ -6894,6 +7015,77 @@ export async function providerSmokeTest(rootDir: string, providerId: string): Pr
   return result;
 }
 
+export async function analysisStatusVault(rootDir: string): Promise<AnalysisStatusResult> {
+  const { paths } = await loadVaultConfig(rootDir);
+  const manifests = await listManifests(rootDir);
+  const entries = await Promise.all(
+    manifests.map(async (manifest) => {
+      const analysisPath = path.join(paths.analysesDir, `${manifest.sourceId}.json`);
+      const analysis = await readJsonFile<SourceAnalysis>(analysisPath).catch(() => null);
+      return {
+        sourceId: manifest.sourceId,
+        title: manifest.title,
+        analysisMode: analysis?.analysisMode ?? (analysis ? "heuristic" : "missing"),
+        providerId: analysis?.providerId,
+        providerModel: analysis?.providerModel,
+        warningCount: analysis?.warnings?.length ?? 0,
+        providerFailureCount: analysis?.providerFailures?.length ?? 0,
+        analysisPath
+      } satisfies AnalysisStatusResult["entries"][number];
+    })
+  );
+  const byMode: Record<string, number> = {};
+  for (const entry of entries) {
+    byMode[entry.analysisMode] = (byMode[entry.analysisMode] ?? 0) + 1;
+  }
+  const fallbackCount = entries.filter((entry) => entry.analysisMode === "heuristic" && entry.providerFailureCount > 0).length;
+  return {
+    totalSources: manifests.length,
+    analyzedSources: entries.filter((entry) => entry.analysisMode !== "missing").length,
+    missingAnalyses: entries.filter((entry) => entry.analysisMode === "missing").length,
+    byMode,
+    fallbackCount,
+    entries
+  };
+}
+
+export async function retryAnalysisVault(
+  rootDir: string,
+  options: { mode?: "heuristic" | "missing" | "all"; sourceId?: string; failOnFallback?: boolean } = {}
+): Promise<AnalysisRetryResult> {
+  const { paths } = await loadVaultConfig(rootDir);
+  const status = await analysisStatusVault(rootDir);
+  const targetEntries = status.entries.filter((entry) => {
+    if (options.sourceId) {
+      return entry.sourceId === options.sourceId;
+    }
+    if (options.mode === "all") {
+      return true;
+    }
+    if (options.mode === "missing") {
+      return entry.analysisMode === "missing";
+    }
+    return entry.analysisMode === "heuristic";
+  });
+  let deletedAnalysisCount = 0;
+  for (const entry of targetEntries) {
+    const analysisPath = path.join(paths.analysesDir, `${entry.sourceId}.json`);
+    if (await fileExists(analysisPath)) {
+      await fs.rm(analysisPath, { force: true });
+      deletedAnalysisCount += 1;
+    }
+  }
+  const compile = await compileVault(rootDir, {
+    failOnFallback: options.failOnFallback ?? false,
+    forceAnalysis: false
+  });
+  return {
+    targetSourceIds: targetEntries.map((entry) => entry.sourceId),
+    deletedAnalysisCount,
+    compile
+  };
+}
+
 type SemanticSearchHit = { pageId: string; path: string; title: string; kind: string; status: string; score: number };
 
 function matchesScalarOrList(value: string, filter: string | string[] | undefined): boolean {
@@ -7104,8 +7296,12 @@ export async function queryVault(rootDir: string, options: QueryOptions): Promis
     dataToolHints: query.dataToolHints,
     agentDecision: query.agentDecision,
     evidenceSet: query.evidenceSet,
+    primaryEvidenceSet: query.primaryEvidenceSet,
+    supportingEvidenceSet: query.supportingEvidenceSet,
+    excludedEvidenceSet: query.excludedEvidenceSet,
     standardCoverage: query.standardCoverage,
     evidenceCompleteness: query.evidenceCompleteness,
+    temporalIntent: query.temporalIntent,
     retrievalDebug: query.retrievalDebug
   };
 }

@@ -37,10 +37,13 @@ describe("retrieval index", () => {
     await expect(fs.access(path.join(rootDir, "state", "retrieval", "fts-000.sqlite"))).resolves.toBeUndefined();
     const manifest = JSON.parse(await fs.readFile(path.join(rootDir, "state", "retrieval", "manifest.json"), "utf8"));
     expect(manifest.backend).toBe("sqlite");
+    expect(manifest.indexSchemaVersion).toBeGreaterThanOrEqual(3);
+    expect(manifest.indexSchemaHash).toBeTruthy();
     expect(manifest.shards[0].path).toBe("retrieval/fts-000.sqlite");
 
     const status = await getRetrievalStatus(rootDir);
     expect(status.stale).toBe(false);
+    expect(status.schemaOk).toBe(true);
     expect(status.indexExists).toBe(true);
     expect(status.manifestExists).toBe(true);
 

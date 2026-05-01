@@ -17,6 +17,7 @@ import {
   addInput,
   addManagedSource,
   addWatchedRoot,
+  analysisStatusVault,
   archiveCandidate,
   autoCommitWikiChanges,
   benchmarkVault,
@@ -84,6 +85,7 @@ import {
   renderGraphShareSvg,
   resumeMemoryTask,
   resumeSourceSession,
+  retryAnalysisVault,
   reviewManagedSource,
   reviewSourceScope,
   runAutoPromotion,
@@ -920,6 +922,58 @@ program
     }
   );
 
+const analysis = program.command("analysis").description("Inspect and retry source analysis cache.");
+
+analysis
+  .command("status")
+  .description("Summarize source analysis modes, warnings, and provider fallbacks.")
+  .option("--show <mode>", "Filter entries by mode (provider|heuristic|vision|code|empty|missing)")
+  .action(async (options: { show?: string }) => {
+    const status = await analysisStatusVault(process.cwd());
+    const entries = options.show ? status.entries.filter((entry) => entry.analysisMode === options.show) : status.entries;
+    if (isJson()) {
+      emitJson({ ...status, entries });
+      return;
+    }
+    log(
+      `Analysis: total=${status.totalSources}, analyzed=${status.analyzedSources}, missing=${status.missingAnalyses}, fallback=${status.fallbackCount}.`
+    );
+    log(
+      `Modes: ${
+        Object.entries(status.byMode)
+          .map(([mode, count]) => `${mode}=${count}`)
+          .join(", ") || "none"
+      }`
+    );
+    for (const entry of entries) {
+      log(
+        `${entry.sourceId}  ${entry.analysisMode}  warnings=${entry.warningCount} failures=${entry.providerFailureCount}  ${entry.title}`
+      );
+    }
+  });
+
+analysis
+  .command("retry")
+  .description("Delete selected analysis cache files and recompile the affected sources.")
+  .option("--mode <mode>", "Retry by mode (heuristic|missing|all)", "heuristic")
+  .option("--source <sourceId>", "Retry one source id")
+  .option("--fail-on-fallback", "Fail if retry still produces provider fallbacks", false)
+  .action(async (options: { mode?: "heuristic" | "missing" | "all"; source?: string; failOnFallback?: boolean }) => {
+    const result = await retryAnalysisVault(process.cwd(), {
+      mode: options.mode,
+      sourceId: options.source,
+      failOnFallback: options.failOnFallback ?? false
+    });
+    if (isJson()) {
+      emitJson(result);
+      return;
+    }
+    log(`Retried ${result.targetSourceIds.length} source(s); deleted ${result.deletedAnalysisCount} cached analysis file(s).`);
+    log(
+      `Compile: sources=${result.compile.sourceCount}, pages=${result.compile.pageCount}, fallback=${result.compile.analysisStats?.fallbackCount ?? 0}.`
+    );
+  });
+
 program
   .command("consolidate")
   .description("Roll working-tier insights up into episodic, semantic, and procedural tiers.")
@@ -956,6 +1010,9 @@ program
   .option("--include-drafts", "Include draft consultation materials in retrieval", false)
   .option("--include-superseded", "Include superseded materials in retrieval", false)
   .option("--require-current-basis", "Require current effective basis materials", false)
+  .option("--as-of-date <date>", "Historical as-of date for authority/version questions, ISO date preferred")
+  .option("--evaluation-period <period>", "Evaluation/reporting period, for example 2023 or 2023年度")
+  .option("--evaluation-year <year>", "Evaluation/reporting year")
   .option("--evidence-mode <mode>", "Grounding mode (strict|balanced|exploratory)")
   .option("--strict-grounding", "Only answer when retrieved evidence is sufficient", false)
   .option("--debug-context", "Return retrieval evidence and grounding diagnostics in JSON output", false)
@@ -991,6 +1048,9 @@ program
         includeDrafts?: boolean;
         includeSuperseded?: boolean;
         requireCurrentBasis?: boolean;
+        asOfDate?: string;
+        evaluationPeriod?: string;
+        evaluationYear?: string;
         evidenceMode?: "strict" | "balanced" | "exploratory";
         strictGrounding?: boolean;
         debugContext?: boolean;
@@ -1012,6 +1072,9 @@ program
         includeDrafts: options.includeDrafts ?? false,
         includeSuperseded: options.includeSuperseded ?? false,
         requireCurrentBasis: options.requireCurrentBasis ?? false,
+        asOfDate: options.asOfDate,
+        evaluationPeriod: options.evaluationPeriod,
+        evaluationYear: options.evaluationYear ? parsePositiveInt(options.evaluationYear, 0) || undefined : undefined,
         evidenceMode: options.evidenceMode,
         strictGrounding: options.strictGrounding ?? false,
         debugContext: options.debugContext ?? false,

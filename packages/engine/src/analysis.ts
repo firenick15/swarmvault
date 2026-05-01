@@ -608,9 +608,11 @@ async function providerAnalysis(
   text: string,
   provider: ProviderAdapter,
   schema: VaultSchema,
-  domainProfile: LoadedDomainProfile = DEFAULT_ENV_AIR_PROFILE
+  domainProfile: LoadedDomainProfile = DEFAULT_ENV_AIR_PROFILE,
+  options: { maxInputChars?: number } = {}
 ): Promise<SourceAnalysis> {
   const cleanedText = normalizeEnvAirText(text);
+  const repairWarnings: string[] = [];
   const parsed = await provider.generateStructured(
     {
       system: [
@@ -625,9 +627,10 @@ async function providerAnalysis(
         "Vault schema instructions:",
         truncate(schema.content, 6000)
       ].join("\n"),
-      prompt: `Analyze the following source and return structured JSON.\n\nSource title: ${manifest.title}\nSource kind: ${manifest.sourceKind}\nSource id: ${manifest.sourceId}\n\nText:\n${truncate(cleanedText, 18000)}`
+      prompt: `Analyze the following source and return structured JSON.\n\nSource title: ${manifest.title}\nSource kind: ${manifest.sourceKind}\nSource id: ${manifest.sourceId}\n\nText:\n${truncate(cleanedText, options.maxInputChars ?? 18000)}`
     },
-    sourceAnalysisSchema
+    sourceAnalysisSchema,
+    { schemaName: "source_analysis", repairWarnings }
   );
   const normalizedConcepts = filterDomainTermCandidates(
     parsed.concepts.map((term) => term.name),
@@ -692,10 +695,48 @@ async function providerAnalysis(
     analysisMode: "provider",
     providerId: provider.id,
     providerModel: provider.model,
-    warnings: [],
+    warnings: repairWarnings.map((warning) => `structured_repair:${warning}`),
     rationales: [],
     producedAt: new Date().toISOString()
   };
+}
+
+async function providerAnalysisWithRetry(
+  manifest: SourceManifest,
+  text: string,
+  provider: ProviderAdapter,
+  schema: VaultSchema,
+  domainProfile: LoadedDomainProfile = DEFAULT_ENV_AIR_PROFILE
+): Promise<SourceAnalysis> {
+  const failures: NonNullable<SourceAnalysis["providerFailures"]> = [];
+  try {
+    return await providerAnalysis(manifest, text, provider, schema, domainProfile, { maxInputChars: 18000 });
+  } catch (error) {
+    failures.push({
+      phase: "initial",
+      error: truncate(error instanceof Error ? error.message : String(error), 1200),
+      producedAt: new Date().toISOString()
+    });
+  }
+  try {
+    const retry = await providerAnalysis(manifest, text, provider, schema, domainProfile, { maxInputChars: 9000 });
+    return {
+      ...retry,
+      providerFailures: failures,
+      warnings: uniqueBy([...(retry.warnings ?? []), "provider_retry_succeeded:compact_retry"], (item) => item)
+    };
+  } catch (error) {
+    failures.push({
+      phase: "compact_retry",
+      error: truncate(error instanceof Error ? error.message : String(error), 1200),
+      producedAt: new Date().toISOString()
+    });
+    const finalError = new Error(error instanceof Error ? error.message : String(error)) as Error & {
+      providerFailures?: NonNullable<SourceAnalysis["providerFailures"]>;
+    };
+    finalError.providerFailures = failures;
+    throw finalError;
+  }
 }
 
 function analysisFromVisionExtraction(
@@ -783,6 +824,7 @@ export async function analyzeSource(
   const content = normalizeEnvAirText(normalizeWhitespace(extractedText ?? ""));
   let analysis: SourceAnalysis;
   let providerFailure: string | undefined;
+  let providerFailures: SourceAnalysis["providerFailures"] = [];
 
   if (manifest.sourceKind === "code" && content) {
     analysis = {
@@ -824,9 +866,10 @@ export async function analyzeSource(
       analysis = heuristicAnalysis(manifest, content, schema.hash);
     } else {
       try {
-        analysis = await providerAnalysis(manifest, content, provider, schema, options.domainProfile);
+        analysis = await providerAnalysisWithRetry(manifest, content, provider, schema, options.domainProfile);
       } catch (error) {
         providerFailure = error instanceof Error ? error.message : String(error);
+        providerFailures = (error as { providerFailures?: SourceAnalysis["providerFailures"] }).providerFailures ?? [];
         analysis = heuristicAnalysis(manifest, content, schema.hash);
       }
     }
@@ -857,9 +900,10 @@ export async function analyzeSource(
     analysis = heuristicAnalysis(manifest, content, schema.hash);
   } else {
     try {
-      analysis = await providerAnalysis(manifest, content, provider, schema, options.domainProfile);
+      analysis = await providerAnalysisWithRetry(manifest, content, provider, schema, options.domainProfile);
     } catch (error) {
       providerFailure = error instanceof Error ? error.message : String(error);
+      providerFailures = (error as { providerFailures?: SourceAnalysis["providerFailures"] }).providerFailures ?? [];
       analysis = heuristicAnalysis(manifest, content, schema.hash);
     }
   }
@@ -904,6 +948,17 @@ export async function analyzeSource(
       analysisMode: "heuristic",
       providerId: provider.id,
       providerModel: provider.model,
+      providerFailures: uniqueBy(
+        [
+          ...(providerFailures ?? []),
+          {
+            phase: "fallback" as const,
+            error: truncate(providerFailure, 1200),
+            producedAt: new Date().toISOString()
+          }
+        ],
+        (failure) => `${failure.phase}:${failure.error}`
+      ),
       warnings: uniqueBy([...(analysis.warnings ?? []), `Provider analysis failed: ${truncate(providerFailure, 240)}`], (value) => value)
     };
   }

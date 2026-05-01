@@ -10,9 +10,11 @@ import type {
   ImageGenerationResponse,
   ProviderAdapter,
   ProviderCapability,
-  ProviderType
+  ProviderType,
+  StructuredGenerationOptions
 } from "../types.js";
 import { extractJson } from "../utils.js";
+import { parseStructuredWithRepair } from "./structured-repair.js";
 
 export abstract class BaseProviderAdapter implements ProviderAdapter {
   public readonly capabilities: Set<ProviderCapability>;
@@ -40,14 +42,18 @@ export abstract class BaseProviderAdapter implements ProviderAdapter {
     throw new Error(`Provider ${this.id} does not support audio transcription.`);
   }
 
-  public async generateStructured<T>(request: GenerationRequest, schema: z.ZodType<T>): Promise<T> {
+  public async generateStructured<T>(
+    request: GenerationRequest,
+    schema: z.ZodType<T>,
+    options: StructuredGenerationOptions = {}
+  ): Promise<T> {
     const schemaDescription = JSON.stringify(z.toJSONSchema(schema), null, 2);
     const response = await this.generateText({
       ...request,
       prompt: `${request.prompt}\n\nReturn JSON only. Follow this JSON Schema exactly:\n${schemaDescription}`
     });
     const parsed = JSON.parse(extractJson(response.text));
-    return schema.parse(parsed);
+    return parseStructuredWithRepair(schema, parsed, options);
   }
 
   protected async encodeAttachments(attachments: GenerationAttachment[] = []): Promise<Array<{ mimeType: string; base64: string }>> {

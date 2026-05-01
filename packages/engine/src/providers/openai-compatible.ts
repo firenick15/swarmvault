@@ -8,10 +8,12 @@ import type {
   ImageGenerationRequest,
   ImageGenerationResponse,
   ProviderCapability,
-  ProviderType
+  ProviderType,
+  StructuredGenerationOptions
 } from "../types.js";
 import { extractJson, truncate } from "../utils.js";
 import { BaseProviderAdapter } from "./base.js";
+import { parseStructuredWithRepair, zodIssueSummary } from "./structured-repair.js";
 
 export interface OpenAiCompatibleOptions {
   baseUrl: string;
@@ -129,62 +131,6 @@ function toOpenAiStrictJsonSchema(schema: unknown): unknown {
   return normalizedSchema;
 }
 
-function stripNullObjectProperties(value: unknown): unknown {
-  if (Array.isArray(value)) {
-    return value.map((item) => stripNullObjectProperties(item));
-  }
-
-  if (!isJsonSchemaObject(value)) {
-    return value;
-  }
-
-  const entries = Object.entries(value)
-    .filter(([, item]) => item !== null)
-    .map(([key, item]) => [key, stripNullObjectProperties(item)]);
-  return Object.fromEntries(entries);
-}
-
-function coerceStructuredValue(value: unknown): unknown {
-  if (Array.isArray(value)) {
-    return value.map((item) => coerceStructuredValue(item));
-  }
-  if (!isJsonSchemaObject(value)) {
-    return value;
-  }
-  const entries = Object.entries(value).map(([key, item]) => {
-    if ((key === "citation" || key.endsWith("Citation")) && isJsonSchemaObject(item)) {
-      return [key, JSON.stringify(item)];
-    }
-    if ((key === "concepts" || key === "entities" || key === "tags") && Array.isArray(item)) {
-      return [
-        key,
-        item.map((entry) =>
-          typeof entry === "string" && (key === "concepts" || key === "entities")
-            ? { name: entry, description: "" }
-            : coerceStructuredValue(entry)
-        )
-      ];
-    }
-    if (key === "claims" && Array.isArray(item)) {
-      return [
-        key,
-        item.map((entry) => {
-          if (typeof entry === "string") {
-            return { text: entry, citation: "", confidence: 0.5 };
-          }
-          if (isJsonSchemaObject(entry) && typeof entry.text !== "string") {
-            const candidate = entry.text ?? entry.claim ?? entry.summary ?? entry.content;
-            return { ...entry, text: typeof candidate === "string" ? candidate : JSON.stringify(candidate ?? entry) };
-          }
-          return coerceStructuredValue(entry);
-        })
-      ];
-    }
-    return [key, coerceStructuredValue(item)];
-  });
-  return Object.fromEntries(entries);
-}
-
 function buildStructuredFormat(schema: z.ZodTypeAny) {
   return {
     type: "json_schema" as const,
@@ -228,7 +174,7 @@ function structuredErrorMessage(
 ): string {
   const reason = result.finishReason ? ` finishReason=${result.finishReason}` : "";
   const parsedLength = typeof jsonLength === "number" ? ` jsonChars=${jsonLength}` : "";
-  const detail = error instanceof Error ? error.message : String(error);
+  const detail = zodIssueSummary(error);
   return `Provider ${providerId} structured ${attempt} response could not be parsed: rawChars=${result.text.length}${parsedLength}${reason} error=${truncateErrorBody(detail)}`;
 }
 
@@ -261,7 +207,11 @@ export class OpenAiCompatibleProviderAdapter extends BaseProviderAdapter {
     return this.generateViaResponses(request);
   }
 
-  public async generateStructured<T>(request: GenerationRequest, schema: z.ZodType<T>): Promise<T> {
+  public async generateStructured<T>(
+    request: GenerationRequest,
+    schema: z.ZodType<T>,
+    options: StructuredGenerationOptions = {}
+  ): Promise<T> {
     const structuredFormat = buildStructuredFormat(schema);
     const parseStructured = (result: StructuredProviderText, attempt: "initial" | "repair"): T => {
       let jsonText = "";
@@ -271,14 +221,23 @@ export class OpenAiCompatibleProviderAdapter extends BaseProviderAdapter {
         throw new Error(structuredErrorMessage(this.id, attempt, result, error));
       }
       try {
-        return schema.parse(coerceStructuredValue(stripNullObjectProperties(JSON.parse(jsonText))));
+        return parseStructuredWithRepair(schema, JSON.parse(jsonText), options);
       } catch (error) {
         throw new Error(structuredErrorMessage(this.id, attempt, result, error, jsonText.length));
       }
     };
 
-    const readStructured = async (repair = false): Promise<StructuredProviderText> => {
-      const repairHint = repair ? "\n\nYour previous response was not valid JSON. Return ONLY valid JSON matching the schema." : "";
+    const readStructured = async (repair = false, repairReason = ""): Promise<StructuredProviderText> => {
+      const repairHint = repair
+        ? [
+            "",
+            "Your previous response was not valid JSON for the required schema.",
+            repairReason ? `Validation problems: ${repairReason}` : "",
+            "Return ONLY valid JSON matching the schema. Do not add explanations."
+          ]
+            .filter(Boolean)
+            .join("\n")
+        : "";
       const schemaPrompt = `JSON schema:\n${JSON.stringify(structuredFormat.schema)}`;
       const mergedSystem = [request.system, this.structuredOutputMode === "json_schema" ? "" : schemaPrompt].filter(Boolean).join("\n\n");
       const mergedRequest: GenerationRequest = {
@@ -298,7 +257,7 @@ export class OpenAiCompatibleProviderAdapter extends BaseProviderAdapter {
       return parseStructured(result, "initial");
     } catch (error) {
       const initialMessage = error instanceof Error ? error.message : String(error);
-      const result = await readStructured(true);
+      const result = await readStructured(true, initialMessage);
       try {
         return parseStructured(result, "repair");
       } catch (repairError) {

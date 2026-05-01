@@ -152,6 +152,7 @@ export type * from "./types.js";
 export { slugifyKnowledgeLabel } from "./utils.js";
 export {
   acceptApproval,
+  analysisStatusVault,
   archiveCandidate,
   benchmarkVault,
   blastRadiusVault,
@@ -179,6 +180,7 @@ export {
   readGraphReport,
   readPage,
   rejectApproval,
+  retryAnalysisVault,
   runAutoPromotion,
   searchVault,
   stageGeneratedOutputPages

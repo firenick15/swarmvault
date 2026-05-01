@@ -79,6 +79,7 @@ function mergeProfile(base: EnvAirProfile, raw: unknown): EnvAirProfile {
     dataLocationTerms: stringArray(raw.dataLocationTerms, base.dataLocationTerms),
     dataOperationTerms: stringArray(raw.dataOperationTerms, base.dataOperationTerms),
     explicitDataToolTerms: stringArray(raw.explicitDataToolTerms, base.explicitDataToolTerms),
+    basisOnlyTerms: stringArray(raw.basisOnlyTerms, base.basisOnlyTerms),
     knowledgeOperationTerms: stringArray(raw.knowledgeOperationTerms, base.knowledgeOperationTerms),
     knowledgeHints: stringArray(raw.knowledgeHints, base.knowledgeHints),
     currentBasisHints: stringArray(raw.currentBasisHints, base.currentBasisHints),
