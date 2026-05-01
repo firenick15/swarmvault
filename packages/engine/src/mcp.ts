@@ -256,7 +256,7 @@ export async function createMcpServer(rootDir: string): Promise<McpServer> {
     "query_vault",
     {
       description:
-        "Ask a question against the compiled vault. For environmental air work, returns grounded citations, evidenceState, answerBasis, toolRouting, evidenceSet, agentDecision, current-status hints, retrieval diagnostics when requested, and explicit guidance for when the environment data MCP should be called. Treat evidenceState=grounded as report-ready only when agentDecision.reportUsability=direct; partial is draft-only; insufficient requires more evidence; needs_data_mcp means the environment data MCP must be called before making data conclusions.",
+        "Ask a question against the compiled vault. For environmental air work, returns grounded citations, evidenceState, answerBasis, toolRouting, evidenceSet, agentDecision, current-status hints, retrieval diagnostics when requested, and explicit guidance for when the environment data MCP should be called. Treat evidenceState=grounded as report-ready only when agentDecision.reportUsability=direct; partial is draft-only; insufficient requires more evidence; agentDecision.reportUsability=needs_data_mcp or recommendedNextTool=environment_data_mcp|both means the environment data MCP must be called before making data conclusions.",
       inputSchema: {
         question: z.string().min(1).describe("Question to ask the vault"),
         save: z.boolean().optional().describe("Persist the answer to wiki/outputs"),

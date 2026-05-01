@@ -413,6 +413,7 @@ export interface VaultConfig {
     shardSize?: number;
     hybrid?: boolean;
     rerank?: boolean;
+    queryStalePolicy?: "error" | "auto_repair" | "warn";
     embeddingProvider?: string;
     maxIndexedRows?: number;
     chunking?: {
@@ -426,6 +427,9 @@ export interface VaultConfig {
     failurePolicy?: "fail" | "warn";
     maxFallbackRatio?: number;
     concurrency?: number;
+    maxInputChars?: number;
+    compactRetryChars?: number;
+    longDocumentMode?: "single_pass" | "section_map_reduce";
   };
   domain?: {
     profileId?: string;
@@ -935,6 +939,13 @@ export interface SourceAnalysis {
     phase: "initial" | "repair" | "compact_retry" | "fallback";
     error: string;
     producedAt: string;
+  }>;
+  analysisSegments?: Array<{
+    id: string;
+    heading?: string;
+    charStart: number;
+    charEnd: number;
+    providerId: string;
   }>;
   rationales: SourceRationale[];
   code?: CodeAnalysis;
@@ -1683,6 +1694,7 @@ export interface RetrievalConfig {
   shardSize: number;
   hybrid: boolean;
   rerank: boolean;
+  queryStalePolicy: "error" | "auto_repair" | "warn";
   embeddingProvider?: string;
   maxIndexedRows?: number;
   chunking: {
@@ -1764,6 +1776,7 @@ export interface QueryOptions {
   strictGrounding?: boolean;
   debugContext?: boolean;
   returnDecisionContract?: boolean;
+  retrievalStalePolicy?: "error" | "auto_repair" | "warn";
 }
 
 export type EvidenceState = "grounded" | "partial" | "insufficient";
@@ -1776,6 +1789,17 @@ export interface ToolRoutingDecision {
   reasons: string[];
   dataSignals: string[];
   knowledgeSignals: string[];
+  knowledgeNeeded?: boolean;
+  dataNeeded?: boolean;
+  confidence?: number;
+  matchedSignals?: {
+    time: string[];
+    location: string[];
+    dataObject: string[];
+    operation: string[];
+    basisOnly: string[];
+    knowledge: string[];
+  };
   conflictResolvedBy: "deterministic_policy" | "model_agreement" | "fallback";
 }
 
@@ -1855,6 +1879,11 @@ export interface RetrievalDebugInfo {
   query: string;
   searchOptions: Record<string, unknown>;
   queryPlan?: QueryRetrievalPlan;
+  retrievalStatus?: {
+    staleBeforeQuery: boolean;
+    repaired: boolean;
+    warnings: string[];
+  };
   evidenceItems: RetrievalDebugEvidenceItem[];
   usedEvidenceIds: string[];
   warnings: string[];
@@ -1868,6 +1897,7 @@ export interface QueryRetrievalPlan {
   standardRefs: string[];
   expandedTerms: string[];
   pinnedStandards: string[];
+  standardClusters?: string[];
   matchedIntentRules?: string[];
   temporalIntent?: EnvAirTemporalIntent;
   requiredStandards?: string[];
@@ -1875,6 +1905,10 @@ export interface QueryRetrievalPlan {
   missingStandards?: string[];
   authorityPinnedEvidenceCount?: number;
   rankingSignals: string[];
+  factTypeBoosts?: Record<string, number>;
+  documentRoleBoosts?: Record<string, number>;
+  evidenceRoleBoosts?: Record<string, number>;
+  chunkTermBoosts?: Record<string, number>;
   recommendedNextTool: RecommendedNextTool;
   toolRouting?: ToolRoutingDecision;
   stages: Array<{
@@ -1922,6 +1956,14 @@ export interface QueryResult {
   };
   temporalIntent?: EnvAirTemporalIntent;
   retrievalDebug?: RetrievalDebugInfo;
+  scopeAudit?: {
+    requestedScope?: QueryOptions["scope"];
+    tenantId?: string;
+    projectId?: string;
+    privateEvidenceCount: number;
+    publicEvidenceCount: number;
+    warnings: string[];
+  };
 }
 
 export interface LintFinding {

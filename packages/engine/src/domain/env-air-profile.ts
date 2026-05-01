@@ -5,16 +5,35 @@ export interface EnvAirStandardCatalogEntry {
   current?: string;
   title: string;
   aliases: string[];
+  clusterIds?: string[];
+  documentRoleHints?: string[];
+}
+
+export interface EnvAirStandardCluster {
+  id: string;
+  title: string;
+  standards: string[];
+  aliases?: string[];
+  evidenceRoles?: string[];
+  documentRoles?: string[];
 }
 
 export interface EnvAirIntentRule {
   id: string;
   priority: number;
   anyText?: string[];
+  allText?: string[];
+  anyTermGroups?: string[][];
   anyPollutant?: boolean;
   expandedTerms?: string[];
   pinnedStandards?: string[];
+  standardClusters?: string[];
   rankingSignals?: string[];
+  factTypeBoosts?: Record<string, number>;
+  documentRoleBoosts?: Record<string, number>;
+  evidenceRoleBoosts?: Record<string, number>;
+  chunkTermBoosts?: Record<string, number>;
+  routePolicy?: "knowledge" | "data" | "both" | "defer";
 }
 
 export interface EnvAirTopicSeed {
@@ -27,6 +46,7 @@ export interface EnvAirTopicSeed {
 export interface EnvAirProfile {
   id: string;
   standardCatalog: EnvAirStandardCatalogEntry[];
+  standardClusters: EnvAirStandardCluster[];
   envTerms: string[];
   termAliases: Record<string, string[]>;
   pollutantFocusTerms: Record<string, string[]>;
@@ -59,7 +79,8 @@ export const DEFAULT_ENV_AIR_PROFILE: EnvAirProfile = {
       number: "3095",
       current: "GB 3095-2026",
       title: "环境空气质量标准",
-      aliases: ["GB 3095", "GB3095", "GB 3095-2026", "GB30952026", "环境空气质量标准", "环境空气标准", "空气质量标准"]
+      aliases: ["GB 3095", "GB3095", "GB 3095-2026", "GB30952026", "环境空气质量标准", "环境空气标准", "空气质量标准"],
+      clusterIds: ["ambient_quality_core"]
     },
     {
       identity: "HJ 663",
@@ -67,7 +88,8 @@ export const DEFAULT_ENV_AIR_PROFILE: EnvAirProfile = {
       number: "663",
       current: "HJ 663-2026",
       title: "环境空气质量评价技术规范",
-      aliases: ["HJ 663", "HJ663", "HJ 663-2026", "HJ6632026", "环境空气质量评价技术规范", "达标评价技术规范"]
+      aliases: ["HJ 663", "HJ663", "HJ 663-2026", "HJ6632026", "环境空气质量评价技术规范", "达标评价技术规范"],
+      clusterIds: ["ambient_quality_core"]
     },
     {
       identity: "HJ 633",
@@ -75,28 +97,98 @@ export const DEFAULT_ENV_AIR_PROFILE: EnvAirProfile = {
       number: "633",
       current: "HJ 633-2026",
       title: "环境空气质量指数(AQI)技术规定",
-      aliases: ["HJ 633", "HJ633", "HJ 633-2026", "HJ6332026", "AQI技术规定", "空气质量指数技术规定", "日报和实时报技术规定"]
+      aliases: ["HJ 633", "HJ633", "HJ 633-2026", "HJ6332026", "AQI技术规定", "空气质量指数技术规定", "日报和实时报技术规定"],
+      clusterIds: ["ambient_quality_core"]
     },
     {
       identity: "HJ 655",
       family: "HJ",
       number: "655",
       title: "环境空气颗粒物连续自动监测系统安装和验收技术规范",
-      aliases: ["HJ 655", "HJ655", "颗粒物连续自动监测系统", "安装和验收技术规范"]
+      aliases: ["HJ 655", "HJ655", "颗粒物连续自动监测系统", "安装和验收技术规范"],
+      clusterIds: ["ambient_auto_monitoring_acceptance"]
     },
     {
       identity: "HJ 664",
       family: "HJ",
       number: "664",
       title: "环境空气质量监测点位布设技术规范",
-      aliases: ["HJ 664", "HJ664", "监测点位布设", "环境空气质量监测点位"]
+      aliases: ["HJ 664", "HJ664", "监测点位布设", "环境空气质量监测点位"],
+      clusterIds: ["ambient_quality_core", "ambient_auto_monitoring_acceptance"]
     },
     {
       identity: "HJ 818",
       family: "HJ",
       number: "818",
       title: "环境空气气态污染物连续自动监测系统运行和质控技术规范",
-      aliases: ["HJ 818", "HJ818", "气态污染物连续自动监测系统", "运行和质控技术规范"]
+      aliases: ["HJ 818", "HJ818", "气态污染物连续自动监测系统", "运行和质控技术规范"],
+      clusterIds: ["ambient_auto_monitoring_operation_qaqc"]
+    }
+  ],
+  standardClusters: [
+    {
+      id: "ambient_quality_core",
+      title: "环境空气质量评价核心标准族",
+      standards: ["GB 3095", "HJ 663", "HJ 633", "HJ 664"],
+      aliases: ["环境空气质量标准", "达标评价", "AQI", "空气质量评价"],
+      evidenceRoles: ["current_authority", "method"],
+      documentRoles: ["standard", "monitoring_method"]
+    },
+    {
+      id: "ambient_auto_monitoring_acceptance",
+      title: "环境空气自动监测安装验收标准族",
+      standards: ["HJ 655", "HJ 193", "HJ 654"],
+      aliases: ["自动监测安装", "验收", "比对测试", "监测系统"],
+      evidenceRoles: ["current_authority", "method"],
+      documentRoles: ["standard", "monitoring_method", "qa_qc"]
+    },
+    {
+      id: "ambient_auto_monitoring_operation_qaqc",
+      title: "环境空气自动监测运行质控标准族",
+      standards: ["HJ 818", "HJ 817", "HJ 653", "HJ 654", "HJ 193"],
+      aliases: ["运行质控", "质量保证", "质量控制", "有效数据", "负值", "零点", "量程", "转换炉效率", "平行性"],
+      evidenceRoles: ["current_authority", "method"],
+      documentRoles: ["standard", "monitoring_method", "qa_qc"]
+    },
+    {
+      id: "ambient_manual_sampling_analysis",
+      title: "环境空气手工采样与分析方法标准族",
+      standards: ["HJ 194", "HJ 618"],
+      aliases: ["手工监测", "采样", "样品保存", "测定", "检出限"],
+      evidenceRoles: ["method", "current_authority"],
+      documentRoles: ["monitoring_method", "standard"]
+    },
+    {
+      id: "ambient_statistics_reporting",
+      title: "环境空气统计报告与公报证据族",
+      standards: [],
+      aliases: ["公报", "月报", "年报", "统计", "城市数量", "评价城市", "统计期"],
+      evidenceRoles: ["statistics", "official_explanation"],
+      documentRoles: ["statistics", "whitepaper", "official_explanation"]
+    },
+    {
+      id: "ozone_pm25_coordinated_control",
+      title: "臭氧与 PM2.5 协同控制证据族",
+      standards: ["GB 3095", "HJ 663"],
+      aliases: ["臭氧", "PM2.5", "VOCs", "NOx", "协同控制", "来源解析"],
+      evidenceRoles: ["current_authority", "method", "research", "statistics"],
+      documentRoles: ["standard", "technical_guide", "research_literature", "statistics", "whitepaper"]
+    },
+    {
+      id: "local_adaptation",
+      title: "地方适配材料族",
+      standards: [],
+      aliases: ["地方标准", "地方办法", "地方口径", "省", "市"],
+      evidenceRoles: ["local_adaptation"],
+      documentRoles: ["standard", "local_reference", "technical_guide"]
+    },
+    {
+      id: "evolution_tracking",
+      title: "标准演化材料族",
+      standards: [],
+      aliases: ["征求意见稿", "编制说明", "修改单", "历史版本", "废止", "替代"],
+      evidenceRoles: ["evolution"],
+      documentRoles: ["draft", "compilation_explanation", "amendment"]
     }
   ],
   envTerms: [
@@ -260,7 +352,10 @@ export const DEFAULT_ENV_AIR_PROFILE: EnvAirProfile = {
       anyText: ["数据有效性", "有效数据", "有效性要求", "有效监测数据", "评价数据", "达标评价有效性", "评价有效性"],
       expandedTerms: ["HJ 663", "HJ 663-2026", "环境空气质量评价技术规范", "数据有效性", "有效监测数据", "评价项目和评价方法"],
       pinnedStandards: ["HJ 663", "HJ 663-2026"],
-      rankingSignals: ["ambient_air_assessment_validity_question"]
+      standardClusters: ["ambient_quality_core", "ambient_auto_monitoring_operation_qaqc"],
+      rankingSignals: ["ambient_air_assessment_validity_question"],
+      factTypeBoosts: { validity_rule: 5, technical_parameter: 2 },
+      chunkTermBoosts: { 数据有效性: 4, 有效数据: 4, 评价项目: 2 }
     },
     {
       id: "ambient_air_quality_limit_question",
@@ -269,7 +364,10 @@ export const DEFAULT_ENV_AIR_PROFILE: EnvAirProfile = {
       anyText: ["限值", "浓度限值", "一级", "二级", "年平均", "日平均", "小时平均", "日最大", "8小时", "达标", "超标", "评价"],
       expandedTerms: ["GB 3095", "GB 3095-2026", "GB 3095-2012", "环境空气质量标准", "环境空气质量标准限值", "一级", "二级"],
       pinnedStandards: ["GB 3095", "GB 3095-2026"],
-      rankingSignals: ["ambient_air_quality_limit_question"]
+      standardClusters: ["ambient_quality_core"],
+      rankingSignals: ["ambient_air_quality_limit_question"],
+      factTypeBoosts: { limit_value: 5, formula: 2 },
+      evidenceRoleBoosts: { current_authority: 4, method: 2 }
     },
     {
       id: "aqi_reporting_question",
@@ -277,7 +375,9 @@ export const DEFAULT_ENV_AIR_PROFILE: EnvAirProfile = {
       anyText: ["AQI", "IAQI", "空气质量指数", "日报", "实时报", "日报和实时报", "日报技术规定"],
       expandedTerms: ["HJ 633", "HJ 633-2026", "HJ 633-2012", "环境空气质量指数", "空气质量日报", "空气质量实时报"],
       pinnedStandards: ["HJ 633", "HJ 633-2026"],
-      rankingSignals: ["aqi_reporting_question"]
+      standardClusters: ["ambient_quality_core"],
+      rankingSignals: ["aqi_reporting_question"],
+      factTypeBoosts: { formula: 4, technical_parameter: 2 }
     },
     {
       id: "ambient_air_quality_assessment_question",
@@ -285,14 +385,35 @@ export const DEFAULT_ENV_AIR_PROFILE: EnvAirProfile = {
       anyText: ["评价技术规范", "达标评价", "评价报告", "报告依据", "空气质量评价"],
       expandedTerms: ["HJ 663", "HJ 663-2026", "环境空气质量评价技术规范", "达标评价技术规范"],
       pinnedStandards: ["HJ 663", "HJ 663-2026"],
-      rankingSignals: ["ambient_air_quality_assessment_question"]
+      standardClusters: ["ambient_quality_core"],
+      rankingSignals: ["ambient_air_quality_assessment_question"],
+      factTypeBoosts: { validity_rule: 4, formula: 3, limit_value: 2 }
     },
     {
       id: "monitoring_method_question",
       priority: 70,
       anyText: ["监测方法", "采样", "分析方法", "测定", "检出限", "公式", "校准", "质控", "质量控制"],
       expandedTerms: ["环境空气监测方法", "环境空气质量监测规范", "采样", "质量保证", "质量控制"],
-      rankingSignals: ["monitoring_method_question"]
+      standardClusters: [
+        "ambient_auto_monitoring_operation_qaqc",
+        "ambient_manual_sampling_analysis",
+        "ambient_auto_monitoring_acceptance"
+      ],
+      rankingSignals: ["monitoring_method_question", "qaqc_question"],
+      factTypeBoosts: { technical_parameter: 5, method_step: 4, validity_rule: 3 },
+      documentRoleBoosts: { monitoring_method: 4, qa_qc: 4, standard: 2 },
+      chunkTermBoosts: { 质控: 4, 质量控制: 4, 校准: 3, 采样: 3 }
+    },
+    {
+      id: "ambient_statistics_reporting_question",
+      priority: 65,
+      anyText: ["公报", "月报", "年报", "统计", "城市数量", "评价城市", "同比", "环比", "年度报告"],
+      expandedTerms: ["环境空气质量公报", "环境空气质量月报", "环境空气质量年报", "统计期", "评价城市", "城市数量"],
+      standardClusters: ["ambient_statistics_reporting"],
+      rankingSignals: ["ambient_statistics_reporting_question"],
+      documentRoleBoosts: { statistics: 5, whitepaper: 2, official_explanation: 2 },
+      evidenceRoleBoosts: { statistics: 5, official_explanation: 2 },
+      chunkTermBoosts: { 公报: 3, 月报: 3, 年报: 3, 统计: 4, 城市: 2, 评价城市: 4 }
     },
     {
       id: "authority_boundary_question",
@@ -312,14 +433,19 @@ export const DEFAULT_ENV_AIR_PROFILE: EnvAirProfile = {
         "是否强制"
       ],
       expandedTerms: ["执行依据", "强制标准", "推荐标准", "征求意见稿", "编制说明", "研究论文", "技术参考", "法律效力"],
-      rankingSignals: ["authority_boundary_question"]
+      standardClusters: ["evolution_tracking"],
+      rankingSignals: ["authority_boundary_question"],
+      documentRoleBoosts: { standard: 3, draft: 3, compilation_explanation: 3, research_literature: 2, statistics: 2 }
     },
     {
       id: "amendment_question",
       priority: 50,
       anyText: ["修改单", "甲醛吸收", "副玫瑰苯胺", "修订", "替换"],
       expandedTerms: ["修改单", "结果表示", "按式", "替换"],
-      rankingSignals: ["amendment_question"]
+      standardClusters: ["evolution_tracking"],
+      rankingSignals: ["amendment_question"],
+      factTypeBoosts: { status_rule: 4, formula: 3 },
+      documentRoleBoosts: { amendment: 5, compilation_explanation: 2 }
     }
   ],
   topicSeeds: [

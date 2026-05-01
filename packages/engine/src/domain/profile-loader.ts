@@ -37,6 +37,20 @@ function stringArray(value: unknown, fallback: string[] = []): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string" && item.trim().length > 0) : fallback;
 }
 
+function numberRecord(value: unknown): Record<string, number> | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const output: Record<string, number> = {};
+  for (const [key, raw] of Object.entries(value)) {
+    const parsed = typeof raw === "number" ? raw : Number(raw);
+    if (Number.isFinite(parsed)) {
+      output[key] = Math.max(0, Math.min(10, parsed));
+    }
+  }
+  return Object.keys(output).length ? output : undefined;
+}
+
 function recordOfStringArrays(value: unknown, fallback: Record<string, string[]> = {}): Record<string, string[]> {
   if (!isRecord(value)) {
     return fallback;
@@ -49,6 +63,59 @@ function recordOfStringArrays(value: unknown, fallback: Record<string, string[]>
     }
   }
   return { ...fallback, ...output };
+}
+
+function standardClusters(value: unknown, fallback: EnvAirProfile["standardClusters"] = []): EnvAirProfile["standardClusters"] {
+  if (!Array.isArray(value)) {
+    return fallback;
+  }
+  const parsed = value
+    .filter(isRecord)
+    .map((item) => ({
+      id: typeof item.id === "string" ? item.id.trim() : "",
+      title: typeof item.title === "string" ? item.title.trim() : "",
+      standards: stringArray(item.standards),
+      aliases: stringArray(item.aliases),
+      evidenceRoles: stringArray(item.evidenceRoles),
+      documentRoles: stringArray(item.documentRoles)
+    }))
+    .filter((item) => item.id && item.title);
+  return parsed.length ? parsed : fallback;
+}
+
+function intentRules(value: unknown, fallback: EnvAirProfile["intentRules"]): EnvAirProfile["intentRules"] {
+  if (!Array.isArray(value)) {
+    return fallback;
+  }
+  const parsed: EnvAirProfile["intentRules"] = value
+    .filter(isRecord)
+    .map((item) => {
+      const routePolicy: EnvAirProfile["intentRules"][number]["routePolicy"] =
+        item.routePolicy === "knowledge" || item.routePolicy === "data" || item.routePolicy === "both" || item.routePolicy === "defer"
+          ? item.routePolicy
+          : undefined;
+      return {
+        id: typeof item.id === "string" ? item.id.trim() : "",
+        priority: Number.isFinite(Number(item.priority)) ? Number(item.priority) : 0,
+        anyText: stringArray(item.anyText),
+        allText: stringArray(item.allText),
+        anyTermGroups: Array.isArray(item.anyTermGroups)
+          ? item.anyTermGroups.map((group) => stringArray(group)).filter((group) => group.length)
+          : [],
+        anyPollutant: item.anyPollutant === true,
+        expandedTerms: stringArray(item.expandedTerms),
+        pinnedStandards: stringArray(item.pinnedStandards),
+        standardClusters: stringArray(item.standardClusters),
+        rankingSignals: stringArray(item.rankingSignals),
+        factTypeBoosts: numberRecord(item.factTypeBoosts),
+        documentRoleBoosts: numberRecord(item.documentRoleBoosts),
+        evidenceRoleBoosts: numberRecord(item.evidenceRoleBoosts),
+        chunkTermBoosts: numberRecord(item.chunkTermBoosts),
+        routePolicy
+      };
+    })
+    .filter((item) => item.id);
+  return parsed.length ? parsed : fallback;
 }
 
 function profilePathValue(profile: Record<string, unknown>, key: string, configPath?: string): string | undefined {
@@ -71,6 +138,7 @@ function mergeProfile(base: EnvAirProfile, raw: unknown): EnvAirProfile {
     ...base,
     id: typeof raw.profileId === "string" ? raw.profileId : typeof raw.id === "string" ? raw.id : base.id,
     standardCatalog: Array.isArray(raw.standardCatalog) ? (raw.standardCatalog as EnvAirProfile["standardCatalog"]) : base.standardCatalog,
+    standardClusters: standardClusters(raw.standardClusters, base.standardClusters),
     envTerms: stringArray(raw.envTerms ?? raw.terms, base.envTerms),
     termAliases: recordOfStringArrays(raw.termAliases ?? raw.aliases, base.termAliases),
     pollutantFocusTerms: recordOfStringArrays(raw.pollutantFocusTerms, base.pollutantFocusTerms),
@@ -87,7 +155,7 @@ function mergeProfile(base: EnvAirProfile, raw: unknown): EnvAirProfile {
     aqiHints: stringArray(raw.aqiHints, base.aqiHints),
     monitoringMethodHints: stringArray(raw.monitoringMethodHints, base.monitoringMethodHints),
     authorityBoundaryHints: stringArray(raw.authorityBoundaryHints, base.authorityBoundaryHints),
-    intentRules: Array.isArray(raw.intentRules) ? (raw.intentRules as EnvAirProfile["intentRules"]) : base.intentRules,
+    intentRules: intentRules(raw.intentRules, base.intentRules),
     topicSeeds: Array.isArray(raw.topicSeeds) ? (raw.topicSeeds as EnvAirProfile["topicSeeds"]) : base.topicSeeds,
     shortSlugAllowlist: stringArray(raw.shortSlugAllowlist, base.shortSlugAllowlist),
     sourceAnalysisSystemPrompt: stringArray(raw.sourceAnalysisSystemPrompt, base.sourceAnalysisSystemPrompt),
@@ -144,7 +212,14 @@ export async function loadDomainProfile(rootDir: string, config: VaultConfig): P
 
   const intentRules = await readOptionalStructured(rootDir, referenced.intentRules);
   if (Array.isArray(intentRules)) {
-    profile = { ...profile, intentRules: intentRules as EnvAirProfile["intentRules"] };
+    profile = { ...profile, intentRules: mergeProfile(profile, { intentRules }).intentRules };
+  }
+
+  const rankingRules = await readOptionalStructured(rootDir, domain.rankingPath ?? referenced.rankingRules);
+  if (isRecord(rankingRules)) {
+    profile = mergeProfile(profile, rankingRules);
+  } else if (Array.isArray(rankingRules)) {
+    profile = { ...profile, intentRules: mergeProfile(profile, { intentRules: rankingRules }).intentRules };
   }
 
   const topicSeeds = await readOptionalStructured(rootDir, referenced.topicSeeds);

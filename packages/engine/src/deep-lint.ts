@@ -6,12 +6,13 @@ import { loadVaultConfig } from "./config.js";
 import { extractStandardReferences, standardIdentityKey } from "./domain/env-air.js";
 import { normalizeFindingSeverity } from "./findings.js";
 import { listManifests } from "./ingest.js";
+import { evaluateKnowledgeCandidateQuality } from "./knowledge-quality.js";
 import { runConfiguredRoles, summarizeRoleQuestions } from "./orchestration.js";
 import { getProviderForTask } from "./providers/registry.js";
 import { normalizeDeepLintCode } from "./providers/structured-repair.js";
 import { loadVaultSchema } from "./schema.js";
 import type { GraphArtifact, LintFinding, OrchestrationRole } from "./types.js";
-import { normalizeWhitespace, readJsonFile, truncate, uniqueBy } from "./utils.js";
+import { normalizeKnowledgeLabelKey, normalizeWhitespace, readJsonFile, slugify, truncate, uniqueBy } from "./utils.js";
 import { getWebSearchAdapterForTask } from "./web-search/registry.js";
 
 const deepLintResponseSchema = z.object({
@@ -133,6 +134,7 @@ function collapsedKnowledgeSlug(pathValue: string): { collapsed: boolean; severi
 async function deterministicEnvAirFindings(rootDir: string, graph: GraphArtifact): Promise<LintFinding[]> {
   const { paths } = await loadVaultConfig(rootDir);
   const findings: LintFinding[] = [];
+  const labelKeys = new Map<string, GraphArtifact["pages"]>();
   const pages = graph.pages.filter(
     (page) =>
       page.kind === "source" || page.kind === "module" || page.kind === "concept" || page.kind === "entity" || page.kind === "output"
@@ -145,6 +147,36 @@ async function deterministicEnvAirFindings(rootDir: string, graph: GraphArtifact
     }
     const parsed = matter(raw);
     const title = typeof parsed.data.title === "string" ? parsed.data.title : page.title;
+    if (page.kind === "concept" || page.kind === "entity") {
+      const labelKey = normalizeKnowledgeLabelKey(title);
+      labelKeys.set(labelKey, [...(labelKeys.get(labelKey) ?? []), page]);
+      const asciiSlug = slugify(title);
+      if (asciiSlug === "item") {
+        findings.push({
+          severity: "warning",
+          code: "ascii_slug_collision_risk",
+          message: `${page.kind} page ${title} would collapse to the legacy ASCII slug "item".`,
+          pagePath: absolutePath,
+          relatedPageIds: [page.id]
+        });
+      }
+      const quality = evaluateKnowledgeCandidateQuality({
+        title,
+        kind: page.kind,
+        sourceIds: page.sourceIds,
+        authorityLayers: typeof parsed.data.authority_layer === "string" ? [parsed.data.authority_layer] : undefined,
+        documentRoles: typeof parsed.data.document_role === "string" ? [parsed.data.document_role] : undefined
+      });
+      if (quality.severity === "reject" || quality.severity === "index_only") {
+        findings.push({
+          severity: quality.severity === "reject" ? "error" : "warning",
+          code: quality.tags.includes("document_title") ? "document_title_candidate" : "noisy_promoted_page",
+          message: `${page.kind} page ${title} has low candidate quality: ${quality.reasons.join(", ")}.`,
+          pagePath: absolutePath,
+          relatedPageIds: [page.id]
+        });
+      }
+    }
     if (page.kind === "output") {
       const invalidSourceIds = page.sourceIds.filter(
         (sourceId) => sourceId.includes("#") || sourceId.includes(":") || /^https?:\/\//i.test(sourceId)
@@ -282,6 +314,20 @@ async function deterministicEnvAirFindings(rootDir: string, graph: GraphArtifact
         pagePath: absolutePath,
         relatedSourceIds,
         relatedPageIds: [page.id]
+      });
+    }
+  }
+  for (const [labelKey, pagesWithKey] of labelKeys) {
+    const titles = uniqueBy(
+      pagesWithKey.map((page) => page.title),
+      (item) => item.toLowerCase()
+    );
+    if (titles.length > 1) {
+      findings.push({
+        severity: "warning",
+        code: "knowledge_label_key_collision",
+        message: `Knowledge label key ${labelKey} maps to multiple titles: ${titles.slice(0, 6).join(", ")}.`,
+        relatedPageIds: pagesWithKey.map((page) => page.id)
       });
     }
   }

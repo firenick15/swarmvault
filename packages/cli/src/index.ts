@@ -1017,6 +1017,7 @@ program
   .option("--strict-grounding", "Only answer when retrieved evidence is sufficient", false)
   .option("--debug-context", "Return retrieval evidence and grounding diagnostics in JSON output", false)
   .option("--return-decision-contract", "Include DeerFlow-facing decision metadata in query output", false)
+  .option("--retrieval-stale-policy <policy>", "Retrieval stale policy (error|auto_repair|warn)")
   .option("--scope <scope>", "Access scope (public_only|tenant_only|project_only|mixed_public_private)")
   .option("--tenant-id <id>", "Tenant id for scoped retrieval")
   .option("--project-id <id>", "Project id for scoped retrieval")
@@ -1055,6 +1056,7 @@ program
         strictGrounding?: boolean;
         debugContext?: boolean;
         returnDecisionContract?: boolean;
+        retrievalStalePolicy?: "error" | "auto_repair" | "warn";
         scope?: "public_only" | "tenant_only" | "project_only" | "mixed_public_private";
         tenantId?: string;
         projectId?: string;
@@ -1079,6 +1081,7 @@ program
         strictGrounding: options.strictGrounding ?? false,
         debugContext: options.debugContext ?? false,
         returnDecisionContract: options.returnDecisionContract ?? false,
+        retrievalStalePolicy: options.retrievalStalePolicy,
         scope: options.scope,
         tenantId: options.tenantId,
         projectId: options.projectId

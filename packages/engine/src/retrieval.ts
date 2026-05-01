@@ -4,10 +4,12 @@ import { loadVaultConfig } from "./config.js";
 import { applyStandardRelationOverrides } from "./domain/standard-relations.js";
 import { rebuildSearchIndex } from "./search.js";
 import type { GraphArtifact, RetrievalConfig, RetrievalDoctorResult, RetrievalManifest, RetrievalStatus, VaultConfig } from "./types.js";
-import { fileExists, readJsonFile, sha256, toPosix, writeJsonFile } from "./utils.js";
+import { ensureDir, fileExists, readJsonFile, sha256, toPosix, writeJsonFile } from "./utils.js";
 
 const DEFAULT_RETRIEVAL_SHARD_SIZE = 25000;
 export const RETRIEVAL_INDEX_SCHEMA_VERSION = 3;
+const RETRIEVAL_LOCK_POLL_MS = 500;
+const RETRIEVAL_LOCK_TIMEOUT_MS = 10 * 60 * 1000;
 
 const RETRIEVAL_INDEX_REQUIRED_COLUMNS: Record<string, string[]> = {
   pages: [
@@ -148,6 +150,7 @@ export function resolveRetrievalConfig(config: VaultConfig): RetrievalConfig {
     shardSize: config.retrieval?.shardSize ?? DEFAULT_RETRIEVAL_SHARD_SIZE,
     hybrid: config.retrieval?.hybrid ?? config.search?.hybrid ?? true,
     rerank: config.retrieval?.rerank ?? config.search?.rerank ?? false,
+    queryStalePolicy: config.retrieval?.queryStalePolicy ?? "auto_repair",
     embeddingProvider: config.retrieval?.embeddingProvider ?? config.tasks.embeddingProvider,
     maxIndexedRows: config.retrieval?.maxIndexedRows,
     chunking: {
@@ -157,6 +160,42 @@ export function resolveRetrievalConfig(config: VaultConfig): RetrievalConfig {
     },
     debug: config.retrieval?.debug ?? false
   };
+}
+
+async function withRetrievalLock<T>(rootDir: string, run: () => Promise<T>): Promise<T> {
+  const { paths } = await loadVaultConfig(rootDir);
+  await ensureDir(paths.retrievalDir);
+  const lockPath = path.join(paths.retrievalDir, "retrieval.lock");
+  const started = Date.now();
+  while (true) {
+    const handle = await fs.open(lockPath, "wx").catch(async (error) => {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+        throw error;
+      }
+      const stat = await fs.stat(lockPath).catch(() => null);
+      if (stat && Date.now() - stat.mtimeMs > RETRIEVAL_LOCK_TIMEOUT_MS) {
+        await fs.rm(lockPath, { force: true }).catch(() => undefined);
+      }
+      return null;
+    });
+    if (handle) {
+      try {
+        await handle.writeFile(JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString(), rootDir }, null, 2), "utf8");
+      } finally {
+        await handle.close();
+      }
+      break;
+    }
+    if (Date.now() - started > RETRIEVAL_LOCK_TIMEOUT_MS) {
+      throw new Error("Timed out waiting for retrieval index repair lock.");
+    }
+    await new Promise((resolve) => setTimeout(resolve, RETRIEVAL_LOCK_POLL_MS));
+  }
+  try {
+    return await run();
+  } finally {
+    await fs.rm(lockPath, { force: true }).catch(() => undefined);
+  }
 }
 
 function graphHash(graph: GraphArtifact): string {
@@ -202,9 +241,45 @@ export async function rebuildRetrievalIndex(rootDir: string): Promise<RetrievalS
     throw new Error("Graph artifact not found. Run `swarmvault compile` before rebuilding retrieval.");
   }
   await applyStandardRelationOverrides(paths.wikiDir, graph.pages);
-  await rebuildSearchIndex(paths.searchDbPath, graph.pages, paths.wikiDir, { chunking: config.retrieval?.chunking });
+  await ensureDir(paths.retrievalDir);
+  const tempDbPath = path.join(paths.retrievalDir, `fts-000.${process.pid}.${Date.now()}.tmp.sqlite`);
+  await fs.rm(tempDbPath, { force: true }).catch(() => undefined);
+  await rebuildSearchIndex(tempDbPath, graph.pages, paths.wikiDir, { chunking: config.retrieval?.chunking });
+  await fs.rm(paths.searchDbPath, { force: true }).catch(() => undefined);
+  await fs.rename(tempDbPath, paths.searchDbPath);
   await writeRetrievalManifest(rootDir, graph);
   return getRetrievalStatus(rootDir);
+}
+
+export async function ensureRetrievalReady(
+  rootDir: string,
+  options: { policy?: "error" | "auto_repair" | "warn" } = {}
+): Promise<{ status: RetrievalStatus; staleBeforeQuery: boolean; repaired: boolean; warnings: string[] }> {
+  let status = await getRetrievalStatus(rootDir);
+  const staleBeforeQuery = status.stale;
+  if (!status.graphExists) {
+    throw new Error("Graph artifact is missing. Run `swarmvault compile` before querying.");
+  }
+  if (!status.stale) {
+    return { status, staleBeforeQuery, repaired: false, warnings: status.warnings };
+  }
+  const policy = options.policy ?? status.configured.queryStalePolicy;
+  if (policy === "warn") {
+    return { status, staleBeforeQuery, repaired: false, warnings: status.warnings };
+  }
+  if (policy === "error") {
+    throw new Error(`Retrieval index is stale or missing. Run \`swarmvault retrieval doctor --repair\`. ${status.warnings.join(" ")}`);
+  }
+  let repaired = false;
+  status = await withRetrievalLock(rootDir, async () => {
+    const current = await getRetrievalStatus(rootDir);
+    if (!current.stale) {
+      return current;
+    }
+    repaired = true;
+    return rebuildRetrievalIndex(rootDir);
+  });
+  return { status, staleBeforeQuery, repaired, warnings: status.warnings };
 }
 
 export async function getRetrievalStatus(rootDir: string): Promise<RetrievalStatus> {

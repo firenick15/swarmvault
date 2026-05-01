@@ -985,7 +985,12 @@ export function mergeSearchResults(
 export function searchPages(dbPath: string, query: string, limitOrOptions: number | SearchQueryOptions = 5): SearchResult[] {
   const options = typeof limitOrOptions === "number" ? { limit: limitOrOptions } : limitOrOptions;
   const domainPlan = buildDomainQueryPlan(query, options.domainProfile);
-  const expandedQuery = [domainPlan.normalizedQuery, ...domainPlan.expandedTerms, ...domainPlan.pinnedStandards].join(" ");
+  const expandedQuery = [
+    domainPlan.normalizedQuery,
+    ...domainPlan.expandedTerms,
+    ...domainPlan.pinnedStandards,
+    ...domainPlan.standardClusters
+  ].join(" ");
   const normalizedQuery = normalizedStandardQuery(expandedQuery);
   const ftsQuery = toFtsQuery(normalizedQuery);
   const likeTerms = searchLikeTerms(normalizedQuery);
@@ -1008,12 +1013,24 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
   const ambientLimitIntent = domainPlan.rankingSignals.includes("ambient_air_quality_limit_question");
   const assessmentValidityIntent = domainPlan.rankingSignals.includes("ambient_air_assessment_validity_question");
   const amendmentIntent = /修改单|amendment/i.test(normalizedQuery);
+  const qaQcIntent =
+    domainPlan.standardClusters.includes("ambient_auto_monitoring_operation_qaqc") ||
+    domainPlan.rankingSignals.includes("qaqc_question") ||
+    /(质控|质量控制|质量保证|有效数据|负值|零点|量程|转换炉效率|平行性|比对)/u.test(normalizedQuery);
+  const statisticsIntent = domainPlan.standardClusters.includes("ambient_statistics_reporting") || options.intent === "statistics";
+  const rankingChunkTerms = uniqueCompact([
+    ...Object.keys(domainPlan.chunkTermBoosts ?? {}),
+    ...domainPlan.expandedTerms,
+    ...(qaQcIntent ? ["质控", "质量控制", "有效数据", "负值", "零点", "量程", "转换炉效率", "平行性", "比对测试"] : []),
+    ...(statisticsIntent ? ["公报", "月报", "年报", "统计", "城市", "评价城市", "统计期"] : [])
+  ]);
   const DatabaseSync = getDatabaseSync();
   const db = withSuppressedSqliteExperimentalWarning(() => new DatabaseSync(dbPath, { readOnly: true }));
   const limit = options.limit ?? 5;
   const candidateLimit = Math.max(limit * 3, limit + 5);
   const seen = new Set<string>();
   const seenPageIds = new Set<string>();
+  const chunkRowsByPage = new Map<string, number>();
   const rows: Array<Record<string, unknown>> = [];
 
   function selectedColumns(rankExpression: string, snippetExpression: string, stage: SearchResult["retrievalStage"]): string {
@@ -1228,6 +1245,10 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
         params.push(`%|${options.project}|%`);
       }
       clauses.push(`(${mixedClauses.join(" OR ")})`);
+    } else if (options.scope === "tenant_only" && !options.tenantId) {
+      clauses.push("1 = 0");
+    } else if (options.scope === "project_only" && !options.project) {
+      clauses.push("1 = 0");
     } else if (options.visibility) {
       clauses.push("pages.visibility = ?");
       params.push(options.visibility);
@@ -1251,6 +1272,18 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
 
   function standardCodeExpr(column: string): string {
     return `UPPER(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(${column}, ' ', ''), '-', ''), '/', ''), '—', ''), '–', ''), '―', ''), '：', ''))`;
+  }
+
+  function boostCase(column: "pages.document_role" | "pages.evidence_role", boosts: Record<string, number> | undefined): string {
+    const entries = Object.entries(boosts ?? {})
+      .filter(([key, value]) => /^[a-z_]+$/i.test(key) && Number.isFinite(Number(value)) && Number(value) > 0)
+      .slice(0, 12);
+    if (!entries.length) {
+      return "WHEN 1=0 THEN 0";
+    }
+    return entries
+      .map(([key, value]) => `WHEN ${column} = '${key.replace(/'/g, "''")}' THEN ${Math.max(0, Math.min(10, Number(value)))}`)
+      .join(" ");
   }
 
   function orderBy(): string {
@@ -1284,6 +1317,13 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
           WHEN ${currentBasisIntent ? 1 : 0} = 1 AND pages.legal_status = 'current_effective' THEN 0
           WHEN ${currentBasisIntent ? 1 : 0} = 1 AND pages.authority_layer IN ('core', 'method', 'local') THEN 1
           WHEN ${currentBasisIntent ? 1 : 0} = 1 THEN 2
+          ELSE 0
+        END,
+        CASE ${boostCase("pages.evidence_role", domainPlan.evidenceRoleBoosts)} ELSE 0 END * -1,
+        CASE ${boostCase("pages.document_role", domainPlan.documentRoleBoosts)} ELSE 0 END * -1,
+        CASE
+          WHEN ${statisticsIntent ? 1 : 0} = 1 AND pages.document_role IN ('statistics', 'whitepaper', 'official_explanation') THEN -4
+          WHEN ${qaQcIntent ? 1 : 0} = 1 AND pages.document_role IN ('monitoring_method', 'qa_qc', 'standard') THEN -4
           ELSE 0
         END,
         CASE pages.status
@@ -1328,8 +1368,20 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
     for (const row of nextRows) {
       const pageId = String(row.pageId ?? "");
       const stage = String(row.retrievalStage ?? "");
+      if (stage === "chunk_fts") {
+        const current = chunkRowsByPage.get(pageId) ?? 0;
+        const chunkBudget = qaQcIntent || statisticsIntent || domainPlan.pinnedStandards.length > 0 ? 3 : 1;
+        if (current >= chunkBudget) {
+          continue;
+        }
+        chunkRowsByPage.set(pageId, current + 1);
+      }
       const rowKey =
-        stage === "structured_fact" ? `${stage}:${String(row.factId ?? row.chunkId ?? pageId)}` : stage === "chunk_fts" ? pageId : pageId;
+        stage === "structured_fact"
+          ? `${stage}:${String(row.factId ?? row.chunkId ?? pageId)}`
+          : stage === "chunk_fts"
+            ? `${stage}:${String(row.chunkId ?? pageId)}`
+            : pageId;
       if (!pageId || seen.has(rowKey)) {
         continue;
       }
@@ -1404,7 +1456,14 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
           String(row.authorityLayer ?? "") === "method" ||
           standardCode.length > 0);
       const isAmendmentTarget = amendmentIntent && (title.includes("修改单") || standardCode.includes("修改单"));
-      if (!isAmbientLimitTarget && !isAssessmentValidityTarget && !isAmendmentTarget) {
+      const isRankingTarget =
+        rankingChunkTerms.length > 0 &&
+        (domainPlan.pinnedStandards.length > 0 ||
+          String(row.authorityLayer ?? "") === "core" ||
+          String(row.authorityLayer ?? "") === "method" ||
+          qaQcIntent ||
+          statisticsIntent);
+      if (!isAmbientLimitTarget && !isAssessmentValidityTarget && !isAmendmentTarget && !isRankingTarget) {
         return false;
       }
       if (!row.chunkId) {
@@ -1432,7 +1491,13 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
     ]);
     const amendmentTerms = uniqueCompact([...domainPlan.expandedTerms, "修改单", "修订", "替换"]);
     for (const row of targetRows) {
-      const terms = assessmentValidityIntent ? assessmentValidityTerms : ambientLimitIntent ? ambientTerms : amendmentTerms;
+      const terms = assessmentValidityIntent
+        ? assessmentValidityTerms
+        : ambientLimitIntent
+          ? ambientTerms
+          : amendmentIntent
+            ? amendmentTerms
+            : rankingChunkTerms;
       const statement = db.prepare(`
         SELECT id, ordinal, heading, kind, location, text
         FROM chunks
@@ -1452,9 +1517,13 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
               ? (includesFocusTerm(text, ambientTerms) ? 6 : 0) +
                 (/(年平均|日平均|1小时平均|日最大8小时平均)/.test(text) ? 4 : 0) +
                 (text.includes("浓度限值") || text.includes("一级") || text.includes("二级") ? 3 : 0)
-              : (text.includes("修改单") ? 5 : 0) +
-                amendmentTerms.reduce((score, term) => score + (text.includes(term) ? 2 : 0), 0) +
-                (hasUsefulAmendmentSnippet(sourceExcerptBody(text)) ? 8 : 0);
+              : amendmentIntent
+                ? (text.includes("修改单") ? 5 : 0) +
+                  amendmentTerms.reduce((score, term) => score + (text.includes(term) ? 2 : 0), 0) +
+                  (hasUsefulAmendmentSnippet(sourceExcerptBody(text)) ? 8 : 0)
+                : rankingChunkTerms.reduce((score, term) => score + (text.includes(term) ? 2 : 0), 0) +
+                  (qaQcIntent && /(质控|质量控制|有效数据|负值|零点|量程|转换炉效率|平行性)/u.test(text) ? 8 : 0) +
+                  (statisticsIntent && /(公报|月报|年报|统计|城市|评价城市)/u.test(text) ? 6 : 0);
           const kindScore = kind === "table" || kind === "formula" ? 2 : kind === "paragraph" ? 1 : kind === "heading" ? -1 : 0;
           return { chunk, score: domainScore + matchScore + kindScore, kindScore };
         })
@@ -1480,16 +1549,35 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
           ? assessmentValidityTerms
           : ambientLimitIntent
             ? ambientTerms
-            : ["将", "修改为", "结果表示", "按式", "式中"]
+            : amendmentIntent
+              ? ["将", "修改为", "结果表示", "按式", "式中"]
+              : rankingChunkTerms
       );
       row.retrievalStage = row.retrievalStage ?? "chunk_fts";
     }
   }
 
   try {
-    const factBoostExpression = assessmentValidityIntent
-      ? "bm25(fact_search) - CASE facts.fact_type WHEN 'validity_rule' THEN 5.0 WHEN 'limit_value' THEN 2.0 WHEN 'formula' THEN 1.5 WHEN 'technical_parameter' THEN 1.0 ELSE 0 END"
-      : "bm25(fact_search) - CASE facts.fact_type WHEN 'limit_value' THEN 4.0 WHEN 'formula' THEN 3.0 WHEN 'technical_parameter' THEN 2.0 ELSE 0 END";
+    const defaultFactBoosts: Record<string, number> = assessmentValidityIntent
+      ? { validity_rule: 5, limit_value: 2, formula: 1.5, technical_parameter: 1 }
+      : { limit_value: 4, formula: 3, technical_parameter: 2 };
+    if (qaQcIntent) {
+      defaultFactBoosts.technical_parameter = Math.max(defaultFactBoosts.technical_parameter ?? 0, 5);
+      defaultFactBoosts.validity_rule = Math.max(defaultFactBoosts.validity_rule ?? 0, 4);
+      defaultFactBoosts.method_step = Math.max(defaultFactBoosts.method_step ?? 0, 3);
+    }
+    if (statisticsIntent) {
+      defaultFactBoosts.status_rule = Math.max(defaultFactBoosts.status_rule ?? 0, 2);
+      defaultFactBoosts.technical_parameter = Math.max(defaultFactBoosts.technical_parameter ?? 0, 2);
+    }
+    for (const [key, value] of Object.entries(domainPlan.factTypeBoosts ?? {})) {
+      if (/^[a-z_]+$/i.test(key)) {
+        defaultFactBoosts[key] = Math.max(defaultFactBoosts[key] ?? 0, Math.max(0, Math.min(10, Number(value))));
+      }
+    }
+    const factBoostExpression = `bm25(fact_search) - CASE facts.fact_type ${Object.entries(defaultFactBoosts)
+      .map(([key, value]) => `WHEN '${key.replace(/'/g, "''")}' THEN ${value}`)
+      .join(" ")} ELSE 0 END`;
     if (hasExactStandards) {
       for (const exactStandard of exactStandards) {
         if (rows.length >= candidateLimit) {
@@ -1556,7 +1644,7 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
       try {
         const params: Array<number | string> = [ftsQuery];
         const clauses = ["chunk_search MATCH ?", ...buildFilterClauses(params)];
-        if (seenPageIds.size) {
+        if (seenPageIds.size && !qaQcIntent && !statisticsIntent && domainPlan.pinnedStandards.length === 0) {
           clauses.push(`pages.id NOT IN (${[...seenPageIds].map(() => "?").join(", ")})`);
           params.push(...[...seenPageIds]);
         }

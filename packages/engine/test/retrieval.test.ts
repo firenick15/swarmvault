@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   compileVault,
   doctorRetrieval,
+  ensureRetrievalReady,
   getRetrievalStatus,
   ingestInput,
   initVault,
@@ -69,6 +70,23 @@ describe("retrieval index", () => {
 
     const rebuilt = await rebuildRetrievalIndex(rootDir);
     expect(rebuilt.stale).toBe(false);
+  });
+
+  it("repairs stale retrieval artifacts before query use", async () => {
+    const rootDir = await createTempWorkspace();
+    await initVault(rootDir);
+    await fs.writeFile(path.join(rootDir, "alpha.md"), "# Alpha\n\nRetrieval readiness repairs stale manifests.\n", "utf8");
+    await ingestInput(rootDir, "alpha.md");
+    await compileVault(rootDir);
+    const manifestPath = path.join(rootDir, "state", "retrieval", "manifest.json");
+    const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8"));
+    manifest.graphHash = "stale";
+    await fs.writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+
+    const ready = await ensureRetrievalReady(rootDir, { policy: "auto_repair" });
+    expect(ready.staleBeforeQuery).toBe(true);
+    expect(ready.repaired).toBe(true);
+    expect(ready.status.stale).toBe(false);
   });
 
   it("migrates legacy search config and removes state/search.sqlite", async () => {

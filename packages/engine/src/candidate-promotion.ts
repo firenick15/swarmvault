@@ -1,4 +1,4 @@
-import { DEFAULT_ENV_AIR_PROFILE } from "./domain/env-air-profile.js";
+import { evaluateKnowledgeCandidateQuality } from "./knowledge-quality.js";
 import type { CandidatePromotionConfig, CompileState, GraphArtifact, GraphPage, PromotionDecision, PromotionGateResult } from "./types.js";
 
 export const DEFAULT_PROMOTION_CONFIG: CandidatePromotionConfig = {
@@ -42,11 +42,7 @@ function maxDegreeFor(graph: GraphArtifact, nodeIds: readonly string[]): number 
 }
 
 function slugQualityScore(title: string): number {
-  const normalized = title.trim().toLowerCase();
-  if (/^\d{4}.*(目录|清单|公告|公报|报告)/.test(title)) return 0;
-  const shortSlugAllowlist = new Set(DEFAULT_ENV_AIR_PROFILE.shortSlugAllowlist.map((item) => item.replace(/\s+/g, "").toLowerCase()));
-  if (/^[a-z0-9]{1,3}$/.test(normalized) && !shortSlugAllowlist.has(normalized.replace(/\./g, ""))) return 0.25;
-  return 1;
+  return evaluateKnowledgeCandidateQuality({ title, kind: "concept" }).score;
 }
 
 function describeGate(result: PromotionGateResult): string {

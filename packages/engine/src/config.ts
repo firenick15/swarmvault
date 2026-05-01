@@ -236,6 +236,7 @@ const vaultConfigSchema = z.object({
       shardSize: z.number().int().positive().optional(),
       hybrid: z.boolean().optional(),
       rerank: z.boolean().optional(),
+      queryStalePolicy: z.enum(["error", "auto_repair", "warn"]).optional(),
       embeddingProvider: z.string().min(1).optional(),
       maxIndexedRows: z.number().int().positive().optional(),
       chunking: z
@@ -252,7 +253,10 @@ const vaultConfigSchema = z.object({
     .object({
       failurePolicy: z.enum(["fail", "warn"]).optional(),
       maxFallbackRatio: z.number().min(0).max(1).optional(),
-      concurrency: z.number().int().positive().optional()
+      concurrency: z.number().int().positive().optional(),
+      maxInputChars: z.number().int().positive().optional(),
+      compactRetryChars: z.number().int().positive().optional(),
+      longDocumentMode: z.enum(["single_pass", "section_map_reduce"]).optional()
     })
     .optional(),
   domain: z
@@ -494,6 +498,7 @@ export function defaultVaultConfig(profile: VaultProfileConfig = defaultVaultPro
       shardSize: 25000,
       hybrid: true,
       rerank: false,
+      queryStalePolicy: "auto_repair",
       chunking: {
         enabled: true,
         maxChars: 1600,
@@ -503,7 +508,10 @@ export function defaultVaultConfig(profile: VaultProfileConfig = defaultVaultPro
     },
     analysis: {
       failurePolicy: "warn",
-      maxFallbackRatio: 1
+      maxFallbackRatio: 1,
+      maxInputChars: 18000,
+      compactRetryChars: 9000,
+      longDocumentMode: "single_pass"
     },
     domain: {}
   };

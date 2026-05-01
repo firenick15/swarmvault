@@ -14,4 +14,10 @@ describe("environment air tool routing", () => {
     expect(classifyEnvAirToolRouting("查询昨天北京国控站 PM2.5 小时值并分析超标过程").finalNextTool).toBe("environment_data_mcp");
     expect(classifyEnvAirToolRouting("按 HJ633 对上周臭氧监测数据计算 AQI").finalNextTool).toBe("both");
   });
+
+  it("routes time-location air quality status questions to the environment data MCP", () => {
+    const routing = classifyEnvAirToolRouting("今天北京市空气质量怎么样？");
+    expect(routing.finalNextTool).toBe("environment_data_mcp");
+    expect(routing.reasons).toContain("time_location_air_quality_status_request");
+  });
 });

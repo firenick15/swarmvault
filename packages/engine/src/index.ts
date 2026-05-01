@@ -127,6 +127,7 @@ export { assertProviderCapability, createProvider, getProviderForTask } from "./
 export { buildConfiguredRedactor, buildRedactor, DEFAULT_REDACTION_PATTERNS, resolveRedactionPatterns } from "./redaction.js";
 export {
   doctorRetrieval,
+  ensureRetrievalReady,
   getRetrievalStatus,
   rebuildRetrievalIndex,
   resolveRetrievalConfig,
@@ -149,7 +150,7 @@ export {
 export { estimatePageTokens, estimateTokens, trimToTokenBudget } from "./token-estimation.js";
 export { contentTokens, searchTokens, tokenize } from "./tokenize.js";
 export type * from "./types.js";
-export { slugifyKnowledgeLabel } from "./utils.js";
+export { normalizeKnowledgeLabelKey, slugifyKnowledgeLabel } from "./utils.js";
 export {
   acceptApproval,
   analysisStatusVault,

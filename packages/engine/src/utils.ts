@@ -26,6 +26,32 @@ export function slugifyKnowledgeLabel(value: string): string {
   return `item-${sha256(value).slice(0, 12)}`;
 }
 
+export function normalizeKnowledgeLabelKey(value: string): string {
+  const normalized = value
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/[‐‑‒–—―]/g, "-")
+    .replace(/[／]/g, "/")
+    .replace(/[．]/g, ".")
+    .replace(/['"`“”‘’]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  const compactStandard = normalized.match(
+    /\b(gb\/t|gb|hj\/t|hj|db[0-9]{2}\/t|db[0-9]{2})\s*[-/]?\s*([0-9]{2,6})(?:\s*[-:：]\s*([0-9]{2,4}))?\b/i
+  );
+  if (compactStandard) {
+    const family = compactStandard[1].toUpperCase().replace(/\s+/g, "");
+    const number = compactStandard[2];
+    const year = compactStandard[3] ? (compactStandard[3].length === 2 ? `20${compactStandard[3]}` : compactStandard[3]) : "";
+    return [family, number, year].filter(Boolean).join(":");
+  }
+  const key = normalized
+    .replace(/[^\p{Letter}\p{Number}.+/#-]+/gu, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return key || `item:${sha256(value).slice(0, 16)}`;
+}
+
 export function sha256(value: string | Uint8Array): string {
   return crypto.createHash("sha256").update(value).digest("hex");
 }

@@ -706,11 +706,44 @@ async function providerAnalysisWithRetry(
   text: string,
   provider: ProviderAdapter,
   schema: VaultSchema,
-  domainProfile: LoadedDomainProfile = DEFAULT_ENV_AIR_PROFILE
+  domainProfile: LoadedDomainProfile = DEFAULT_ENV_AIR_PROFILE,
+  options: { maxInputChars?: number; compactRetryChars?: number; longDocumentMode?: "single_pass" | "section_map_reduce" } = {}
 ): Promise<SourceAnalysis> {
   const failures: NonNullable<SourceAnalysis["providerFailures"]> = [];
+  const maxInputChars = options.maxInputChars ?? 18000;
+  const compactRetryChars = options.compactRetryChars ?? 9000;
+  const cleanedText = normalizeEnvAirText(text);
+  const analysisSegments =
+    options.longDocumentMode === "section_map_reduce" && cleanedText.length > maxInputChars
+      ? [
+          {
+            id: "segment:1",
+            heading: "initial-window",
+            charStart: 0,
+            charEnd: Math.min(cleanedText.length, maxInputChars),
+            providerId: provider.id
+          },
+          {
+            id: "segment:2",
+            heading: "tail-window",
+            charStart: Math.max(0, cleanedText.length - Math.floor(maxInputChars / 2)),
+            charEnd: cleanedText.length,
+            providerId: provider.id
+          }
+        ]
+      : undefined;
+  const analysisText =
+    analysisSegments && analysisSegments.length > 1
+      ? `${cleanedText.slice(analysisSegments[0].charStart, analysisSegments[0].charEnd)}\n\n[... middle omitted for long-document analysis ...]\n\n${cleanedText.slice(
+          analysisSegments[1].charStart,
+          analysisSegments[1].charEnd
+        )}`
+      : text;
   try {
-    return await providerAnalysis(manifest, text, provider, schema, domainProfile, { maxInputChars: 18000 });
+    const analysis = await providerAnalysis(manifest, analysisText, provider, schema, domainProfile, {
+      maxInputChars: analysisSegments ? analysisText.length : maxInputChars
+    });
+    return analysisSegments ? { ...analysis, analysisSegments } : analysis;
   } catch (error) {
     failures.push({
       phase: "initial",
@@ -719,9 +752,10 @@ async function providerAnalysisWithRetry(
     });
   }
   try {
-    const retry = await providerAnalysis(manifest, text, provider, schema, domainProfile, { maxInputChars: 9000 });
+    const retry = await providerAnalysis(manifest, analysisText, provider, schema, domainProfile, { maxInputChars: compactRetryChars });
     return {
       ...retry,
+      ...(analysisSegments ? { analysisSegments } : {}),
       providerFailures: failures,
       warnings: uniqueBy([...(retry.warnings ?? []), "provider_retry_succeeded:compact_retry"], (item) => item)
     };
@@ -801,7 +835,14 @@ export async function analyzeSource(
   provider: ProviderAdapter,
   paths: ResolvedPaths,
   schema: VaultSchema,
-  options: { bypassCache?: boolean; domainProfileHash?: string; domainProfile?: LoadedDomainProfile } = {}
+  options: {
+    bypassCache?: boolean;
+    domainProfileHash?: string;
+    domainProfile?: LoadedDomainProfile;
+    maxInputChars?: number;
+    compactRetryChars?: number;
+    longDocumentMode?: "single_pass" | "section_map_reduce";
+  } = {}
 ): Promise<SourceAnalysis> {
   const cachePath = path.join(paths.analysesDir, `${manifest.sourceId}.json`);
   const cached = options.bypassCache ? null : await readJsonFile<SourceAnalysis>(cachePath);
@@ -866,7 +907,7 @@ export async function analyzeSource(
       analysis = heuristicAnalysis(manifest, content, schema.hash);
     } else {
       try {
-        analysis = await providerAnalysisWithRetry(manifest, content, provider, schema, options.domainProfile);
+        analysis = await providerAnalysisWithRetry(manifest, content, provider, schema, options.domainProfile, options);
       } catch (error) {
         providerFailure = error instanceof Error ? error.message : String(error);
         providerFailures = (error as { providerFailures?: SourceAnalysis["providerFailures"] }).providerFailures ?? [];
@@ -900,7 +941,7 @@ export async function analyzeSource(
     analysis = heuristicAnalysis(manifest, content, schema.hash);
   } else {
     try {
-      analysis = await providerAnalysisWithRetry(manifest, content, provider, schema, options.domainProfile);
+      analysis = await providerAnalysisWithRetry(manifest, content, provider, schema, options.domainProfile, options);
     } catch (error) {
       providerFailure = error instanceof Error ? error.message : String(error);
       providerFailures = (error as { providerFailures?: SourceAnalysis["providerFailures"] }).providerFailures ?? [];

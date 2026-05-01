@@ -17,7 +17,13 @@ export interface EnvAirQueryPlan {
   standardRefs: StandardReference[];
   expandedTerms: string[];
   pinnedStandards: string[];
+  standardClusters: string[];
   rankingSignals: string[];
+  factTypeBoosts: Record<string, number>;
+  documentRoleBoosts: Record<string, number>;
+  evidenceRoleBoosts: Record<string, number>;
+  chunkTermBoosts: Record<string, number>;
+  routePolicies: Array<"knowledge" | "data" | "both" | "defer">;
   matchedIntentRules: string[];
   currentBasisIntent: boolean;
   temporalIntent: EnvAirTemporalIntent;
@@ -43,6 +49,29 @@ const POLLUTANT_FOCUS_TERMS: Record<string, string[]> = DEFAULT_ENV_AIR_PROFILE.
 
 function normalizeSpace(value: string): string {
   return value.replace(/\s+/g, " ").trim();
+}
+
+function mergeBoosts(target: Record<string, number>, next: Record<string, number> | undefined): void {
+  if (!next) {
+    return;
+  }
+  for (const [key, value] of Object.entries(next)) {
+    const parsed = Number(value);
+    if (!key || !Number.isFinite(parsed)) {
+      continue;
+    }
+    target[key] = Math.max(target[key] ?? 0, Math.max(0, Math.min(10, parsed)));
+  }
+}
+
+function standardsForClusters(profile: EnvAirProfile, clusterIds: string[]): string[] {
+  const clusters = new Set(clusterIds);
+  return [
+    ...profile.standardClusters.filter((cluster) => clusters.has(cluster.id)).flatMap((cluster) => cluster.standards),
+    ...profile.standardCatalog
+      .filter((entry) => entry.clusterIds?.some((clusterId) => clusters.has(clusterId)))
+      .map((entry) => entry.identity)
+  ];
 }
 
 function normalizeFamily(value: string): string {
@@ -303,7 +332,13 @@ export function buildEnvAirQueryPlan(
   const pollutants = pollutantFocus(normalizedQuery, profile);
   const expandedTerms: string[] = [];
   const pinnedStandards: string[] = [];
+  const standardClusters: string[] = [];
   const rankingSignals: string[] = [];
+  const factTypeBoosts: Record<string, number> = {};
+  const documentRoleBoosts: Record<string, number> = {};
+  const evidenceRoleBoosts: Record<string, number> = {};
+  const chunkTermBoosts: Record<string, number> = {};
+  const routePolicies: Array<"knowledge" | "data" | "both" | "defer"> = [];
   const matchedIntentRules: string[] = [];
 
   if (standardRefs.length) {
@@ -316,13 +351,26 @@ export function buildEnvAirQueryPlan(
 
   for (const rule of [...profile.intentRules].sort((left, right) => right.priority - left.priority)) {
     const textMatched = !rule.anyText?.length || includesAnyTerm(normalizedQuery, rule.anyText);
+    const allMatched = !rule.allText?.length || rule.allText.every((term) => includesAnyTerm(normalizedQuery, [term]));
+    const groupMatched =
+      !rule.anyTermGroups?.length ||
+      rule.anyTermGroups.some((group) => group.length > 0 && group.every((term) => includesAnyTerm(normalizedQuery, [term])));
     const pollutantMatched = rule.anyPollutant !== true || pollutants.length > 0;
-    if (!textMatched || !pollutantMatched) {
+    if (!textMatched || !allMatched || !groupMatched || !pollutantMatched) {
       continue;
     }
     expandedTerms.push(...(rule.expandedTerms ?? []));
     pinnedStandards.push(...(rule.pinnedStandards ?? []));
+    standardClusters.push(...(rule.standardClusters ?? []));
+    pinnedStandards.push(...standardsForClusters(profile, rule.standardClusters ?? []));
     rankingSignals.push(...(rule.rankingSignals ?? []));
+    mergeBoosts(factTypeBoosts, rule.factTypeBoosts);
+    mergeBoosts(documentRoleBoosts, rule.documentRoleBoosts);
+    mergeBoosts(evidenceRoleBoosts, rule.evidenceRoleBoosts);
+    mergeBoosts(chunkTermBoosts, rule.chunkTermBoosts);
+    if (rule.routePolicy) {
+      routePolicies.push(rule.routePolicy);
+    }
     matchedIntentRules.push(rule.id);
   }
   const temporalIntent = inferEnvAirTemporalIntent(normalizedQuery, options, profile);
@@ -337,7 +385,13 @@ export function buildEnvAirQueryPlan(
     standardRefs,
     expandedTerms: uniqueCompact(expandedTerms),
     pinnedStandards: uniqueCompact(pinnedStandards),
+    standardClusters: uniqueCompact(standardClusters),
     rankingSignals: uniqueCompact(rankingSignals),
+    factTypeBoosts,
+    documentRoleBoosts,
+    evidenceRoleBoosts,
+    chunkTermBoosts,
+    routePolicies: uniqueCompact(routePolicies) as Array<"knowledge" | "data" | "both" | "defer">,
     matchedIntentRules: uniqueCompact(matchedIntentRules),
     currentBasisIntent: inferCurrentBasisIntent(normalizedQuery, profile),
     temporalIntent,
@@ -356,6 +410,24 @@ function matchedTerms(question: string, terms: string[]): string[] {
 }
 
 export function classifyEnvAirToolRouting(question: string, profile: EnvAirProfile = DEFAULT_ENV_AIR_PROFILE): ToolRoutingDecision {
+  const normalizedQuestion = question
+    .replace(STANDARD_DASH_PATTERN, "-")
+    .replace(/\bpm\s*2\s*\.?\s*5\b/gi, "PM2.5")
+    .replace(/\bpm\s*1\s*0\b/gi, "PM10")
+    .trim();
+  const pollutants = pollutantFocus(normalizedQuestion, profile);
+  const routePolicies: Array<"knowledge" | "data" | "both" | "defer"> = [];
+  for (const rule of [...profile.intentRules].sort((left, right) => right.priority - left.priority)) {
+    const textMatched = !rule.anyText?.length || includesAnyTerm(normalizedQuestion, rule.anyText);
+    const allMatched = !rule.allText?.length || rule.allText.every((term) => includesAnyTerm(normalizedQuestion, [term]));
+    const groupMatched =
+      !rule.anyTermGroups?.length ||
+      rule.anyTermGroups.some((group) => group.length > 0 && group.every((term) => includesAnyTerm(normalizedQuestion, [term])));
+    const pollutantMatched = rule.anyPollutant !== true || pollutants.length > 0;
+    if (textMatched && allMatched && groupMatched && pollutantMatched && rule.routePolicy) {
+      routePolicies.push(rule.routePolicy);
+    }
+  }
   const dataObjects = matchedTerms(question, profile.dataObjectTerms);
   const dataTimes = matchedTerms(question, profile.dataTimeTerms);
   const dataLocations = matchedTerms(question, profile.dataLocationTerms);
@@ -372,11 +444,19 @@ export function classifyEnvAirToolRouting(question: string, profile: EnvAirProfi
   const hasConcreteDataObject = dataObjects.length > 0;
   const hasDataFrame = dataTimes.length > 0 || dataLocations.length > 0;
   const hasDataOperation = dataOperations.length > 0;
+  const hasAirQualityStatus = /(空气质量|污染|优良|轻度|中度|重度|严重|aqi|iaqi|浓度|超标|达标)/iu.test(question);
+  const hasTimeLocationStatus = dataTimes.length > 0 && dataLocations.length > 0 && hasAirQualityStatus;
   const actualDataAction =
-    hasExplicitDataTool || /实测|实际监测|监测数据|原始数据|站点数据|是否超标|排名|同比|环比|过程分析|异常|查询|统计/u.test(question);
+    hasExplicitDataTool ||
+    hasTimeLocationStatus ||
+    /实测|实际监测|监测数据|原始数据|站点数据|是否超标|排名|同比|环比|过程分析|异常|查询|统计/u.test(question);
   const basisOnlyQuestion = basisOnlySignals.length > 0 && !actualDataAction;
-  const wantsData = !basisOnlyQuestion && (hasExplicitDataTool || hasConcreteDataObject || (hasDataFrame && hasDataOperation));
-  const wantsKnowledge = knowledgeSignals.length > 0;
+  const ruleWantsData = routePolicies.includes("data") || routePolicies.includes("both");
+  const ruleWantsKnowledge = routePolicies.includes("knowledge") || routePolicies.includes("both");
+  const wantsData =
+    !basisOnlyQuestion &&
+    (ruleWantsData || hasExplicitDataTool || hasConcreteDataObject || hasTimeLocationStatus || (hasDataFrame && hasDataOperation));
+  const wantsKnowledge = ruleWantsKnowledge || knowledgeSignals.length > 0;
   const reasons: string[] = [];
   if (wantsKnowledge) {
     reasons.push("knowledge_signals_present");
@@ -385,6 +465,8 @@ export function classifyEnvAirToolRouting(question: string, profile: EnvAirProfi
     reasons.push("explicit_environment_data_mcp_request");
   } else if (basisOnlyQuestion) {
     reasons.push("basis_only_question");
+  } else if (hasTimeLocationStatus) {
+    reasons.push("time_location_air_quality_status_request");
   } else if (hasConcreteDataObject) {
     reasons.push("monitoring_data_object_present");
   } else if (hasDataFrame && hasDataOperation) {
@@ -396,12 +478,24 @@ export function classifyEnvAirToolRouting(question: string, profile: EnvAirProfi
     reasons.push("data_terms_without_concrete_monitoring_request");
   }
   const finalNextTool: RecommendedNextTool = wantsData && wantsKnowledge ? "both" : wantsData ? "environment_data_mcp" : "knowledge_base";
+  const confidence = hasExplicitDataTool || basisOnlyQuestion || hasTimeLocationStatus ? 0.95 : wantsData || wantsKnowledge ? 0.75 : 0.45;
   return {
     deterministicNextTool: finalNextTool,
     finalNextTool,
     reasons,
     dataSignals,
     knowledgeSignals,
+    knowledgeNeeded: wantsKnowledge,
+    dataNeeded: wantsData,
+    confidence,
+    matchedSignals: {
+      time: dataTimes,
+      location: dataLocations,
+      dataObject: dataObjects,
+      operation: dataOperations,
+      basisOnly: basisOnlySignals,
+      knowledge: knowledgeSignals
+    },
     conflictResolvedBy: "deterministic_policy"
   };
 }
