@@ -1,5 +1,6 @@
 import matter from "gray-matter";
 import { modulePageTitle } from "./code-analysis.js";
+import { authorityStatusNotice, authorityUseBoundary } from "./domain/authority-text.js";
 import { filterGraphBySourceClass, sourceClassBreakdown } from "./embeddings.js";
 import { describeSimilarityReasons } from "./graph-enrichment.js";
 import { buildGraphShareArtifact, renderGraphShareMarkdown } from "./graph-share.js";
@@ -361,6 +362,12 @@ export function buildSourcePage(
         }
       : {}),
     ...(analysis.analysisMode ? { analysis_mode: analysis.analysisMode } : {}),
+    ...(analysis.analysisMode === "empty"
+      ? {
+          extraction_status: "manual_required",
+          needs_ocr: true
+        }
+      : {}),
     ...(analysis.providerId ? { analysis_provider_id: analysis.providerId } : {}),
     ...(analysis.providerModel ? { analysis_provider_model: analysis.providerModel } : {}),
     ...(analysis.warnings?.length ? { analysis_warnings: analysis.warnings } : {}),
@@ -383,6 +390,14 @@ export function buildSourcePage(
     schema_hash: schemaHash,
     ...sourceHashFrontmatter(sourceHashes, sourceSemanticHashes)
   };
+  const authorityNotice = authorityStatusNotice(analysis.domain, {
+    title: analysis.title,
+    path: manifest.originalPath ?? manifest.storedPath
+  });
+  const useBoundary = authorityUseBoundary(analysis.domain, {
+    title: analysis.title,
+    path: manifest.originalPath ?? manifest.storedPath
+  });
 
   const body = appendGuidedSourceBlocks(
     [
@@ -399,13 +414,15 @@ export function buildSourcePage(
             `Document Role: \`${analysis.domain.documentRole}\``,
             `Legal Status: \`${analysis.domain.legalStatus}\``,
             ...(analysis.domain.standardCode ? [`Standard Code: \`${analysis.domain.standardCode}\``] : []),
-            ...(analysis.domain.notes?.some((note) => note.startsWith("legal_status_"))
+            ...(authorityNotice || useBoundary || analysis.domain.notes?.some((note) => note.startsWith("legal_status_"))
               ? [
                   "",
                   "## Status Notice",
                   "",
+                  ...(authorityNotice ? [`- ${authorityNotice}`] : []),
+                  ...(useBoundary ? [`- Use boundary: ${useBoundary}`] : []),
                   `- Normalized legal status: \`${analysis.domain.legalStatus}\``,
-                  ...analysis.domain.notes
+                  ...(analysis.domain.notes ?? [])
                     .filter((note) => note.startsWith("legal_status_"))
                     .slice(0, 4)
                     .map((note) => `- ${note}`)
@@ -469,6 +486,7 @@ export function buildSourcePage(
         ? analysis.claims.map((claim) => `- ${claim.text} [source:${claim.citation}]`)
         : ["- No claims extracted."]),
       "",
+      ...(useBoundary ? ["## Use Boundaries", "", useBoundary, ""] : []),
       "## Questions",
       "",
       ...(analysis.questions.length ? analysis.questions.map((question) => `- ${question}`) : ["- No follow-up questions yet."]),

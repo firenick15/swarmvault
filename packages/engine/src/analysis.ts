@@ -4,6 +4,7 @@ import nlp from "compromise";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 import { analyzeCodeSource } from "./code-analysis.js";
+import { classifyAuthorityUse, reconcileSourceAnalysisAuthority } from "./domain/authority-text.js";
 import { extractStandardReferences } from "./domain/env-air.js";
 import { DEFAULT_ENV_AIR_PROFILE } from "./domain/env-air-profile.js";
 import { normalizeDomainMetadataLegalStatus } from "./domain/env-air-status.js";
@@ -41,7 +42,7 @@ import {
   writeJsonFile
 } from "./utils.js";
 
-const ANALYSIS_FORMAT_VERSION = 10;
+const ANALYSIS_FORMAT_VERSION = 11;
 
 const domainMetadataSchema = z
   .object({
@@ -538,16 +539,18 @@ function normalizeAnalysisTitle(manifest: SourceManifest, candidate: string): st
 
 function normalizeSourceAnalysis(manifest: SourceManifest, analysis: SourceAnalysis): SourceAnalysis {
   const title = normalizeAnalysisTitle(manifest, analysis.title);
+  const sourcePath = manifest.originalPath ?? manifest.repoRelativePath ?? manifest.storedPath;
   const domain = analysis.domain
     ? normalizeDomainMetadataLegalStatus(analysis.domain, {
         title,
-        path: manifest.originalPath ?? manifest.repoRelativePath ?? manifest.storedPath
+        path: sourcePath
       })
     : undefined;
-  if (title === analysis.title && JSON.stringify(domain ?? null) === JSON.stringify(analysis.domain ?? null)) {
-    return analysis;
-  }
-  return { ...analysis, title, ...(domain ? { domain } : {}) };
+  const normalized =
+    title === analysis.title && JSON.stringify(domain ?? null) === JSON.stringify(analysis.domain ?? null)
+      ? analysis
+      : { ...analysis, title, ...(domain ? { domain } : {}) };
+  return reconcileSourceAnalysisAuthority(normalized, { title, path: sourcePath });
 }
 
 function heuristicAnalysis(manifest: SourceManifest, text: string, schemaHash: string): SourceAnalysis {
@@ -613,12 +616,22 @@ async function providerAnalysis(
 ): Promise<SourceAnalysis> {
   const cleanedText = normalizeEnvAirText(text);
   const repairWarnings: string[] = [];
+  const inferred = inferDomainMetadata(manifest, cleanedText);
+  const inferredAuthority = classifyAuthorityUse(inferred, {
+    title: manifest.title,
+    path: manifest.originalPath ?? manifest.repoRelativePath ?? manifest.storedPath
+  });
   const parsed = await provider.generateStructured(
     {
       system: [
         ...domainProfile.sourceAnalysisSystemPrompt,
         "",
         "Follow the vault schema when choosing titles, categories, relationships, and summaries.",
+        "",
+        "Use the inferred authority metadata below as a constraint. Do not describe drafts, explanations, statistics, research, or superseded materials as current binding execution basis unless the evidence explicitly proves current legal force.",
+        `Inferred authority metadata: authority_layer=${inferred.authorityLayer}; legal_force=${inferred.legalForce}; document_role=${inferred.documentRole}; legal_status=${inferred.legalStatus}; use_class=${inferredAuthority.useClass}.`,
+        inferredAuthority.statement ? `Authority status notice to respect: ${inferredAuthority.statement}` : "",
+        inferredAuthority.useBoundary ? `Authority use boundary: ${inferredAuthority.useBoundary}` : "",
         "",
         "Return up to 5 broad domain tags that categorize this source. Tags should be lowercase kebab-case (e.g., cryptography, distributed-systems, machine-learning). These are broader categories, not specific concepts or entity names.",
         "",
@@ -652,7 +665,6 @@ async function providerAnalysis(
         llmUncertainFields: parsed.domain.llmUncertainFields ?? []
       } as DomainMetadata)
     : undefined;
-  const inferred = inferDomainMetadata(manifest, cleanedText);
   const domain: DomainMetadata = parsedDomain
     ? {
         ...inferred,

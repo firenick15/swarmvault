@@ -10,6 +10,7 @@ import type {
   ContextPackFormat,
   GraphArtifact,
   GuidedSourceSessionQuestion,
+  QueryIntent,
   SourceClass
 } from "@swarmvaultai/engine";
 import {
@@ -60,6 +61,7 @@ import {
   listManifests,
   listMemoryTasks,
   listSchedules,
+  listSourceExtractionIssues,
   listWatchedRoots,
   loadVaultConfig,
   pathGraphVault,
@@ -685,6 +687,32 @@ source
       for (const entry of sources) {
         log(`${entry.id}  ${entry.kind}  ${entry.status}  ${entry.title}`);
       }
+    }
+  });
+
+source
+  .command("doctor")
+  .description("List source extraction issues such as empty text or OCR/manual-review requirements.")
+  .option("--empty-only", "Only list sources with empty extracted text", false)
+  .option("--needs-ocr", "Only list sources marked as needing OCR or manual extraction review", false)
+  .action(async (options: { emptyOnly?: boolean; needsOcr?: boolean }) => {
+    const issues = await listSourceExtractionIssues(process.cwd(), {
+      emptyOnly: options.emptyOnly,
+      needsOcr: options.needsOcr
+    });
+    if (isJson()) {
+      emitJson({ count: issues.length, issues });
+      return;
+    }
+    if (!issues.length) {
+      log("No source extraction issues found.");
+      return;
+    }
+    for (const issue of issues) {
+      log(
+        `${issue.path} - ${issue.title} (${issue.extractionStatus ?? issue.analysisMode ?? "unknown"})` +
+          `${issue.sourcePath ? `\n  Source: ${issue.sourcePath}` : ""}\n  ${issue.message}`
+      );
     }
   });
 
@@ -1804,18 +1832,48 @@ graph
   .argument("<question>", "Question or graph search seed")
   .option("--dfs", "Prefer a depth-first traversal instead of breadth-first", false)
   .option("--budget <n>", "Maximum number of graph nodes to summarize")
-  .action(async (question: string, options: { dfs?: boolean; budget?: string }) => {
-    const budget = options.budget ? parsePositiveInt(options.budget, 0) || undefined : undefined;
-    const result = await queryGraphVault(process.cwd(), question, {
-      traversal: options.dfs ? "dfs" : "bfs",
-      budget
-    });
-    if (isJson()) {
-      emitJson(result);
-      return;
+  .option("--intent <intent>", "Domain intent hint for seed ranking")
+  .option("--region <region>", "Region hint for domain-aware seed ranking")
+  .option("--pollutant <pollutant>", "Pollutant hint for domain-aware seed ranking")
+  .option("--as-of-date <date>", "As-of date for temporal graph ranking")
+  .option("--evaluation-period <period>", "Evaluation period hint for graph ranking")
+  .option("--evaluation-year <year>", "Evaluation year hint for graph ranking")
+  .option("--explain-seeds", "Include seed ranking diagnostics in JSON output", false)
+  .action(
+    async (
+      question: string,
+      options: {
+        dfs?: boolean;
+        budget?: string;
+        intent?: string;
+        region?: string;
+        pollutant?: string;
+        asOfDate?: string;
+        evaluationPeriod?: string;
+        evaluationYear?: string;
+        explainSeeds?: boolean;
+      }
+    ) => {
+      const budget = options.budget ? parsePositiveInt(options.budget, 0) || undefined : undefined;
+      const evaluationYear = options.evaluationYear ? parsePositiveInt(options.evaluationYear, 0) || undefined : undefined;
+      const result = await queryGraphVault(process.cwd(), question, {
+        traversal: options.dfs ? "dfs" : "bfs",
+        budget,
+        intent: options.intent as QueryIntent | undefined,
+        region: options.region,
+        pollutant: options.pollutant,
+        asOfDate: options.asOfDate,
+        evaluationPeriod: options.evaluationPeriod,
+        evaluationYear,
+        explainSeeds: options.explainSeeds
+      });
+      if (isJson()) {
+        emitJson(result);
+        return;
+      }
+      log(result.summary);
     }
-    log(result.summary);
-  });
+  );
 
 graph
   .command("path")

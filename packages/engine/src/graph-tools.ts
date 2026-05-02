@@ -12,6 +12,7 @@ import type {
   GraphPage,
   GraphPathResult,
   GraphQueryMatch,
+  GraphQueryOptions,
   GraphQueryResult,
   SearchResult
 } from "./types.js";
@@ -64,6 +65,133 @@ function scoreMatch(query: string, candidate: string): number {
   const candidateTokens = new Set(normalizedCandidate.split(/\s+/).filter(Boolean));
   const overlap = queryTokens.filter((token) => candidateTokens.has(token)).length;
   return overlap ? overlap * 10 : 0;
+}
+
+function compactText(value: string): string {
+  return normalizeTarget(value).replace(/\s+/g, "");
+}
+
+function queryTerms(query: string): string[] {
+  const normalized = normalizeTarget(query);
+  const terms = new Set<string>();
+  for (const match of normalized.matchAll(/[a-z0-9./-]+|[\p{Script=Han}]{2,}/gu)) {
+    const token = match[0];
+    if (token.length >= 2) {
+      terms.add(token);
+    }
+    if (/[\p{Script=Han}]/u.test(token) && token.length > 4) {
+      for (let size = 2; size <= Math.min(6, token.length); size++) {
+        for (let index = 0; index + size <= token.length; index++) {
+          terms.add(token.slice(index, index + size));
+        }
+      }
+    }
+  }
+  return [...terms].filter((term) => term.length >= 2);
+}
+
+function scoreTermOverlap(query: string, candidate: string): { score: number; matched: string[] } {
+  const candidateCompact = compactText(candidate);
+  if (!candidateCompact) {
+    return { score: 0, matched: [] };
+  }
+  const matched = queryTerms(query).filter((term) => candidateCompact.includes(term.replace(/\s+/g, "")));
+  const score = matched.reduce((sum, term) => sum + Math.min(18, Math.max(4, term.length * 2)), 0);
+  return { score, matched: matched.slice(0, 8) };
+}
+
+function inferredGraphIntent(question: string, options?: GraphQueryOptions): string | undefined {
+  if (options?.intent) {
+    return options.intent;
+  }
+  const compact = compactText(question);
+  if (/(月报|年报|公报|报告|统计|城市数量|339个城市|趋势|同比|环比)/u.test(compact)) {
+    return "statistics";
+  }
+  if (/(限值|浓度|执行|依据|现行|标准|评价|达标)/u.test(compact)) {
+    return "current_basis";
+  }
+  if (/(历史|废止|替代|代替|征求意见|编制说明|演化|变化|修改单)/u.test(compact)) {
+    return "evolution";
+  }
+  if (/(地方|省|市|自治区|口径|落地)/u.test(compact)) {
+    return "local";
+  }
+  return undefined;
+}
+
+function domainSeedBoost(
+  question: string,
+  result: SearchResult | undefined,
+  options?: GraphQueryOptions
+): { score: number; reasons: string[] } {
+  let score = 0;
+  const reasons: string[] = [];
+  const intent = inferredGraphIntent(question, options);
+  const documentRole = result?.documentRole ?? "";
+  const evidenceRole = result?.evidenceRole ?? "";
+  const legalStatus = result?.legalStatus ?? "";
+  const title = result?.title ?? "";
+  const authorityLayer = result?.authorityLayer ?? "";
+  const roleBoost = documentRole ? (options?.documentRoleBoosts?.[documentRole] ?? 0) : 0;
+  const evidenceBoost = evidenceRole ? (options?.evidenceRoleBoosts?.[evidenceRole] ?? 0) : 0;
+  if (roleBoost) {
+    score += roleBoost;
+    reasons.push(`profile_document_role_boost:${documentRole}:${roleBoost}`);
+  }
+  if (evidenceBoost) {
+    score += evidenceBoost;
+    reasons.push(`profile_evidence_role_boost:${evidenceRole}:${evidenceBoost}`);
+  }
+  if (intent === "statistics") {
+    if (documentRole === "statistics" || evidenceRole === "statistics") {
+      score += 45;
+      reasons.push("statistics_intent_metadata");
+    }
+    if (/(月报|年报|公报|报告|统计|bulletin|statistics)/iu.test(title)) {
+      score += 25;
+      reasons.push("statistics_intent_title");
+    }
+  } else if (intent === "current_basis") {
+    if (legalStatus === "current_effective") {
+      score += 22;
+      reasons.push("current_basis_current_status");
+    }
+    if (["law", "regulation", "policy", "standard", "emission_standard", "monitoring_method"].includes(documentRole)) {
+      score += 28;
+      reasons.push(`current_basis_document_role:${documentRole}`);
+    }
+    if (authorityLayer === "core" || authorityLayer === "method" || authorityLayer === "local") {
+      score += 16;
+      reasons.push(`current_basis_authority_layer:${authorityLayer}`);
+    }
+  } else if (intent === "evolution") {
+    if (["draft", "amendment", "official_explanation", "compilation_explanation"].includes(documentRole)) {
+      score += 28;
+      reasons.push(`evolution_document_role:${documentRole}`);
+    }
+    if (["draft_consultation", "superseded", "explanation_only"].includes(legalStatus)) {
+      score += 22;
+      reasons.push(`evolution_legal_status:${legalStatus}`);
+    }
+  } else if (intent === "local") {
+    if (authorityLayer === "local" || documentRole === "local_reference" || result?.region) {
+      score += 30;
+      reasons.push("local_intent_metadata");
+    }
+  }
+  if (options?.region && result?.region && compactText(options.region) === compactText(result.region)) {
+    score += 18;
+    reasons.push(`region_match:${result.region}`);
+  }
+  if (
+    options?.pollutant &&
+    result?.pollutants?.some((pollutant) => compactText(pollutant).includes(compactText(options.pollutant ?? "")))
+  ) {
+    score += 18;
+    reasons.push(`pollutant_match:${options.pollutant}`);
+  }
+  return { score, reasons };
 }
 
 function primaryNodeForPage(graph: GraphArtifact, page: GraphPage): GraphNode | undefined {
@@ -212,11 +340,7 @@ export function queryGraph(
   graph: GraphArtifact,
   question: string,
   searchResults: SearchResult[],
-  options?: {
-    traversal?: "bfs" | "dfs";
-    budget?: number;
-    semanticMatches?: GraphQueryMatch[];
-  }
+  options?: GraphQueryOptions
 ): GraphQueryResult {
   const traversal = options?.traversal ?? "bfs";
   const budget = Math.max(3, Math.min(options?.budget ?? 12, 50));
@@ -232,17 +356,64 @@ export function queryGraph(
     .sort((left, right) => right.score - left.score || left.label.localeCompare(right.label))
     .slice(0, 12);
   const pages = pageById(graph);
-  const seeds = uniqueBy(
-    [
-      ...searchResults.flatMap((result) => pages.get(result.pageId)?.nodeIds ?? []),
-      ...matches.filter((match) => match.type === "page").flatMap((match) => pages.get(match.id)?.nodeIds ?? []),
-      ...matches.filter((match) => match.type === "node").map((match) => match.id),
-      ...matches
-        .filter((match) => match.type === "hyperedge")
-        .flatMap((match) => graph.hyperedges.find((hyperedge) => hyperedge.id === match.id)?.nodeIds ?? [])
-    ],
-    (item) => item
-  ).filter(Boolean);
+  const nodes = nodeById(graph);
+  const searchByPage = new Map(searchResults.map((result, index) => [result.pageId, { result, index }]));
+  const seedScores = new Map<string, { nodeId: string; pageId?: string; score: number; reasons: string[] }>();
+  const addSeed = (nodeId: string | undefined, baseScore: number, reasons: string[], pageId?: string) => {
+    if (!nodeId) {
+      return;
+    }
+    const node = nodes.get(nodeId);
+    const page = pageId ? pages.get(pageId) : node?.pageId ? pages.get(node.pageId) : undefined;
+    const search = page ? searchByPage.get(page.id)?.result : undefined;
+    const overlap = scoreTermOverlap(
+      question,
+      [node?.label ?? "", node?.id ?? "", page?.title ?? "", search?.title ?? "", search?.snippet ?? ""].join(" ")
+    );
+    const metadataBoost = domainSeedBoost(question, search, options);
+    const score = baseScore + nodeTypePriority(node?.type ?? "") * 2 + overlap.score + metadataBoost.score;
+    const nextReasons = uniqueBy(
+      [...reasons, ...(overlap.matched.length ? [`query_terms:${overlap.matched.join(",")}`] : []), ...metadataBoost.reasons],
+      (item) => item
+    );
+    const existing = seedScores.get(nodeId);
+    if (!existing || score > existing.score) {
+      seedScores.set(nodeId, { nodeId, pageId: page?.id, score, reasons: nextReasons });
+    }
+  };
+
+  searchResults.forEach((result, index) => {
+    const page = pages.get(result.pageId);
+    const rankBoost = Number.isFinite(result.rank) ? Math.max(0, Math.min(30, -result.rank || 0)) : 0;
+    for (const nodeId of page?.nodeIds ?? []) {
+      addSeed(nodeId, 120 - index * 3 + rankBoost, [`search_result:${index + 1}`], page?.id);
+    }
+  });
+  for (const match of matches) {
+    if (match.type === "page") {
+      const page = pages.get(match.id);
+      for (const nodeId of page?.nodeIds ?? []) {
+        addSeed(nodeId, 80 + match.score, [`graph_match:page:${match.label}`], page?.id);
+      }
+    } else if (match.type === "node") {
+      addSeed(match.id, 70 + match.score, [`graph_match:node:${match.label}`]);
+    } else {
+      for (const nodeId of graph.hyperedges.find((hyperedge) => hyperedge.id === match.id)?.nodeIds ?? []) {
+        addSeed(nodeId, 60 + match.score, [`graph_match:hyperedge:${match.label}`]);
+      }
+    }
+  }
+  const seedDiagnostics = [...seedScores.values()]
+    .sort((left, right) => right.score - left.score || left.nodeId.localeCompare(right.nodeId))
+    .slice(0, Math.max(budget * 2, 12));
+  const seeds = seedDiagnostics.map((item) => item.nodeId);
+  const warnings: string[] = [];
+  if (!matches.length) {
+    warnings.push("graph_query_no_direct_matches");
+  }
+  if (!seeds.length) {
+    warnings.push("graph_query_no_seed_nodes");
+  }
 
   const adjacency = graphAdjacency(graph);
   const visitedNodeIds: string[] = [];
@@ -268,7 +439,6 @@ export function queryGraph(
     }
   }
 
-  const nodes = nodeById(graph);
   const pageIds = uniqueBy(
     [
       ...searchResults.map((result) => result.pageId),
@@ -305,13 +475,16 @@ export function queryGraph(
     pageIds,
     communities,
     matches,
+    seedDiagnostics: options?.explainSeeds ? seedDiagnostics : undefined,
+    warnings: warnings.length ? warnings : undefined,
     summary: [
       `Seeds: ${seeds.join(", ") || "none"}`,
       `Visited nodes: ${visitedNodeIds.length}`,
       `Visited edges: ${visitedEdgeIds.size}`,
       `Touched group patterns: ${hyperedgeIds.length}`,
       `Communities: ${communities.join(", ") || "none"}`,
-      `Pages: ${pageIds.join(", ") || "none"}`
+      `Pages: ${pageIds.join(", ") || "none"}`,
+      ...(warnings.length ? [`Warnings: ${warnings.join(", ")}`] : [])
     ].join("\n")
   };
 }

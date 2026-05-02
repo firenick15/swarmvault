@@ -139,6 +139,7 @@ import type {
   GraphNode,
   GraphPage,
   GraphPathResult,
+  GraphQueryOptions,
   GraphQueryResult,
   GraphReportArtifact,
   GraphShareBundleFile,
@@ -159,6 +160,7 @@ import type {
   SearchResult,
   SourceAnalysis,
   SourceClass,
+  SourceExtractionIssue,
   SourceManifest,
   StandardCoverage,
   ToolRoutingDecision,
@@ -210,6 +212,7 @@ type QueryExecutionResult = {
   excludedEvidenceSet?: QueryResult["excludedEvidenceSet"];
   standardCoverage?: QueryResult["standardCoverage"];
   evidenceCompleteness?: QueryResult["evidenceCompleteness"];
+  structuredAnswerDiagnostics?: QueryResult["structuredAnswerDiagnostics"];
   temporalIntent?: QueryResult["temporalIntent"];
   retrievalDebug?: RetrievalDebugInfo;
   scopeAudit?: QueryResult["scopeAudit"];
@@ -5090,6 +5093,7 @@ async function executeQuery(
   let answer: string;
   let usage: QueryExecutionResult["usage"];
   let structuredAnswer: GroundedAnswer | undefined;
+  let structuredAnswerDiagnostics: QueryExecutionResult["structuredAnswerDiagnostics"];
   const evidenceIdAliases = Object.fromEntries(evidenceIdAliasMap(evidenceItems).entries());
   const providerWarnings: string[] =
     strictMissingTerms.length && !strictMissingShouldBlock ? [`strict_exact_terms_not_found:${strictMissingTerms.join(",")}`] : [];
@@ -5167,6 +5171,12 @@ async function executeQuery(
         answer = structuredAnswer.answer;
         if (answerLooksIncomplete(question, answer)) {
           providerWarnings.push("structured_answer_incomplete_fallback");
+          structuredAnswerDiagnostics = {
+            fallback: true,
+            reason: "answer_looks_incomplete",
+            missingFields: ["answer"],
+            repairWarnings: [...providerWarnings]
+          };
           const response = await provider.generateText({
             system,
             prompt: `Question: ${question}\n\n${context}`
@@ -5176,7 +5186,14 @@ async function executeQuery(
           structuredAnswer = undefined;
         }
       } catch (error) {
-        providerWarnings.push(`structured_query_fallback:${error instanceof Error ? error.message : String(error)}`);
+        const message = error instanceof Error ? error.message : String(error);
+        providerWarnings.push(`structured_query_fallback:${message}`);
+        structuredAnswerDiagnostics = {
+          fallback: true,
+          reason: truncate(message, 240),
+          missingFields: [],
+          repairWarnings: [...providerWarnings]
+        };
         const response = await provider.generateText({
           system,
           prompt: `Question: ${question}\n\n${context}`
@@ -5249,6 +5266,7 @@ async function executeQuery(
     supportingEvidenceSet: evidenceLayers.supporting,
     excludedEvidenceSet: evidenceLayers.excluded,
     evidenceCompleteness,
+    structuredAnswerDiagnostics,
     temporalIntent: queryPlan.temporalIntent,
     scopeAudit: buildScopeAudit(options.queryOptions, evidenceItems),
     retrievalDebug: options.queryOptions?.debugContext
@@ -7375,6 +7393,7 @@ export async function queryVault(rootDir: string, options: QueryOptions): Promis
     excludedEvidenceSet: query.excludedEvidenceSet,
     standardCoverage: query.standardCoverage,
     evidenceCompleteness: query.evidenceCompleteness,
+    structuredAnswerDiagnostics: query.structuredAnswerDiagnostics,
     temporalIntent: query.temporalIntent,
     retrievalDebug: query.retrievalDebug,
     scopeAudit: query.scopeAudit
@@ -7697,6 +7716,56 @@ export async function searchVault(
   return merged;
 }
 
+export async function listSourceExtractionIssues(
+  rootDir: string,
+  options: { emptyOnly?: boolean; needsOcr?: boolean } = {}
+): Promise<SourceExtractionIssue[]> {
+  const { paths } = await loadVaultConfig(rootDir);
+  const graph = await ensureCompiledGraph(rootDir);
+  const manifests = await listManifests(rootDir);
+  const manifestsBySourceId = new Map(manifests.map((manifest) => [manifest.sourceId, manifest]));
+  const issues: SourceExtractionIssue[] = [];
+  for (const page of graph.pages.filter((item) => item.kind === "source" || item.kind === "module")) {
+    const absolutePath = path.join(paths.wikiDir, page.path);
+    const raw = await fs.readFile(absolutePath, "utf8").catch(() => "");
+    if (!raw) {
+      continue;
+    }
+    const parsed = matter(raw);
+    const analysisMode = typeof parsed.data.analysis_mode === "string" ? parsed.data.analysis_mode : undefined;
+    const extractionStatus = typeof parsed.data.extraction_status === "string" ? parsed.data.extraction_status : undefined;
+    const needsOcr = parsed.data.needs_ocr === true || extractionStatus === "manual_required";
+    const allowEmpty = parsed.data.allow_empty === true;
+    const empty = analysisMode === "empty" && !allowEmpty;
+    if (options.emptyOnly && !empty) {
+      continue;
+    }
+    if (options.needsOcr && !needsOcr) {
+      continue;
+    }
+    if (!empty && !needsOcr) {
+      continue;
+    }
+    const primarySourceId = page.sourceIds[0];
+    const manifest = primarySourceId ? manifestsBySourceId.get(primarySourceId) : undefined;
+    issues.push({
+      pageId: page.id,
+      title: page.title,
+      path: page.path,
+      sourceIds: page.sourceIds,
+      sourcePath: manifest?.originalPath ?? manifest?.storedPath,
+      analysisMode,
+      extractionStatus,
+      needsOcr,
+      allowEmpty,
+      message: empty
+        ? "No extracted text is available. OCR, source replacement, manual conversion, or allow_empty review is required."
+        : "Source is marked as requiring OCR or manual extraction review."
+    });
+  }
+  return issues.sort((left, right) => left.path.localeCompare(right.path));
+}
+
 async function rerankSearchResults(rootDir: string, query: string, results: SearchResult[], limit: number): Promise<SearchResult[]> {
   const provider = await getProviderForTask(rootDir, "queryProvider");
   const candidates = results
@@ -7763,27 +7832,36 @@ async function runResolvedGraphQuery(
   rootDir: string,
   graph: GraphArtifact,
   question: string,
-  options: {
-    traversal?: "bfs" | "dfs";
-    budget?: number;
-  } = {}
+  options: GraphQueryOptions = {}
 ): Promise<GraphQueryResult> {
-  const searchResults = await searchVault(rootDir, question, Math.max(5, options.budget ?? 10));
+  const { config } = await loadVaultConfig(rootDir);
+  const domainProfile = await loadDomainProfile(rootDir, config);
+  const queryPlan = buildDomainQueryPlan(question, domainProfile, {
+    intent: options.intent,
+    region: options.region,
+    pollutants: options.pollutant ? [options.pollutant] : undefined,
+    asOfDate: options.asOfDate,
+    evaluationPeriod: options.evaluationPeriod,
+    evaluationYear: options.evaluationYear
+  });
+  const searchResults = await searchVault(rootDir, question, {
+    limit: Math.max(5, options.budget ?? 10),
+    intent: options.intent,
+    region: options.region,
+    pollutant: options.pollutant,
+    domainProfile
+  });
   const semanticMatches = await semanticGraphMatches(rootDir, graph, question, Math.max(8, options.budget ?? 12)).catch(() => []);
   return queryGraph(graph, question, searchResults, {
     ...options,
-    semanticMatches
+    semanticMatches,
+    documentRoleBoosts: queryPlan.documentRoleBoosts,
+    evidenceRoleBoosts: queryPlan.evidenceRoleBoosts,
+    rankingSignals: queryPlan.rankingSignals
   });
 }
 
-export async function queryGraphVault(
-  rootDir: string,
-  question: string,
-  options: {
-    traversal?: "bfs" | "dfs";
-    budget?: number;
-  } = {}
-): Promise<GraphQueryResult> {
+export async function queryGraphVault(rootDir: string, question: string, options: GraphQueryOptions = {}): Promise<GraphQueryResult> {
   const graph = await ensureCompiledGraph(rootDir);
   return runResolvedGraphQuery(rootDir, graph, question, options);
 }

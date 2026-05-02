@@ -12,7 +12,7 @@ import { getProviderForTask } from "./providers/registry.js";
 import { normalizeDeepLintCode } from "./providers/structured-repair.js";
 import { loadVaultSchema } from "./schema.js";
 import type { GraphArtifact, LintFinding, OrchestrationRole } from "./types.js";
-import { normalizeKnowledgeLabelKey, normalizeWhitespace, readJsonFile, slugify, truncate, uniqueBy } from "./utils.js";
+import { normalizeKnowledgeLabelKey, normalizeWhitespace, readJsonFile, slugifyKnowledgeLabel, truncate, uniqueBy } from "./utils.js";
 import { getWebSearchAdapterForTask } from "./web-search/registry.js";
 
 const deepLintResponseSchema = z.object({
@@ -135,6 +135,7 @@ async function deterministicEnvAirFindings(rootDir: string, graph: GraphArtifact
   const { paths } = await loadVaultConfig(rootDir);
   const findings: LintFinding[] = [];
   const labelKeys = new Map<string, GraphArtifact["pages"]>();
+  const actualKnowledgeSlugs = new Map<string, GraphArtifact["pages"]>();
   const pages = graph.pages.filter(
     (page) =>
       page.kind === "source" || page.kind === "module" || page.kind === "concept" || page.kind === "entity" || page.kind === "output"
@@ -150,12 +151,15 @@ async function deterministicEnvAirFindings(rootDir: string, graph: GraphArtifact
     if (page.kind === "concept" || page.kind === "entity") {
       const labelKey = normalizeKnowledgeLabelKey(title);
       labelKeys.set(labelKey, [...(labelKeys.get(labelKey) ?? []), page]);
-      const asciiSlug = slugify(title);
-      if (asciiSlug === "item") {
+      const actualSlug = path.basename(page.path, ".md").toLowerCase();
+      actualKnowledgeSlugs.set(actualSlug, [...(actualKnowledgeSlugs.get(actualSlug) ?? []), page]);
+      const expectedSlug = slugifyKnowledgeLabel(title).toLowerCase();
+      const slugHasNoReadableLabel = actualSlug === "item" || /^item-[a-f0-9]{8,}$/i.test(actualSlug) || actualSlug.length <= 2;
+      if (slugHasNoReadableLabel && actualSlug !== expectedSlug) {
         findings.push({
           severity: "warning",
-          code: "ascii_slug_collision_risk",
-          message: `${page.kind} page ${title} would collapse to the legacy ASCII slug "item".`,
+          code: "knowledge_slug_low_information",
+          message: `${page.kind} page ${title} uses a low-information slug (${actualSlug}) that does not match the current knowledge label slug.`,
           pagePath: absolutePath,
           relatedPageIds: [page.id]
         });
@@ -233,7 +237,7 @@ async function deterministicEnvAirFindings(rootDir: string, graph: GraphArtifact
       findings.push({
         severity: "error",
         code: "empty_extraction_source",
-        message: `Source ${title} has no extracted text and should be OCRed, replaced, or explicitly marked allow_empty.`,
+        message: `Source ${title} has no extracted text and should be OCRed, replaced, or explicitly marked allow_empty. extraction_status=${parsed.data.extraction_status ?? "unknown"}.`,
         pagePath: absolutePath,
         relatedSourceIds,
         relatedPageIds: [page.id]
@@ -328,6 +332,20 @@ async function deterministicEnvAirFindings(rootDir: string, graph: GraphArtifact
         code: "knowledge_label_key_collision",
         message: `Knowledge label key ${labelKey} maps to multiple titles: ${titles.slice(0, 6).join(", ")}.`,
         relatedPageIds: pagesWithKey.map((page) => page.id)
+      });
+    }
+  }
+  for (const [slug, pagesWithSlug] of actualKnowledgeSlugs) {
+    const titles = uniqueBy(
+      pagesWithSlug.map((page) => page.title),
+      (item) => item.toLowerCase()
+    );
+    if (titles.length > 1) {
+      findings.push({
+        severity: "warning",
+        code: "knowledge_slug_collision",
+        message: `Knowledge slug ${slug} maps to multiple titles: ${titles.slice(0, 6).join(", ")}.`,
+        relatedPageIds: pagesWithSlug.map((page) => page.id)
       });
     }
   }

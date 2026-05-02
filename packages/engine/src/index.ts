@@ -171,6 +171,7 @@ export {
   listGodNodes,
   listGraphHyperedges,
   listPages,
+  listSourceExtractionIssues,
   pathGraphVault,
   previewCandidatePromotions,
   promoteCandidate,

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { shortestGraphPath } from "../src/graph-tools.js";
-import type { GraphArtifact } from "../src/types.js";
+import { queryGraph, shortestGraphPath } from "../src/graph-tools.js";
+import type { GraphArtifact, GraphPage, SearchResult } from "../src/types.js";
 
 function nodeId(prefix: string, id: string): string {
   return `${prefix}:${id}`;
@@ -145,5 +145,101 @@ describe("shortestGraphPath", () => {
 
     expect(result.found).toBe(false);
     expect(result.nodeIds).toEqual([]);
+  });
+});
+
+function page(id: string, title: string, nodeIds: string[]): GraphPage {
+  return {
+    id,
+    path: `${id}.md`,
+    title,
+    kind: "source",
+    sourceIds: [id],
+    projectIds: [],
+    nodeIds,
+    freshness: "fresh",
+    status: "active",
+    confidence: 0.9,
+    backlinks: [],
+    schemaHash: "schema",
+    sourceHashes: {},
+    sourceSemanticHashes: {},
+    relatedPageIds: [],
+    relatedNodeIds: nodeIds,
+    relatedSourceIds: [id],
+    createdAt: "2026-05-02T00:00:00.000Z",
+    updatedAt: "2026-05-02T00:00:00.000Z",
+    compiledFrom: [],
+    managedBy: "system"
+  };
+}
+
+function buildDomainRankingGraph(): GraphArtifact {
+  return {
+    generatedAt: "2026-05-02T00:00:00.000Z",
+    nodes: [
+      {
+        id: "source:obd",
+        type: "source",
+        label: "OBD 远程排放管理",
+        pageId: "source:obd",
+        sourceIds: ["source:obd"],
+        projectIds: [],
+        degree: 1
+      },
+      {
+        id: "source:monthly",
+        type: "source",
+        label: "全国城市空气质量月度报告",
+        pageId: "source:monthly",
+        sourceIds: ["source:monthly"],
+        projectIds: [],
+        degree: 1
+      }
+    ],
+    edges: [],
+    hyperedges: [],
+    communities: [],
+    sources: [],
+    pages: [
+      page("source:obd", "重型车 OBD 远程排放管理", ["source:obd"]),
+      page("source:monthly", "全国城市空气质量月度报告", ["source:monthly"])
+    ]
+  };
+}
+
+describe("queryGraph domain-aware seed ranking", () => {
+  it("boosts statistical report sources for statistics-style Chinese queries", () => {
+    const graph = buildDomainRankingGraph();
+    const searchResults: SearchResult[] = [
+      {
+        pageId: "source:obd",
+        path: "source:obd.md",
+        title: "重型车 OBD 远程排放管理",
+        snippet: "车辆排放监管。",
+        rank: -1,
+        projectIds: [],
+        documentRole: "technical_guide",
+        evidenceRole: "method"
+      },
+      {
+        pageId: "source:monthly",
+        path: "source:monthly.md",
+        title: "全国城市空气质量月度报告",
+        snippet: "覆盖 339 个城市的空气质量统计。",
+        rank: -2,
+        projectIds: [],
+        documentRole: "statistics",
+        evidenceRole: "statistics"
+      }
+    ];
+
+    const result = queryGraph(graph, "全国城市空气质量月度报告 339个城市", searchResults, {
+      budget: 4,
+      explainSeeds: true
+    });
+
+    expect(result.seedDiagnostics?.[0]?.nodeId).toBe("source:monthly");
+    expect(result.seedDiagnostics?.[0]?.reasons).toContain("statistics_intent_metadata");
   });
 });

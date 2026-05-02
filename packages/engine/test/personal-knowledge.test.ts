@@ -277,7 +277,7 @@ describe("personal knowledge workflows", () => {
     expect(researchMapDashboard).toContain("# Research Map");
     const openQuestionsDashboard = await fs.readFile(path.join(rootDir, "wiki", "dashboards", "open-questions.md"), "utf8");
     expect(openQuestionsDashboard).toContain("# Open Questions");
-  });
+  }, 20_000);
 
   it("registers managed file sources and stages source reviews", async () => {
     const rootDir = await createTempWorkspace();

@@ -1197,6 +1197,29 @@ export interface GraphQueryMatch {
   score: number;
 }
 
+export interface GraphSeedDiagnostic {
+  nodeId: string;
+  pageId?: string;
+  score: number;
+  reasons: string[];
+}
+
+export interface GraphQueryOptions {
+  traversal?: "bfs" | "dfs";
+  budget?: number;
+  semanticMatches?: GraphQueryMatch[];
+  intent?: QueryIntent;
+  region?: string;
+  pollutant?: string;
+  asOfDate?: string;
+  evaluationPeriod?: string;
+  evaluationYear?: number;
+  documentRoleBoosts?: Record<string, number>;
+  evidenceRoleBoosts?: Record<string, number>;
+  rankingSignals?: string[];
+  explainSeeds?: boolean;
+}
+
 export interface GraphQueryResult {
   question: string;
   traversal: "bfs" | "dfs";
@@ -1209,6 +1232,8 @@ export interface GraphQueryResult {
   communities: string[];
   summary: string;
   matches: GraphQueryMatch[];
+  seedDiagnostics?: GraphSeedDiagnostic[];
+  warnings?: string[];
 }
 
 export interface GraphPathResult {
@@ -1689,6 +1714,19 @@ export interface SearchResult {
   rankingSignals?: string[];
 }
 
+export interface SourceExtractionIssue {
+  pageId: string;
+  title: string;
+  path: string;
+  sourceIds: string[];
+  sourcePath?: string;
+  analysisMode?: string;
+  extractionStatus?: string;
+  needsOcr: boolean;
+  allowEmpty: boolean;
+  message: string;
+}
+
 export interface RetrievalConfig {
   backend: "sqlite";
   shardSize: number;
@@ -1953,6 +1991,12 @@ export interface QueryResult {
     coveredStandards: string[];
     missingStandards: string[];
     authorityPinnedEvidenceCount: number;
+  };
+  structuredAnswerDiagnostics?: {
+    fallback: boolean;
+    reason?: string;
+    missingFields: string[];
+    repairWarnings: string[];
   };
   temporalIntent?: EnvAirTemporalIntent;
   retrievalDebug?: RetrievalDebugInfo;
