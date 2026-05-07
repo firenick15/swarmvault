@@ -1,10 +1,10 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import matter from "gray-matter";
 import {
   buildEnvAirSearchText,
   extractStandardReferences,
-  inferCurrentBasisIntent,
   normalizeStandardCode,
   pollutantFocusTermsForQuery,
   searchLikeTerms,
@@ -108,6 +108,13 @@ function getDatabaseSync(): DatabaseSyncCtor {
   return builtin.DatabaseSync;
 }
 
+function sqliteImmutableReadOnlyUri(dbPath: string): string {
+  const url = pathToFileURL(path.resolve(dbPath));
+  url.searchParams.set("mode", "ro");
+  url.searchParams.set("immutable", "1");
+  return url.href;
+}
+
 function quoteFtsToken(token: string): string {
   return `"${token.replace(/"/g, '""')}"`;
 }
@@ -155,7 +162,8 @@ function normalizeChunkKind(value: unknown): SearchResult["chunkKind"] | undefin
 }
 
 function normalizeRetrievalStage(value: unknown): SearchResult["retrievalStage"] | undefined {
-  return value === "standard_exact" ||
+  return value === "source_alias" ||
+    value === "standard_exact" ||
     value === "structured_fact" ||
     value === "fts" ||
     value === "chunk_fts" ||
@@ -224,6 +232,133 @@ function uniqueCompact(values: string[]): string[] {
     output.push(normalized);
   }
   return output;
+}
+
+function normalizeAliasText(value: string): string {
+  return value
+    .replace(/\\(?:mathrm|mathsf|mathbf|bf)\s*\{([^}]*)\}/gi, "$1")
+    .replace(/\\left|\\right|\\mathrm|\\mathsf|\\mathbf|\\bf/gi, " ")
+    .replace(/[_{}$()[\]（）《》“”"']/g, " ")
+    .replace(/[，、；;:：/\\|-]+/g, " ")
+    .replace(/\bP\s*M\s*2\s*\.?\s*5\b/gi, "PM2.5")
+    .replace(/\bP\s*M\s*1\s*0\b/gi, "PM10")
+    .replace(/\bS\s*O\s*2\b/gi, "SO2")
+    .replace(/\bN\s*O\s*2\b/gi, "NO2")
+    .replace(/\bO\s*3\b/gi, "O3")
+    .replace(/\bN\s*O\s*x\b/gi, "NOx")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function compactAliasText(value: string): string {
+  return normalizeAliasText(value).toLowerCase().replace(/\s+/g, "");
+}
+
+function fileStemAliases(sourcePath: string): string[] {
+  if (!sourcePath) {
+    return [];
+  }
+  const stem = path.basename(sourcePath, path.extname(sourcePath));
+  const cleaned = normalizeAliasText(stem.replace(/[_-]+/g, " "));
+  return uniqueCompact([
+    stem,
+    cleaned,
+    cleaned.replace(/\b(19|20)\d{2}\b/g, "").trim(),
+    ...cleaned.split(/\s+/).filter((part) => /[\p{Script=Han}]{4,}|[A-Z]{1,4}\s*\d{2,6}|\d+号/u.test(part))
+  ]);
+}
+
+function quotedTitleAliases(text: string): string[] {
+  return uniqueCompact(
+    [...text.matchAll(/[《「“"]([^》」”"]{4,80})[》」”"]/gu)].map((match) => normalizeAliasText(match[1] ?? "")).filter(Boolean)
+  ).slice(0, 12);
+}
+
+function documentNumberAliases(value: string): string[] {
+  const normalized = normalizeAliasText(value);
+  const aliases = new Set<string>();
+  const add = (item: string | undefined): void => {
+    const cleaned = normalizeAliasText(item ?? "");
+    if (cleaned) {
+      aliases.add(cleaned);
+    }
+  };
+  add(normalized);
+  for (const match of normalized.matchAll(/(?:第\s*)?([0-9一二三四五六七八九十百]+)\s*号/gu)) {
+    add(`${match[1]}号`);
+    add(`第${match[1]}号`);
+  }
+  for (const match of normalized.matchAll(/([\u4e00-\u9fa5]{1,8})\s*发\s*〔?\s*((?:19|20)\d{2})\s*〕?\s*([0-9]+)\s*号/gu)) {
+    add(`${match[1]}发〔${match[2]}〕${match[3]}号`);
+    add(`${match[1]}发${match[2]}${match[3]}号`);
+  }
+  return [...aliases];
+}
+
+function frontmatterAliases(data: Record<string, unknown>): string[] {
+  const values: string[] = [];
+  const addValue = (value: unknown): void => {
+    if (typeof value === "string") {
+      values.push(value);
+    } else if (Array.isArray(value)) {
+      for (const item of value) {
+        addValue(item);
+      }
+    }
+  };
+  for (const key of ["title", "canonical_title", "canonicalTitle", "aliases", "standard_code", "document_number", "documentNumber"]) {
+    addValue(data[key]);
+  }
+  return uniqueCompact(values.flatMap((value) => [value, ...documentNumberAliases(value), ...quotedTitleAliases(value)]));
+}
+
+function buildSourceCanonicalAliases(input: {
+  page: GraphPage;
+  parsedData: Record<string, unknown>;
+  sourcePath: string;
+  standardCode: string;
+  rawSourceText: string;
+  body: string;
+}): string[] {
+  const aliasText = [input.page.title, input.standardCode, input.sourcePath].join("\n");
+  return uniqueCompact([
+    input.page.id,
+    input.page.title,
+    path.basename(input.page.path, path.extname(input.page.path)),
+    ...frontmatterAliases(input.parsedData),
+    ...fileStemAliases(input.sourcePath),
+    ...documentNumberAliases(input.standardCode),
+    ...quotedTitleAliases(aliasText)
+  ]).slice(0, 80);
+}
+
+function sourceAliasQueryTerms(query: string): string[] {
+  const normalized = normalizeAliasText(query);
+  const terms = new Set<string>();
+  for (const match of normalized.matchAll(/[\p{Script=Han}]{4,40}/gu)) {
+    const rawValue = match[0];
+    const actionSplit = rawValue
+      .split(/(?:什么时候|何时|多久|怎么|如何|应该|能否|是否|可否|规定|要求|引用|作为|主要|管理|报告|里|在)/u)
+      .map((item) => item.trim())
+      .filter((item) => item.length >= 6);
+    const candidates = actionSplit.length ? actionSplit : [rawValue];
+    for (const value of candidates) {
+      if (value.length >= 10) {
+        terms.add(value);
+      }
+      for (let size = Math.min(22, value.length); size >= 10; size -= 2) {
+        for (let index = 0; index + size <= value.length; index += Math.max(1, Math.floor(size / 2))) {
+          terms.add(value.slice(index, index + size));
+        }
+      }
+    }
+  }
+  for (const match of normalized.matchAll(
+    /(?:国发|环发|环办|生态环境部令|环境保护部令)\s*〔?\s*(?:19|20)\d{2}\s*〕?\s*[0-9]+\s*号|[\p{Script=Han}]{2,12}\s*[0-9一二三四五六七八九十百]+\s*号令?|(?:第\s*)?[0-9一二三四五六七八九十百]+\s*号/gu
+  )) {
+    terms.add(match[0]);
+  }
+  return uniqueCompact([...terms]).slice(0, 36);
 }
 
 function normalizedStandardQuery(query: string): string {
@@ -327,8 +462,8 @@ function stripGeneratedSourceSections(text: string): string {
 }
 
 function includesFocusTerm(text: string, focusTerms: string[]): boolean {
-  const compact = text.toLowerCase().replace(/\s+/g, "");
-  return focusTerms.some((term) => compact.includes(term.toLowerCase().replace(/\s+/g, "")));
+  const compact = compactAliasText(text);
+  return focusTerms.some((term) => compact.includes(compactAliasText(term)));
 }
 
 function requiredAmbientPeriodGroups(query: string): string[][] {
@@ -442,6 +577,17 @@ function meaningfulMetadataValue(value: unknown): string {
   return typeof value === "string" && value.trim() && value.trim() !== "unknown" ? value.trim() : "";
 }
 
+function generatedStatusNoticeLegalStatus(text: string): string {
+  const match =
+    text.match(
+      /Normalized legal status:\s*`?\s*(current_effective|issued_not_yet_effective|draft_consultation|superseded|amended|explanation_only|time_scoped_evidence)\s*`?/i
+    ) ??
+    text.match(
+      /legal_status_normalized:[^\n\r]*(current_effective|issued_not_yet_effective|draft_consultation|superseded|amended|explanation_only|time_scoped_evidence)/i
+    );
+  return match?.[1] ? match[1].toLowerCase() : "";
+}
+
 function pathIncludes(sourcePath: string, needle: string): boolean {
   return sourcePath.replace(/\\/g, "/").toLowerCase().includes(needle.toLowerCase());
 }
@@ -459,6 +605,10 @@ function inferEnvAirMetadata(input: {
   let documentRole = meaningfulMetadataValue(input.documentRole);
   const sourcePath = input.sourcePath.replace(/\\/g, "/");
   const combined = `${input.title}\n${sourcePath}\n${sourceExcerptBody(input.body).slice(0, 1200)}`;
+  const statusNoticeLegalStatus = generatedStatusNoticeLegalStatus(input.body);
+  if (statusNoticeLegalStatus && statusNoticeLegalStatus !== legalStatus) {
+    legalStatus = statusNoticeLegalStatus;
+  }
 
   if (!authorityLayer) {
     if (pathIncludes(sourcePath, "/evolution/")) {
@@ -831,7 +981,20 @@ export async function rebuildSearchIndex(
               .map((item) => item.trim())
               .filter(Boolean)
           : [];
-      const searchTerms = buildEnvAirSearchText({ title: page.title, body, standardCode, pollutants });
+      const canonicalAliases = buildSourceCanonicalAliases({
+        page,
+        parsedData: parsed.data,
+        sourcePath,
+        standardCode,
+        rawSourceText,
+        body
+      });
+      const searchTerms = uniqueCompact([
+        buildEnvAirSearchText({ title: page.title, body, standardCode, pollutants }),
+        ...canonicalAliases,
+        ...canonicalAliases.map((alias) => alias.replace(/\s+/g, "")),
+        ...canonicalAliases.map(compactAliasText)
+      ]).join(" ");
       insertPage.run(
         page.id,
         page.path,
@@ -926,6 +1089,8 @@ export async function rebuildSearchIndex(
     db.exec("INSERT INTO chunk_search (rowid, text, search_terms) SELECT rowid, text, search_terms FROM chunks;");
     db.exec("INSERT INTO fact_search (rowid, raw_text, search_terms) SELECT rowid, raw_text, search_terms FROM facts;");
     db.exec("COMMIT;");
+    db.exec("PRAGMA wal_checkpoint(TRUNCATE);");
+    db.exec("PRAGMA journal_mode = DELETE;");
   } catch (error) {
     db.exec("ROLLBACK;");
     db.close();
@@ -994,11 +1159,12 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
   const normalizedQuery = normalizedStandardQuery(expandedQuery);
   const ftsQuery = toFtsQuery(normalizedQuery);
   const likeTerms = searchLikeTerms(normalizedQuery);
+  const aliasTerms = sourceAliasQueryTerms(normalizedQuery);
   if (!ftsQuery && likeTerms.length === 0) {
     return [];
   }
   const currentBasisIntent =
-    (options.domainProfile ? inferCurrentBasisIntent(normalizedQuery, options.domainProfile) : inferCurrentBasisIntent(normalizedQuery)) ||
+    domainPlan.currentBasisIntent ||
     options.requireCurrentBasis === true ||
     options.intent === "current_basis" ||
     options.intent === "report_writing";
@@ -1010,7 +1176,10 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
   const explicitStandardFamily = explicitStandard?.family ?? "";
   const explicitStandardNumber = explicitStandard?.number ?? "";
   const explicitStandardYear = explicitStandard?.year ?? "";
-  const ambientLimitIntent = domainPlan.rankingSignals.includes("ambient_air_quality_limit_question");
+  const ambientLimitIntent =
+    domainPlan.rankingSignals.includes("ambient_air_quality_limit_question") ||
+    (/(PM2\.5|PM10|O3|SO2|NO2|CO|颗粒物|臭氧|二氧化硫|二氧化氮|一氧化碳)/iu.test(normalizedQuery) &&
+      /(限值|标准值|浓度限值|一级|二级|年平均|日平均|24\s*小时|1\s*小时|8\s*小时)/u.test(normalizedQuery));
   const assessmentValidityIntent = domainPlan.rankingSignals.includes("ambient_air_assessment_validity_question");
   const amendmentIntent = /修改单|amendment/i.test(normalizedQuery);
   const qaQcIntent =
@@ -1025,7 +1194,7 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
     ...(statisticsIntent ? ["公报", "月报", "年报", "统计", "城市", "评价城市", "统计期"] : [])
   ]);
   const DatabaseSync = getDatabaseSync();
-  const db = withSuppressedSqliteExperimentalWarning(() => new DatabaseSync(dbPath, { readOnly: true }));
+  const db = withSuppressedSqliteExperimentalWarning(() => new DatabaseSync(sqliteImmutableReadOnlyUri(dbPath)));
   const limit = options.limit ?? 5;
   const candidateLimit = Math.max(limit * 3, limit + 5);
   const seen = new Set<string>();
@@ -1208,7 +1377,10 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
     params.push(...values);
   }
 
-  function buildFilterClauses(params: Array<number | string>, mode: { relaxAuthority?: boolean } = {}): string[] {
+  function buildFilterClauses(
+    params: Array<number | string>,
+    mode: { relaxAuthority?: boolean; includeDrafts?: boolean; includeSuperseded?: boolean } = {}
+  ): string[] {
     const clauses: string[] = [];
     addScalarOrListFilter(clauses, params, "pages.kind", options.kind);
     addScalarOrListFilter(clauses, params, "pages.status", options.status);
@@ -1261,10 +1433,10 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
       clauses.push("LOWER(pages.pollutants) LIKE ?");
       params.push(`%${options.pollutant.toLowerCase()}%`);
     }
-    if (options.includeDrafts !== true) {
+    if (options.includeDrafts !== true && mode.includeDrafts !== true) {
       clauses.push("(pages.legal_status <> 'draft_consultation' OR pages.legal_status = '')");
     }
-    if (options.includeSuperseded !== true) {
+    if (options.includeSuperseded !== true && mode.includeSuperseded !== true) {
       clauses.push("(pages.legal_status <> 'superseded' OR pages.legal_status = '')");
     }
     return clauses;
@@ -1403,13 +1575,56 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
     const evidenceRole = String(row.evidenceRole ?? "");
     const authorityLayer = String(row.authorityLayer ?? "");
     const retrievalStage = String(row.retrievalStage ?? "");
+    if (retrievalStage === "source_alias") {
+      return -110;
+    }
     if (hasExactStandards && retrievalStage === "standard_exact") {
       if (amendmentIntent && (documentRole === "amendment" || title.includes("修改单") || standardCode.includes("修改单"))) {
         return -120;
       }
+      const formalStandardRole = [
+        "standard",
+        "monitoring_method",
+        "qa_qc",
+        "technical_regulation",
+        "regulation",
+        "law",
+        "policy",
+        "emission_standard"
+      ].includes(documentRole);
+      const explanatoryReferenceRole = [
+        "technical_guide",
+        "official_explanation",
+        "whitepaper",
+        "research_literature",
+        "statistics",
+        "compilation_explanation",
+        "draft"
+      ].includes(documentRole);
+      const versionedStandard = extractStandardReferences(`${standardCode}\n${title}`).some((ref) => ref.year);
+      if (formalStandardRole && versionedStandard) {
+        return -128;
+      }
+      if (formalStandardRole) {
+        return -118;
+      }
+      if (explanatoryReferenceRole) {
+        return -84;
+      }
       return -100;
     }
-    if ((ambientLimitIntent || assessmentValidityIntent || retrievalStage === "structured_fact") && retrievalStage === "structured_fact") {
+    if (ambientLimitIntent && retrievalStage === "structured_fact") {
+      const factText = [row.factRawText, row.factSubject, row.factObjectValue, row.pollutants, row.averagingPeriod, row.value, row.unit]
+        .filter(Boolean)
+        .join(" ");
+      const usefulLimitFact =
+        includesFocusTerm(factText, pollutantFocusTermsForQuery(normalizedQuery)) &&
+        requiredAmbientPeriodGroups(normalizedQuery).every((group) => includesFocusTerm(factText, group)) &&
+        /[0-9]/.test(factText) &&
+        /(一级|二级|限值|μg|µg|ug|mg|年平均|日平均|24小时平均|1小时平均|日最大8小时平均)/iu.test(factText);
+      return usefulLimitFact ? -130 : -65;
+    }
+    if ((assessmentValidityIntent || retrievalStage === "structured_fact") && retrievalStage === "structured_fact") {
       return -95;
     }
     if (assessmentValidityIntent && (evidenceRole === "current_authority" || authorityLayer === "core" || authorityLayer === "method")) {
@@ -1558,6 +1773,34 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
   }
 
   try {
+    if (aliasTerms.length) {
+      const params: Array<number | string> = [];
+      const clauses = buildFilterClauses(params, { relaxAuthority: true });
+      if (!options.kind) {
+        clauses.push("pages.kind IN ('source', 'module')");
+      }
+      const aliasClauses: string[] = [];
+      for (const term of aliasTerms) {
+        const pattern = `%${term.toLowerCase()}%`;
+        const compactPattern = `%${compactAliasText(term)}%`;
+        aliasClauses.push(
+          "(LOWER(pages.title) LIKE ? OR LOWER(pages.search_terms) LIKE ? OR LOWER(REPLACE(pages.search_terms, ' ', '')) LIKE ? OR LOWER(pages.standard_code) LIKE ?)"
+        );
+        params.push(pattern, pattern, compactPattern, pattern);
+      }
+      clauses.push(`(${aliasClauses.join(" OR ")})`);
+      appendOrderParams(params);
+      params.push(Math.min(candidateLimit, 10));
+      const statement = db.prepare(`
+        ${selectedColumns("-8", "substr(pages.body, 1, 420)", "source_alias")}
+        FROM pages
+        WHERE ${clauses.join(" AND ")}
+        ${orderBy()}
+        LIMIT ?
+      `);
+      appendRows(statement.all(...params) as Array<Record<string, unknown>>);
+    }
+
     const defaultFactBoosts: Record<string, number> = assessmentValidityIntent
       ? { validity_rule: 5, limit_value: 2, formula: 1.5, technical_parameter: 1 }
       : { limit_value: 4, formula: 3, technical_parameter: 2 };
@@ -1578,13 +1821,106 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
     const factBoostExpression = `bm25(fact_search) - CASE facts.fact_type ${Object.entries(defaultFactBoosts)
       .map(([key, value]) => `WHEN '${key.replace(/'/g, "''")}' THEN ${value}`)
       .join(" ")} ELSE 0 END`;
+    if (rows.length < candidateLimit && aliasTerms.length) {
+      const params: Array<number | string> = [];
+      const clauses = buildFilterClauses(params, { relaxAuthority: true });
+      if (!options.kind) {
+        clauses.push("pages.kind IN ('source', 'module')");
+      }
+      const aliasClauses: string[] = [];
+      for (const term of aliasTerms) {
+        const pattern = `%${term.toLowerCase()}%`;
+        const compactPattern = `%${compactAliasText(term)}%`;
+        aliasClauses.push(
+          "(LOWER(pages.title) LIKE ? OR LOWER(pages.search_terms) LIKE ? OR LOWER(REPLACE(pages.search_terms, ' ', '')) LIKE ? OR LOWER(pages.standard_code) LIKE ?)"
+        );
+        params.push(pattern, pattern, compactPattern, pattern);
+      }
+      clauses.push(`(${aliasClauses.join(" OR ")})`);
+      appendOrderParams(params);
+      params.push(Math.min(candidateLimit - rows.length, 10));
+      const statement = db.prepare(`
+        ${selectedColumns("-8", "substr(pages.body, 1, 420)", "source_alias")}
+        FROM pages
+        WHERE ${clauses.join(" AND ")}
+        ${orderBy()}
+        LIMIT ?
+      `);
+      appendRows(statement.all(...params) as Array<Record<string, unknown>>);
+    }
+
+    if (ambientLimitIntent && rows.length < candidateLimit && ftsQuery) {
+      try {
+        const params: Array<number | string> = [ftsQuery];
+        const clauses = ["fact_search MATCH ?", ...buildFilterClauses(params)];
+        appendOrderParams(params);
+        params.push(candidateLimit - rows.length);
+        const statement = db.prepare(`
+          ${selectedFactColumns(factBoostExpression, "snippet(fact_search, 0, '[', ']', '...', 28)")}
+          FROM fact_search
+          JOIN facts ON facts.rowid = fact_search.rowid
+          JOIN pages ON pages.id = facts.page_id
+          WHERE ${clauses.join(" AND ")}
+          ${orderBy()}
+          LIMIT ?
+        `);
+        appendRows(statement.all(...params) as Array<Record<string, unknown>>);
+      } catch {
+        // Structured facts are additive; exact standard and chunk retrieval can
+        // still answer when an older index lacks fact tables.
+      }
+    }
+
+    if (ambientLimitIntent && rows.length < candidateLimit && !rows.some((row) => String(row.retrievalStage ?? "") === "structured_fact")) {
+      try {
+        const params: Array<number | string> = [];
+        const clauses = buildFilterClauses(params);
+        const factHaystack =
+          "LOWER(COALESCE(facts.raw_text, '') || ' ' || COALESCE(facts.subject, '') || ' ' || COALESCE(facts.object_value, '') || ' ' || COALESCE(pages.pollutants, ''))";
+        const focusGroups = [
+          pollutantFocusTermsForQuery(normalizedQuery).flat(),
+          ...requiredAmbientPeriodGroups(normalizedQuery),
+          /二级/u.test(normalizedQuery) ? ["二级"] : [],
+          /一级/u.test(normalizedQuery) ? ["一级"] : [],
+          /(限值|标准值|浓度限值)/u.test(normalizedQuery) ? ["限值", "浓度限值"] : []
+        ].filter((group) => group.length > 0);
+        for (const group of focusGroups) {
+          const terms = uniqueCompact(group.map((term) => term.toLowerCase()));
+          if (!terms.length) {
+            continue;
+          }
+          clauses.push(`(${terms.map(() => `${factHaystack} LIKE ?`).join(" OR ")})`);
+          params.push(...terms.map((term) => `%${term}%`));
+        }
+        if (focusGroups.length) {
+          appendOrderParams(params);
+          params.push(candidateLimit - rows.length);
+          const statement = db.prepare(`
+            ${selectedFactColumns("-12", "substr(facts.raw_text, 1, 420)")}
+            FROM facts
+            JOIN pages ON pages.id = facts.page_id
+            WHERE ${clauses.join(" AND ")}
+            ${orderBy()}
+            LIMIT ?
+          `);
+          appendRows(statement.all(...params) as Array<Record<string, unknown>>);
+        }
+      } catch {
+        // LIKE fallback is best-effort for fact indexes whose FTS tokenization
+        // does not align with user wording such as "24小时平均" vs "日平均".
+      }
+    }
+
     if (hasExactStandards) {
       for (const exactStandard of exactStandards) {
         if (rows.length >= candidateLimit) {
           break;
         }
         const params: Array<number | string> = [];
-        const clauses = buildFilterClauses(params, { relaxAuthority: true });
+        const clauses = buildFilterClauses(params, {
+          includeSuperseded: hasUserExplicitStandard && !currentBasisIntent,
+          relaxAuthority: true
+        });
         if (!options.kind) {
           clauses.push("pages.kind IN ('source', 'module')");
         }

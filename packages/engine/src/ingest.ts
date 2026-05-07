@@ -1548,6 +1548,9 @@ async function loadGitignoreMatcher(repoRoot: string, enabled: boolean) {
 }
 
 function builtInIgnoreReason(relativePath: string): string | null {
+  if (/\.swarmvault\.meta\.(?:json|ya?ml)$/iu.test(relativePath)) {
+    return "built_in_ignore:source_sidecar_metadata";
+  }
   for (const segment of relativePath.split("/")) {
     if (HARD_REPO_IGNORES.has(segment)) {
       return `built_in_ignore:${segment}`;
@@ -2211,6 +2214,15 @@ export async function syncTrackedRepos(rootDir: string, options?: IngestOptions,
     scannedCount += files.length;
     const progress = createProgressReporter("sync", files.length);
 
+    const ignoredExistingManifests = new Set<string>();
+    for (const manifest of repoManifests) {
+      if (manifest.repoRelativePath && builtInIgnoreReason(manifest.repoRelativePath)) {
+        await removeManifestArtifacts(rootDir, manifest, paths);
+        removed.push(manifest);
+        ignoredExistingManifests.add(manifest.sourceId);
+      }
+    }
+
     const currentPaths = new Set(files.map((absolutePath) => path.resolve(absolutePath)));
     for (const absolutePath of files) {
       const relativePath = repoRelativePathFor(absolutePath, repoRoot) ?? toPosix(path.relative(repoRoot, absolutePath));
@@ -2229,6 +2241,9 @@ export async function syncTrackedRepos(rootDir: string, options?: IngestOptions,
     progress.finish(`repo=${toPosix(path.relative(rootDir, repoRoot)) || "."}`);
 
     for (const manifest of repoManifests) {
+      if (ignoredExistingManifests.has(manifest.sourceId)) {
+        continue;
+      }
       const originalPath = manifest.originalPath ? path.resolve(manifest.originalPath) : null;
       if (originalPath && !currentPaths.has(originalPath)) {
         await removeManifestArtifacts(rootDir, manifest, paths);
@@ -2330,6 +2345,15 @@ export async function syncTrackedReposForWatch(
     scannedCount += files.length;
     const progress = createProgressReporter("sync-watch", files.length);
 
+    const ignoredExistingManifests = new Set<string>();
+    for (const manifest of repoManifests) {
+      if (manifest.repoRelativePath && builtInIgnoreReason(manifest.repoRelativePath)) {
+        await removeManifestArtifacts(rootDir, manifest, paths);
+        removed.push(manifest);
+        ignoredExistingManifests.add(manifest.sourceId);
+      }
+    }
+
     const currentPaths = new Set(files.map((absolutePath) => path.resolve(absolutePath)));
     for (const absolutePath of files) {
       const relativePath = repoRelativePathFor(absolutePath, repoRoot) ?? toPosix(path.relative(repoRoot, absolutePath));
@@ -2386,6 +2410,9 @@ export async function syncTrackedReposForWatch(
     progress.finish(`repo=${toPosix(path.relative(rootDir, repoRoot)) || "."}`);
 
     for (const manifest of repoManifests) {
+      if (ignoredExistingManifests.has(manifest.sourceId)) {
+        continue;
+      }
       const originalPath = manifest.originalPath ? path.resolve(manifest.originalPath) : null;
       if (originalPath && !currentPaths.has(originalPath)) {
         if (shouldDeferWatchSemanticRefresh(manifest.sourceKind)) {

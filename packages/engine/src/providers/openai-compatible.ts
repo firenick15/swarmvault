@@ -165,6 +165,29 @@ function retryDelayMs(attempt: number): number {
   return [1_000, 3_000, 8_000][attempt] ?? 8_000;
 }
 
+function mergeAbortSignals(...signals: Array<AbortSignal | undefined>): AbortSignal | undefined {
+  const activeSignals = signals.filter((signal): signal is AbortSignal => Boolean(signal));
+  if (!activeSignals.length) {
+    return undefined;
+  }
+  if (activeSignals.length === 1) {
+    return activeSignals[0];
+  }
+  if (typeof AbortSignal.any === "function") {
+    return AbortSignal.any(activeSignals);
+  }
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  for (const signal of activeSignals) {
+    if (signal.aborted) {
+      abort();
+      break;
+    }
+    signal.addEventListener("abort", abort, { once: true });
+  }
+  return controller.signal;
+}
+
 function structuredErrorMessage(
   providerId: string,
   attempt: "initial" | "repair",
@@ -267,13 +290,14 @@ export class OpenAiCompatibleProviderAdapter extends BaseProviderAdapter {
     }
   }
 
-  private async requestJson(endpoint: string, body: unknown, init?: { formData?: FormData }): Promise<unknown> {
+  private async requestJson(endpoint: string, body: unknown, init?: { formData?: FormData; signal?: AbortSignal }): Promise<unknown> {
     const url = `${this.baseUrl}${endpoint}`;
     const attempts = this.maxRetries + 1;
     let lastError: Error | null = null;
     for (let attempt = 0; attempt < attempts; attempt += 1) {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
+      const timeoutController = new AbortController();
+      const timeout = setTimeout(() => timeoutController.abort(), this.timeoutMs);
+      const signal = mergeAbortSignals(init?.signal, timeoutController.signal);
       try {
         const response = await fetch(url, {
           method: "POST",
@@ -288,7 +312,7 @@ export class OpenAiCompatibleProviderAdapter extends BaseProviderAdapter {
                 ...this.headers
               },
           body: init?.formData ? init.formData : JSON.stringify(body),
-          signal: controller.signal
+          signal
         });
         if (!response.ok) {
           const errorBody = await response.text().catch(() => "");
@@ -304,14 +328,17 @@ export class OpenAiCompatibleProviderAdapter extends BaseProviderAdapter {
         }
         return await response.json();
       } catch (error) {
-        const message =
-          error instanceof Error && error.name === "AbortError"
+        const callerAborted = init?.signal?.aborted === true;
+        const timedOut = timeoutController.signal.aborted && !callerAborted;
+        const message = callerAborted
+          ? `Provider ${this.id} request aborted.`
+          : timedOut || (error instanceof Error && error.name === "AbortError")
             ? `Provider ${this.id} timed out after ${this.timeoutMs}ms.`
             : error instanceof Error
               ? error.message
               : String(error);
         lastError = new Error(message);
-        if (attempt >= attempts - 1) {
+        if (callerAborted || timedOut || attempt >= attempts - 1) {
           throw lastError;
         }
         await sleep(retryDelayMs(attempt));
@@ -417,12 +444,16 @@ export class OpenAiCompatibleProviderAdapter extends BaseProviderAdapter {
         ]
       : request.prompt;
 
-    const payload = (await this.requestJson("/responses", {
-      model: this.model,
-      input,
-      instructions: request.system,
-      max_output_tokens: request.maxOutputTokens
-    })) as ResponsesApiPayload;
+    const payload = (await this.requestJson(
+      "/responses",
+      {
+        model: this.model,
+        input,
+        instructions: request.system,
+        max_output_tokens: request.maxOutputTokens
+      },
+      { signal: request.signal }
+    )) as ResponsesApiPayload;
     return {
       text: extractResponsesText(payload),
       usage: payload.usage ? { inputTokens: payload.usage.input_tokens, outputTokens: payload.usage.output_tokens } : undefined
@@ -450,19 +481,23 @@ export class OpenAiCompatibleProviderAdapter extends BaseProviderAdapter {
         ]
       : request.prompt;
 
-    const payload = (await this.requestJson("/responses", {
-      model: this.model,
-      input,
-      instructions: request.system,
-      max_output_tokens: request.maxOutputTokens,
-      ...(mode === "json_schema"
-        ? {
-            text: {
-              format
+    const payload = (await this.requestJson(
+      "/responses",
+      {
+        model: this.model,
+        input,
+        instructions: request.system,
+        max_output_tokens: request.maxOutputTokens,
+        ...(mode === "json_schema"
+          ? {
+              text: {
+                format
+              }
             }
-          }
-        : {})
-    })) as ResponsesApiPayload;
+          : {})
+      },
+      { signal: request.signal }
+    )) as ResponsesApiPayload;
     return {
       text: extractResponsesText(payload),
       finishReason: payload.incomplete_details?.reason ?? payload.status
@@ -485,11 +520,15 @@ export class OpenAiCompatibleProviderAdapter extends BaseProviderAdapter {
 
     const messages = [...(request.system ? [{ role: "system", content: request.system }] : []), { role: "user", content }];
 
-    const payload = (await this.requestJson("/chat/completions", {
-      model: this.model,
-      messages,
-      max_tokens: request.maxOutputTokens
-    })) as {
+    const payload = (await this.requestJson(
+      "/chat/completions",
+      {
+        model: this.model,
+        messages,
+        max_tokens: request.maxOutputTokens
+      },
+      { signal: request.signal }
+    )) as {
       choices?: Array<{ message?: { content?: string | Array<{ type?: string; text?: string }> } }>;
       usage?: { prompt_tokens?: number; completion_tokens?: number };
     };
@@ -521,25 +560,29 @@ export class OpenAiCompatibleProviderAdapter extends BaseProviderAdapter {
 
     const messages = [...(request.system ? [{ role: "system", content: request.system }] : []), { role: "user", content }];
 
-    const payload = (await this.requestJson("/chat/completions", {
-      model: this.model,
-      messages,
-      max_tokens: request.maxOutputTokens,
-      ...(mode === "json_schema"
-        ? {
-            response_format: {
-              type: "json_schema",
-              json_schema: format
-            }
-          }
-        : mode === "json_object"
+    const payload = (await this.requestJson(
+      "/chat/completions",
+      {
+        model: this.model,
+        messages,
+        max_tokens: request.maxOutputTokens,
+        ...(mode === "json_schema"
           ? {
               response_format: {
-                type: "json_object"
+                type: "json_schema",
+                json_schema: format
               }
             }
-          : {})
-    })) as {
+          : mode === "json_object"
+            ? {
+                response_format: {
+                  type: "json_object"
+                }
+              }
+            : {})
+      },
+      { signal: request.signal }
+    )) as {
       choices?: Array<{ finish_reason?: string; message?: { content?: string | Array<{ type?: string; text?: string }> } }>;
     };
     const choice = payload.choices?.[0];

@@ -134,6 +134,7 @@ describe("managed sources", () => {
     await fs.mkdir(repoDir, { recursive: true });
     await fs.writeFile(path.join(repoDir, "README.md"), "# Alpha\n\nInitial source.\n", "utf8");
     await fs.writeFile(path.join(repoDir, "notes.md"), "# Notes\n\nExtra detail.\n", "utf8");
+    await fs.writeFile(path.join(repoDir, "README.swarmvault.meta.yaml"), "authority_layer: core\n", "utf8");
 
     await initVault(rootDir);
     const added = await addManagedSource(rootDir, repoDir);
@@ -146,13 +147,15 @@ describe("managed sources", () => {
 
     await fs.rm(path.join(repoDir, "notes.md"));
     await fs.writeFile(path.join(repoDir, "guide.md"), "# Guide\n\nReplacement detail.\n", "utf8");
+    await ingestInput(rootDir, path.join(repoDir, "README.swarmvault.meta.yaml"));
     const reloaded = await reloadManagedSources(rootDir, { id: added.source.id });
     expect(reloaded.sources).toHaveLength(1);
-    expect(reloaded.sources[0]?.lastSyncCounts?.removedCount ?? 0).toBeGreaterThanOrEqual(1);
+    expect(reloaded.sources[0]?.lastSyncCounts?.removedCount ?? 0).toBeGreaterThanOrEqual(2);
 
     const manifests = await readManifests(rootDir);
     expect(manifests.some((manifest) => manifest.originalPath?.endsWith("guide.md"))).toBe(true);
     expect(manifests.some((manifest) => manifest.originalPath?.endsWith("notes.md"))).toBe(false);
+    expect(manifests.some((manifest) => manifest.originalPath?.includes(".swarmvault.meta."))).toBe(false);
 
     const deleted = await deleteManagedSource(rootDir, added.source.id);
     expect(deleted.removed.id).toBe(added.source.id);

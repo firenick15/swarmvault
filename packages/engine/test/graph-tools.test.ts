@@ -242,4 +242,79 @@ describe("queryGraph domain-aware seed ranking", () => {
     expect(result.seedDiagnostics?.[0]?.nodeId).toBe("source:monthly");
     expect(result.seedDiagnostics?.[0]?.reasons).toContain("statistics_intent_metadata");
   });
+
+  it("treats source-alias retrieval hits as direct graph matches for long business titles", () => {
+    const graph = buildDomainRankingGraph();
+    const searchResults: SearchResult[] = [
+      {
+        pageId: "source:monthly",
+        path: "source:monthly.md",
+        title: "中华民共和国环境保护部令",
+        snippet: "《污染源自动监控设施现场监督检查办法》自2012年4月1日起施行。",
+        rank: -1,
+        projectIds: [],
+        authorityLayer: "core",
+        documentRole: "regulation",
+        evidenceRole: "current_authority",
+        retrievalStage: "source_alias"
+      }
+    ];
+
+    const result = queryGraph(graph, "污染源自动监控设施现场监督检查办法什么时候施行？", searchResults, {
+      budget: 4,
+      explainSeeds: true
+    });
+
+    expect(result.warnings ?? []).not.toContain("graph_query_no_direct_matches");
+    expect(result.matches.some((match) => match.type === "page" && match.id === "source:monthly")).toBe(true);
+  });
+
+  it("does not treat city-count wording as an HJ standard code seed", () => {
+    const graph: GraphArtifact = {
+      generatedAt: "2026-05-02T00:00:00.000Z",
+      nodes: [
+        {
+          id: "entity:hj-168",
+          type: "entity",
+          label: "HJ 168",
+          sourceIds: [],
+          projectIds: [],
+          degree: 1
+        },
+        {
+          id: "entity:168-cities",
+          type: "entity",
+          label: "168 个重点城市",
+          sourceIds: ["source:monthly"],
+          projectIds: [],
+          degree: 2
+        },
+        {
+          id: "source:monthly",
+          type: "source",
+          label: "全国城市空气质量月报",
+          pageId: "source:monthly",
+          sourceIds: ["source:monthly"],
+          projectIds: [],
+          degree: 2
+        }
+      ],
+      edges: [],
+      hyperedges: [],
+      communities: [],
+      sources: [],
+      pages: [
+        page("source:hj-168", "HJ 168 环境监测分析方法标准", ["entity:hj-168"]),
+        page("source:monthly", "全国城市空气质量月报 168 个重点城市排名", ["entity:168-cities", "source:monthly"])
+      ]
+    };
+
+    const result = queryGraph(graph, "168 个城市排名范围、名单和区域构成", [], {
+      budget: 4,
+      explainSeeds: true
+    });
+
+    expect(result.seedDiagnostics?.some((seed) => seed.nodeId === "entity:hj-168")).toBe(false);
+    expect(result.seedDiagnostics?.some((seed) => seed.nodeId === "entity:168-cities")).toBe(true);
+  });
 });

@@ -374,6 +374,10 @@ function directorySourceIdsFor(manifests: SourceManifest[], inputPath: string): 
     .sort((left, right) => left.localeCompare(right));
 }
 
+function isSourceSidecarMetadataPath(inputPath: string): boolean {
+  return /\.swarmvault\.meta\.(?:json|ya?ml)$/iu.test(inputPath);
+}
+
 function fileSourceIdsFor(manifests: SourceManifest[], inputPath: string): string[] {
   const absoluteInput = path.resolve(inputPath);
   return manifests
@@ -393,7 +397,7 @@ async function syncDirectorySource(rootDir: string, inputPath: string, repoRoot:
     if (!manifest.originalPath) {
       continue;
     }
-    if (await fileExists(path.resolve(manifest.originalPath))) {
+    if ((await fileExists(path.resolve(manifest.originalPath))) && !isSourceSidecarMetadataPath(manifest.originalPath)) {
       continue;
     }
     const removedManifest = await removeManifestBySourceId(rootDir, manifest.sourceId);

@@ -67,6 +67,25 @@ function scoreMatch(query: string, candidate: string): number {
   return overlap ? overlap * 10 : 0;
 }
 
+function shouldSuppressStandardCodeForCityCount(query: string, candidate: string): boolean {
+  const normalizedQuery = normalizeTarget(query).replace(/\s+/g, "");
+  const normalizedCandidate = normalizeTarget(candidate).replace(/\s+/g, "");
+  const cityCounts = [...normalizedQuery.matchAll(/(\d{2,4})(?:个)?(?:城市|城|地级及以上城市)/gu)].map((match) => match[1]);
+  if (!cityCounts.length) {
+    return false;
+  }
+  return cityCounts.some((count) =>
+    new RegExp(`^(?:entity:)?(?:hj|hj/t|gb|gb/t|db\\d{2}(?:/t)?)-?${count}(?:-|$)`, "iu").test(normalizedCandidate)
+  );
+}
+
+function graphLabelScore(query: string, candidate: string): number {
+  if (shouldSuppressStandardCodeForCityCount(query, candidate)) {
+    return 0;
+  }
+  return scoreMatch(query, candidate);
+}
+
 function compactText(value: string): string {
   return normalizeTarget(value).replace(/\s+/g, "");
 }
@@ -204,7 +223,14 @@ function pageSearchMatches(graph: GraphArtifact, question: string, searchResults
   return searchResults
     .map((result) => {
       const page = pages.get(result.pageId);
-      const score = Math.max(scoreMatch(question, result.title), scoreMatch(question, result.path));
+      const overlap = scoreTermOverlap(question, [result.title, result.path, result.snippet, result.standardCode ?? ""].join(" "));
+      const stageBoost =
+        result.retrievalStage === "source_alias"
+          ? 45
+          : result.retrievalStage === "standard_exact" || result.retrievalStage === "structured_fact"
+            ? 25
+            : 0;
+      const score = Math.max(graphLabelScore(question, result.title), graphLabelScore(question, result.path), overlap.score + stageBoost);
       if (!page || score <= 0) {
         return null;
       }
@@ -224,7 +250,7 @@ function nodeMatches(graph: GraphArtifact, query: string): GraphQueryMatch[] {
       type: "node" as const,
       id: node.id,
       label: node.label,
-      score: Math.max(scoreMatch(query, node.label), scoreMatch(query, node.id))
+      score: Math.max(graphLabelScore(query, node.label), graphLabelScore(query, node.id))
     }))
     .filter((match) => match.score > 0)
     .sort((left, right) => right.score - left.score || left.label.localeCompare(right.label));
@@ -236,7 +262,11 @@ function hyperedgeMatches(graph: GraphArtifact, query: string): GraphQueryMatch[
       type: "hyperedge" as const,
       id: hyperedge.id,
       label: hyperedge.label,
-      score: Math.max(scoreMatch(query, hyperedge.label), scoreMatch(query, hyperedge.why), scoreMatch(query, hyperedge.relation))
+      score: Math.max(
+        graphLabelScore(query, hyperedge.label),
+        graphLabelScore(query, hyperedge.why),
+        graphLabelScore(query, hyperedge.relation)
+      )
     }))
     .filter((match) => match.score > 0)
     .sort((left, right) => right.score - left.score || left.label.localeCompare(right.label));

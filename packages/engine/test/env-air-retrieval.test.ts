@@ -117,7 +117,47 @@ describe("environment air retrieval", () => {
     });
 
     expect(results[0]?.pageId).toBe("source:hj633");
-    expect(results[0]?.retrievalStage).toBe("standard_exact");
+    expect(["source_alias", "standard_exact"]).toContain(results[0]?.retrievalStage);
+  });
+
+  it("recalls explicit standard-code sources even when stale metadata marks them superseded", async () => {
+    const { wikiDir, dbPath } = await createTempWorkspace();
+    const exactPage = graphPage("source:hj818-formal", "HJ 818-2018 气态污染物运行质控技术规范", "sources/hj818-formal.md");
+    const guidePage = graphPage("source:hj818-guide", "光化学监测数据审核技术指南", "sources/hj818-guide.md");
+    await writePage(
+      wikiDir,
+      exactPage.path,
+      {
+        authority_layer: "method",
+        legal_status: "superseded",
+        document_role: "monitoring_method",
+        standard_code: "HJ 818-2018",
+        pollutants: ["SO2", "NO2", "O3", "CO"]
+      },
+      "# HJ 818-2018\n\n环境空气气态污染物 SO2、NO2、O3、CO 连续自动监测系统运行和质控技术规范。"
+    );
+    await writePage(
+      wikiDir,
+      guidePage.path,
+      {
+        authority_layer: "method",
+        legal_status: "current_effective",
+        document_role: "technical_guide",
+        standard_code: "HJ 818"
+      },
+      "# 技术指南\n\n本指南引用 HJ 818 作为光化学组分数据审核参考。"
+    );
+    await rebuildSearchIndex(dbPath, [exactPage, guidePage], wikiDir);
+
+    const results = searchPages(dbPath, "HJ 818 SO2 NO2 O3 CO 运行质控", {
+      limit: 5,
+      authorityLayer: ["core", "method"],
+      includeDrafts: false,
+      includeSuperseded: false
+    });
+
+    expect(results[0]?.pageId).toBe("source:hj818-formal");
+    expect(["source_alias", "standard_exact"]).toContain(results[0]?.retrievalStage);
   });
 
   it("expands pollutant-limit questions to the ambient air quality standard and returns chunk evidence", async () => {
@@ -171,6 +211,148 @@ describe("environment air retrieval", () => {
     expect(results[0]?.pageId).toBe("source:gb3095");
     expect(results[0]?.chunkId).toBeTruthy();
     expect(results[0]?.chunkKind).toBe("table");
+  });
+
+  it("uses source filename and document-number aliases as an early retrieval stage", async () => {
+    const { rootDir, wikiDir, dbPath } = await createTempWorkspace();
+    const page = graphPage("source:item-19", "中华民共和国环境保护部令", "sources/item-19.md");
+    await fs.mkdir(path.join(rootDir, "state", "manifests"), { recursive: true });
+    await fs.writeFile(
+      path.join(rootDir, "state", "manifests", "item-19.json"),
+      JSON.stringify({
+        sourceId: "item-19",
+        originalPath: "D:/kb/raw/污染源自动监控设施现场监督检查办法_环保部19号令.md",
+        storedPath: "raw/item-19.md",
+        sourceKind: "markdown"
+      }),
+      "utf8"
+    );
+    await writePage(
+      wikiDir,
+      page.path,
+      {
+        authority_layer: "core",
+        legal_status: "current_effective",
+        document_role: "regulation",
+        standard_code: "环境保护部令 第19号"
+      },
+      [
+        "# 中华民共和国环境保护部令",
+        "",
+        "## Source Excerpt",
+        "",
+        "《污染源自动监控设施现场监督检查办法》自2012年4月1日起施行，规定污染源自动监控设施现场监督检查的程序、内容和法律责任。"
+      ].join("\n")
+    );
+    await rebuildSearchIndex(dbPath, [page], wikiDir);
+
+    const results = searchPages(dbPath, "污染源自动监控设施现场监督检查办法什么时候施行？", {
+      limit: 5,
+      authorityLayer: ["core", "method"],
+      includeDrafts: false,
+      includeSuperseded: false
+    });
+
+    expect(results[0]?.pageId).toBe("source:item-19");
+    expect(results[0]?.retrievalStage).toBe("source_alias");
+  });
+
+  it("uses generated normalized status notices when frontmatter legal status is stale", async () => {
+    const { wikiDir, dbPath } = await createTempWorkspace();
+    const standardPage = graphPage(
+      "source:hj818",
+      "2018_环境空气气态污染物_SO2、NO2、O3、CO_连续自动监测系统运行和质控技术规范_HJ818-2018",
+      "sources/hj818.md"
+    );
+    const guidePage = graphPage("source:guide", "总站光化学组分自动数据审核技术指南", "sources/guide.md");
+    await writePage(
+      wikiDir,
+      standardPage.path,
+      {
+        authority_layer: "method",
+        legal_status: "superseded",
+        document_role: "monitoring_method",
+        standard_code: "HJ 818-2018",
+        pollutants: ["SO2", "NO2", "O3", "CO"]
+      },
+      [
+        "# 2018_环境空气气态污染物_SO2、NO2、O3、CO_连续自动监测系统运行和质控技术规范_HJ818-2018",
+        "",
+        "Standard Code: `HJ 818-2018`",
+        "",
+        "## Status Notice",
+        "",
+        "- Normalized legal status: `current_effective`",
+        "- legal_status_normalized:effective_date_on_or_before_as_of_date",
+        "",
+        "本标准规定环境空气 SO2、NO2、O3、CO 连续自动监测系统运行与质控要求，包括零点、量程、转换炉效率等运行质量控制。"
+      ].join("\n")
+    );
+    await writePage(
+      wikiDir,
+      guidePage.path,
+      {
+        authority_layer: "method",
+        legal_status: "current_effective",
+        document_role: "technical_guide",
+        standard_code: "HJ 818",
+        pollutants: ["O3", "NOx", "CO"]
+      },
+      "# 总站光化学组分自动数据审核技术指南\n\n本指南引用 HJ 818 作为 NOy 和光化学组分数据审核的衔接依据。"
+    );
+    await rebuildSearchIndex(dbPath, [standardPage, guidePage], wikiDir);
+
+    const results = searchPages(dbPath, "HJ 818 SO2 NO2 O3 CO 运行质控", {
+      limit: 5,
+      authorityLayer: ["core", "method"],
+      includeDrafts: false,
+      includeSuperseded: false
+    });
+
+    expect(results[0]?.pageId).toBe("source:hj818");
+    expect(["source_alias", "standard_exact"]).toContain(results[0]?.retrievalStage);
+    expect(results.map((result) => result.pageId)).toContain("source:guide");
+  });
+
+  it("focuses HTML table evidence when pollutant labels are OCR/LaTeX spaced", async () => {
+    const { wikiDir, dbPath } = await createTempWorkspace();
+    const standardPage = graphPage("source:gb3095-html", "中华人民共和国国家标准", "sources/gb3095-html.md");
+    await writePage(
+      wikiDir,
+      standardPage.path,
+      {
+        authority_layer: "core",
+        legal_status: "current_effective",
+        document_role: "standard",
+        standard_code: "GB 3095-2026",
+        pollutants: ["PM2.5", "PM10", "SO2", "NO2", "CO"]
+      },
+      [
+        "# 中华人民共和国国家标准",
+        "",
+        "## Source Excerpt",
+        "",
+        "<table>",
+        "<tr><td>污染物项目</td><td>平均时间</td><td>一级</td><td>二级</td><td>单位</td></tr>",
+        "<tr><td rowspan=2>$\\mathrm { P M } _ { 2 . 5 }$</td><td>年平均</td><td>15</td><td>25</td><td>μg/m3</td></tr>",
+        "<tr><td>24小时平均</td><td>35</td><td>50</td><td>μg/m3</td></tr>",
+        "<tr><td>$\\mathrm { S O } _ { 2 }$</td><td>1小时平均</td><td>150</td><td>150</td><td>μg/m3</td></tr>",
+        "</table>"
+      ].join("\n")
+    );
+    await rebuildSearchIndex(dbPath, [standardPage], wikiDir);
+
+    const results = searchPages(dbPath, "PM2.5 24 小时平均二级限值是多少？", {
+      limit: 5,
+      authorityLayer: ["core", "method"],
+      includeDrafts: false,
+      includeSuperseded: false
+    });
+
+    expect(results[0]?.pageId).toBe("source:gb3095-html");
+    expect(results[0]?.snippet).toContain("24小时平均");
+    expect(results[0]?.snippet).toContain("50");
+    expect(results.some((result) => result.retrievalStage === "structured_fact")).toBe(true);
   });
 
   it("focuses GB 3095 table evidence on O3 rows instead of PM2.5-only snippets", async () => {

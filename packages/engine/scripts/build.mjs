@@ -52,7 +52,7 @@ if (!existsSync(viewerDistIndex)) {
   runPnpm(["--dir", "../viewer", "build"], cwd);
 }
 
-runPnpm(["exec", "tsup", "src/index.ts", "--format", "esm", "--dts"], cwd);
+runPnpm(["exec", "tsup", "src/index.ts", "src/runtime.ts", "--format", "esm", "--dts"], cwd);
 runPnpm(["exec", "tsup", "--config", "tsup.hooks.config.ts"], cwd);
 
 await rm(viewerTargetDir, { recursive: true, force: true });

@@ -36,6 +36,27 @@ function splitMarkdownRow(line: string): string[] {
     .filter(Boolean);
 }
 
+function splitHtmlTableCells(row: string): string[] {
+  return [...row.matchAll(/<t[dh][^>]*>([\s\S]*?)<\/t[dh]>/giu)].map((match) => stripMarkup(match[1] ?? "")).filter(Boolean);
+}
+
+function htmlRows(line: string): string[] {
+  return [...line.matchAll(/<tr[\s\S]*?<\/tr>/giu)].map((match) => match[0]);
+}
+
+function repairHeaderCells(cells: string[]): string[] {
+  return cells.map((cell, index) => (cell === "级" && cells[index - 1] === "一级" ? "二级" : cell));
+}
+
+function isHtmlHeaderContinuation(cells: string[]): boolean {
+  if (!cells.length || cells.some((cell) => /[0-9]/.test(cell))) {
+    return false;
+  }
+  return cells.every((cell) =>
+    /^(序号|编号|污染物项目|项目|平均时间|评价时段|单位|一级|二级|三级|级|浓度|限值|过渡阶段浓度限值|标准限值)$/u.test(cell)
+  );
+}
+
 function isMarkdownDivider(line: string): boolean {
   return /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$/.test(line);
 }
@@ -64,6 +85,9 @@ export function extractDocumentStructureBlocks(input: { sourceId: string; text: 
   let offset = 0;
   let ordinal = 0;
   let tableHeader: string[] | undefined;
+  let htmlTableHeader: string[] | undefined;
+  let htmlRowIndex = 0;
+  let carriedHtmlRowPrefix: string[] | undefined;
 
   function push(kind: DocumentBlockKind, rawText: string, extra: Partial<DocumentStructureBlock> = {}): void {
     const normalizedText = stripMarkup(rawText);
@@ -103,6 +127,67 @@ export function extractDocumentStructureBlocks(input: { sourceId: string; text: 
       return;
     }
 
+    const rows = htmlRows(line);
+    if (rows.length) {
+      for (const row of rows) {
+        const cells = splitHtmlTableCells(row);
+        if (cells.length < 2) {
+          continue;
+        }
+        const isHeader = /<th[\s>]/iu.test(row) || !htmlTableHeader;
+        if (isHeader) {
+          htmlTableHeader = repairHeaderCells(cells);
+          htmlRowIndex = 0;
+          push("table", row, {
+            cells,
+            headers: htmlTableHeader,
+            rowIndex: 0,
+            tableNo: tableNoFromText(heading) ?? tableNoFromText(row),
+            startOffset: lineStart
+          });
+          continue;
+        }
+        if (isHtmlHeaderContinuation(cells)) {
+          const repairedCells = repairHeaderCells(cells);
+          htmlTableHeader = [...(htmlTableHeader ?? []), ...repairedCells];
+          push("table", row, {
+            cells: repairedCells,
+            headers: htmlTableHeader,
+            rowIndex: 0,
+            tableNo: tableNoFromText(heading) ?? tableNoFromText(row),
+            startOffset: lineStart
+          });
+          continue;
+        }
+        htmlRowIndex += 1;
+        const periodCellIndex = cells.findIndex((cell) =>
+          /^(年平均|日平均|24小时平均|1小时平均|小时平均|日最大|第[0-9]+百分位)/u.test(cell)
+        );
+        const prefixCells =
+          periodCellIndex > 0
+            ? cells
+                .slice(0, periodCellIndex)
+                .filter((cell) => /[\p{Script=Han}A-Za-z0-9]/u.test(cell) && !/^(序号|污染物项目|编号)$/u.test(cell))
+            : [];
+        if (prefixCells.length) {
+          carriedHtmlRowPrefix = prefixCells;
+        }
+        const normalizedCells = periodCellIndex === 0 && carriedHtmlRowPrefix?.length ? [...carriedHtmlRowPrefix, ...cells] : cells;
+        push("table_row", [...(htmlTableHeader ?? []), ...normalizedCells].join(" "), {
+          cells: normalizedCells,
+          headers: htmlTableHeader,
+          rowIndex: htmlRowIndex,
+          tableNo: tableNoFromText(heading) ?? tableNoFromText(row),
+          startOffset: lineStart
+        });
+      }
+      return;
+    } else {
+      htmlTableHeader = undefined;
+      htmlRowIndex = 0;
+      carriedHtmlRowPrefix = undefined;
+    }
+
     if (line.includes("|")) {
       const cells = splitMarkdownRow(line);
       if (cells.length >= 2) {
@@ -116,7 +201,7 @@ export function extractDocumentStructureBlocks(input: { sourceId: string; text: 
             startOffset: lineStart
           });
         } else {
-          push("table_row", line, {
+          push("table_row", [...tableHeader, ...cells].join(" "), {
             cells,
             headers: tableHeader,
             rowIndex: blocks.filter((block) => block.kind === "table_row" && block.heading === heading).length + 1,

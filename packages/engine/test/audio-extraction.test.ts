@@ -107,6 +107,35 @@ describe("OpenAiCompatibleProviderAdapter.transcribeAudio", () => {
       })
     ).rejects.toThrow(/401/);
   });
+
+  it("honors abort signals for text generation requests", async () => {
+    const fetchMock = vi.fn(
+      async (_url: string, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          const signal = init?.signal;
+          if (signal?.aborted) {
+            reject(new DOMException("Aborted", "AbortError"));
+            return;
+          }
+          signal?.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true });
+        })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const provider = new OpenAiCompatibleProviderAdapter("test-abort", "openai", "gpt-test", {
+      baseUrl: "https://api.openai.com/v1",
+      apiKey: "test-key",
+      apiStyle: "chat",
+      capabilities: ["chat"],
+      timeoutMs: 60_000
+    });
+    const controller = new AbortController();
+    const request = provider.generateText({ prompt: "wait", signal: controller.signal });
+    controller.abort();
+
+    await expect(request).rejects.toThrow(/request aborted/i);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("provider audio capability", () => {

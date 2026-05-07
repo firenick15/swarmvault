@@ -434,35 +434,56 @@ export function classifyEnvAirToolRouting(question: string, profile: EnvAirProfi
   const dataOperations = matchedTerms(question, profile.dataOperationTerms);
   const explicitDataTools = matchedTerms(question, profile.explicitDataToolTerms);
   const basisOnlySignals = matchedTerms(question, profile.basisOnlyTerms);
+  const standardReferences = extractStandardReferences(question);
   const knowledgeSignals = uniqueCompact([
     ...matchedTerms(question, profile.knowledgeHints),
     ...matchedTerms(question, profile.knowledgeOperationTerms),
-    ...extractStandardReferences(question).map((ref) => ref.normalized)
+    ...standardReferences.map((ref) => ref.normalized)
   ]);
   const dataSignals = uniqueCompact([...dataObjects, ...dataTimes, ...dataLocations, ...dataOperations, ...explicitDataTools]);
   const hasExplicitDataTool = explicitDataTools.length > 0;
   const hasConcreteDataObject = dataObjects.length > 0;
   const hasDataFrame = dataTimes.length > 0 || dataLocations.length > 0;
   const hasDataOperation = dataOperations.length > 0;
+  const hasBoundaryQuestion =
+    /(能否|能不能|是否可以|可否|能不能直接|能否直接|是否能|是否属于).{0,18}(作为|替代|用于|执行|处罚|依据|结论|法定义务)|边界|区别/u.test(
+      question
+    );
+  const hasReportDraftRequest = /(写|撰写|生成|起草).{0,12}(月报|年报|公报|报告|分析|汇报)|月报分析|报告分析/u.test(question);
+  const hasStandardKnowledgeContext =
+    standardReferences.length > 0 ||
+    /(标准|规范|导则|指南|依据|限值|评价方法|技术要求|质控要求|验收要求|合格要求|频次|多久)/u.test(question);
   const hasAirQualityStatus = /(空气质量|污染|优良|轻度|中度|重度|严重|aqi|iaqi|浓度|超标|达标)/iu.test(question);
   const hasTimeLocationStatus = dataTimes.length > 0 && dataLocations.length > 0 && hasAirQualityStatus;
   const actualDataAction =
     hasExplicitDataTool ||
     hasTimeLocationStatus ||
-    /实测|实际监测|监测数据|原始数据|站点数据|是否超标|排名|同比|环比|过程分析|异常|查询|统计/u.test(question);
+    (!hasBoundaryQuestion &&
+      hasDataFrame &&
+      /(是否超标|排名|同比|环比|过程分析|异常|查询|统计|计算|第\s*90\s*百分位|百分位|MDA8)/u.test(question)) ||
+    (!hasBoundaryQuestion && !hasStandardKnowledgeContext && /实测|实际监测|监测数据|原始数据|站点数据/u.test(question));
   const basisOnlyQuestion = basisOnlySignals.length > 0 && !actualDataAction;
   const ruleWantsData = routePolicies.includes("data") || routePolicies.includes("both");
   const ruleWantsKnowledge = routePolicies.includes("knowledge") || routePolicies.includes("both");
   const wantsData =
     !basisOnlyQuestion &&
-    (ruleWantsData || hasExplicitDataTool || hasConcreteDataObject || hasTimeLocationStatus || (hasDataFrame && hasDataOperation));
-  const wantsKnowledge = ruleWantsKnowledge || knowledgeSignals.length > 0;
+    !hasBoundaryQuestion &&
+    (ruleWantsData ||
+      hasExplicitDataTool ||
+      hasTimeLocationStatus ||
+      (actualDataAction && hasConcreteDataObject) ||
+      (hasDataFrame && hasDataOperation));
+  const wantsKnowledge = hasBoundaryQuestion || hasReportDraftRequest || ruleWantsKnowledge || knowledgeSignals.length > 0;
   const reasons: string[] = [];
   if (wantsKnowledge) {
     reasons.push("knowledge_signals_present");
   }
   if (hasExplicitDataTool) {
     reasons.push("explicit_environment_data_mcp_request");
+  } else if (hasBoundaryQuestion) {
+    reasons.push("authority_boundary_question");
+  } else if (hasReportDraftRequest) {
+    reasons.push("report_analysis_request");
   } else if (basisOnlyQuestion) {
     reasons.push("basis_only_question");
   } else if (hasTimeLocationStatus) {
@@ -477,16 +498,28 @@ export function classifyEnvAirToolRouting(question: string, profile: EnvAirProfi
   if (!wantsData && dataSignals.length) {
     reasons.push("data_terms_without_concrete_monitoring_request");
   }
-  const finalNextTool: RecommendedNextTool = wantsData && wantsKnowledge ? "both" : wantsData ? "environment_data_mcp" : "knowledge_base";
-  const confidence = hasExplicitDataTool || basisOnlyQuestion || hasTimeLocationStatus ? 0.95 : wantsData || wantsKnowledge ? 0.75 : 0.45;
+  const finalNextTool: RecommendedNextTool =
+    hasReportDraftRequest && !hasExplicitDataTool
+      ? "both"
+      : wantsData && wantsKnowledge
+        ? "both"
+        : wantsData
+          ? "environment_data_mcp"
+          : "knowledge_base";
+  const confidence =
+    hasExplicitDataTool || basisOnlyQuestion || hasBoundaryQuestion || hasTimeLocationStatus
+      ? 0.95
+      : wantsData || wantsKnowledge
+        ? 0.75
+        : 0.45;
   return {
     deterministicNextTool: finalNextTool,
     finalNextTool,
     reasons,
     dataSignals,
     knowledgeSignals,
-    knowledgeNeeded: wantsKnowledge,
-    dataNeeded: wantsData,
+    knowledgeNeeded: wantsKnowledge || finalNextTool === "both",
+    dataNeeded: wantsData || finalNextTool === "both" || finalNextTool === "environment_data_mcp",
     confidence,
     matchedSignals: {
       time: dataTimes,

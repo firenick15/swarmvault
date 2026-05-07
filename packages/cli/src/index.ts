@@ -711,7 +711,10 @@ source
     for (const issue of issues) {
       log(
         `${issue.path} - ${issue.title} (${issue.extractionStatus ?? issue.analysisMode ?? "unknown"})` +
-          `${issue.sourcePath ? `\n  Source: ${issue.sourcePath}` : ""}\n  ${issue.message}`
+          `${issue.sourcePath ? `\n  Source: ${issue.sourcePath}${issue.sourcePathExists === false ? " (missing)" : ""}` : ""}` +
+          `${issue.replacementCandidatePath ? `\n  Replacement candidate: ${issue.replacementCandidatePath}` : ""}` +
+          `${issue.recommendedAction ? `\n  Recommended action: ${issue.recommendedAction}` : ""}` +
+          `\n  ${issue.message}`
       );
     }
   });

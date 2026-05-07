@@ -161,6 +161,33 @@ describe("raw-source grounding in queries", () => {
     const result = await queryVault(rootDir, { question: "What is the raw content?", save: false });
     expect(result.answer).toContain("Raw source");
   });
+
+  it("can query in runtime read-only mode without recording sessions or log entries", async () => {
+    const rootDir = await createTempWorkspace();
+    await initVault(rootDir);
+    await fs.writeFile(path.join(rootDir, "readonly-test.md"), "# Read Only\n\nRuntime queries should not mutate logs.", "utf8");
+    await ingestInput(rootDir, "readonly-test.md");
+    await compileVault(rootDir);
+
+    const logPath = path.join(rootDir, "wiki", "log.md");
+    const sessionsDir = path.join(rootDir, "state", "sessions");
+    const beforeLog = await fs.readFile(logPath, "utf8").catch(() => "");
+    const beforeSessions = await fs.readdir(sessionsDir).catch(() => []);
+
+    const result = await queryVault(rootDir, {
+      question: "What should not mutate logs?",
+      save: false,
+      sessionMode: "none",
+      disableQueryLog: true,
+      runtimeReadOnly: true
+    });
+
+    const afterLog = await fs.readFile(logPath, "utf8").catch(() => "");
+    const afterSessions = await fs.readdir(sessionsDir).catch(() => []);
+    expect(result.answer).toBeTruthy();
+    expect(afterLog).toBe(beforeLog);
+    expect(afterSessions).toEqual(beforeSessions);
+  });
 });
 
 describe("computed confidence", () => {

@@ -207,6 +207,7 @@ export interface GenerationRequest {
   prompt: string;
   attachments?: GenerationAttachment[];
   maxOutputTokens?: number;
+  signal?: AbortSignal;
 }
 
 export interface GenerationResponse {
@@ -1694,7 +1695,7 @@ export interface SearchResult {
   chunkHeading?: string;
   chunkKind?: "paragraph" | "table" | "formula" | "heading";
   chunkLocation?: string;
-  retrievalStage?: "standard_exact" | "structured_fact" | "fts" | "chunk_fts" | "like" | "semantic" | "rerank";
+  retrievalStage?: "source_alias" | "standard_exact" | "structured_fact" | "fts" | "chunk_fts" | "like" | "semantic" | "rerank";
   factId?: string;
   factStableId?: string;
   factOrdinal?: number;
@@ -1720,6 +1721,10 @@ export interface SourceExtractionIssue {
   path: string;
   sourceIds: string[];
   sourcePath?: string;
+  sourcePathExists?: boolean;
+  replacementCandidatePath?: string;
+  replacementCandidateKind?: SourceKind;
+  recommendedAction?: string;
   analysisMode?: string;
   extractionStatus?: string;
   needsOcr: boolean;
@@ -1815,6 +1820,10 @@ export interface QueryOptions {
   debugContext?: boolean;
   returnDecisionContract?: boolean;
   retrievalStalePolicy?: "error" | "auto_repair" | "warn";
+  sessionMode?: "record" | "none";
+  disableQueryLog?: boolean;
+  runtimeReadOnly?: boolean;
+  signal?: AbortSignal;
 }
 
 export type EvidenceState = "grounded" | "partial" | "insufficient";

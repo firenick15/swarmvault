@@ -44,15 +44,31 @@ const VALUE_PATTERN =
   /([0-9]+(?:\.[0-9]+)?(?:\s*[-~至]\s*[0-9]+(?:\.[0-9]+)?)?)\s*(μg\/m3|µg\/m3|mg\/m3|μg\/m³|µg\/m³|mg\/m³|ug\/m3|%|分贝|dB)?/iu;
 const PERIOD_PATTERN = /(年平均|24小时平均|日平均|1小时平均|小时平均|日最大8小时平均|8小时平均|月平均|季平均|算术平均|第[0-9]+百分位数)/u;
 
+function normalizeFactText(value: string): string {
+  return value
+    .replace(/\\(?:mathrm|mathsf|mathbf|bf)\s*\{([^}]*)\}/gi, "$1")
+    .replace(/\\left|\\right|\\mathrm|\\mathsf|\\mathbf|\\bf/gi, " ")
+    .replace(/[_{}$()[\]（）]/g, " ")
+    .replace(/\bP\s*M\s*2\s*\.?\s*5\b/gi, "PM2.5")
+    .replace(/\bP\s*M\s*1\s*0\b/gi, "PM10")
+    .replace(/\bS\s*O\s*2\b/gi, "SO2")
+    .replace(/\bN\s*O\s*2\b/gi, "NO2")
+    .replace(/\bO\s*3\b/gi, "O3")
+    .replace(/\bN\s*O\s*x\b/gi, "NOx")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function pollutantFromText(rawText: string): string | undefined {
-  const match = rawText.match(POLLUTANT_PATTERN);
+  const match = normalizeFactText(rawText).match(POLLUTANT_PATTERN);
   return match ? normalizePollutantName(match[0]) : undefined;
 }
 
 function normalizeStructuredFact(fact: StructuredFact): EnvAirStructuredFact | undefined {
-  const pollutant = pollutantFromText(fact.rawText);
-  const valueMatch = fact.rawText.match(VALUE_PATTERN);
-  const periodMatch = fact.rawText.match(PERIOD_PATTERN);
+  const normalizedRawText = normalizeFactText(fact.rawText);
+  const pollutant = pollutantFromText(normalizedRawText);
+  const valueMatch = normalizedRawText.match(VALUE_PATTERN);
+  const periodMatch = normalizedRawText.match(PERIOD_PATTERN);
   if (fact.kind === "other" && !pollutant) {
     return undefined;
   }
@@ -77,7 +93,7 @@ function normalizeStructuredFact(fact: StructuredFact): EnvAirStructuredFact | u
     value: valueMatch?.[1],
     unit: valueMatch?.[2],
     standardCode: fact.standardCode,
-    rawText: fact.rawText,
+    rawText: normalizedRawText,
     searchText: buildEnvAirSearchText({
       title: fact.sourceSection ?? fact.subject ?? "",
       body: fact.rawText,

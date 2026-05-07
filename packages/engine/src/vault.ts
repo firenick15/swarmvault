@@ -4171,14 +4171,56 @@ function isCurrentAuthorityEvidence(item: EvidenceItem): boolean {
   );
 }
 
+function isSchemaRuleEvidence(item: EvidenceItem): boolean {
+  return item.citation?.startsWith("schema:") === true || item.title.toLowerCase().includes("schema authority");
+}
+
 function splitEvidenceByAuthority(
   evidenceItems: EvidenceItem[],
-  currentBasis: boolean
+  currentBasis: boolean,
+  authorityBoundary = false
 ): {
   primary: EvidenceItem[];
   supporting: EvidenceItem[];
   excluded: Array<EvidenceItem & { exclusionReason: string }>;
 } {
+  if (authorityBoundary) {
+    const primary: EvidenceItem[] = [];
+    const supporting: EvidenceItem[] = [];
+    const excluded: Array<EvidenceItem & { exclusionReason: string }> = [];
+    for (const item of evidenceItems) {
+      if (isSchemaRuleEvidence(item)) {
+        primary.push(item);
+        continue;
+      }
+      if (
+        item.legalStatus === "draft_consultation" ||
+        item.legalStatus === "superseded" ||
+        item.legalStatus === "explanation_only" ||
+        item.legalStatus === "time_scoped_evidence" ||
+        item.authorityLayer === "evolution" ||
+        item.documentRole === "draft" ||
+        item.documentRole === "compilation_explanation" ||
+        item.documentRole === "research_literature" ||
+        item.documentRole === "statistics" ||
+        item.documentRole === "whitepaper" ||
+        item.documentRole === "official_explanation"
+      ) {
+        excluded.push({ ...item, exclusionReason: "not_current_execution_basis" });
+        continue;
+      }
+      if (item.documentRole === "technical_guide" || item.authorityLayer === "evidence" || item.kind === "web") {
+        supporting.push(item);
+        continue;
+      }
+      supporting.push(item);
+    }
+    return {
+      primary: primary.length ? primary : evidenceItems.slice(0, 1),
+      supporting,
+      excluded
+    };
+  }
   if (!currentBasis) {
     return { primary: evidenceItems, supporting: [], excluded: [] };
   }
@@ -4965,7 +5007,8 @@ async function executeQuery(
       )
     });
   }
-  const evidenceLayers = splitEvidenceByAuthority(evidenceItems, currentBasisQuery);
+  const authorityBoundaryQuery = queryPlan.rankingSignals.includes("authority_boundary_question");
+  const evidenceLayers = splitEvidenceByAuthority(evidenceItems, currentBasisQuery, authorityBoundaryQuery);
   const evidenceForCoverage = currentBasisQuery && evidenceLayers.primary.length ? evidenceLayers.primary : evidenceItems;
   const standardCoverage = buildStandardCoverage(requiredStandards, evidenceForCoverage);
   const evidenceCompleteness = evidenceCompletenessFromCoverage(standardCoverage);
@@ -5152,6 +5195,7 @@ async function executeQuery(
         structuredAnswer = await provider.generateStructured(
           {
             system,
+            signal: options.queryOptions?.signal,
             prompt: [
               `Question: ${question}`,
               "",
@@ -5179,6 +5223,7 @@ async function executeQuery(
           };
           const response = await provider.generateText({
             system,
+            signal: options.queryOptions?.signal,
             prompt: `Question: ${question}\n\n${context}`
           });
           answer = response.text;
@@ -5196,6 +5241,7 @@ async function executeQuery(
         };
         const response = await provider.generateText({
           system,
+          signal: options.queryOptions?.signal,
           prompt: `Question: ${question}\n\n${context}`
         });
         answer = response.text;
@@ -5204,6 +5250,7 @@ async function executeQuery(
     } else {
       const response = await provider.generateText({
         system,
+        signal: options.queryOptions?.signal,
         prompt: `Question: ${question}\n\n${context}`
       });
       answer = response.text;
@@ -7262,6 +7309,11 @@ export async function queryVault(rootDir: string, options: QueryOptions): Promis
   const startedAt = new Date().toISOString();
   const save = options.save ?? true;
   const review = options.review ?? false;
+  const runtimeReadOnly = options.runtimeReadOnly === true;
+  if (runtimeReadOnly && (save || review || options.memoryTaskId)) {
+    throw new Error("runtimeReadOnly query cannot save output, stage review output, or update memory tasks.");
+  }
+  const shouldRecordSession = !runtimeReadOnly && options.sessionMode !== "none" && options.disableQueryLog !== true;
   const outputFormat = normalizeOutputFormat(options.format);
   const schemas = await loadVaultSchemas(rootDir);
   const query = await executeQuery(rootDir, options.question, outputFormat, {
@@ -7330,30 +7382,32 @@ export async function queryVault(rootDir: string, options: QueryOptions): Promis
     }
   }
 
-  const provider = await getProviderForTask(rootDir, "queryProvider");
-  await recordSession(rootDir, {
-    operation: "query",
-    title: options.question,
-    startedAt,
-    finishedAt: new Date().toISOString(),
-    providerId: provider.id,
-    success: true,
-    relatedSourceIds: query.relatedSourceIds,
-    relatedPageIds: savedPageId ? [...query.relatedPageIds, savedPageId] : query.relatedPageIds,
-    relatedNodeIds: query.relatedNodeIds,
-    citations: query.citations,
-    tokenUsage: query.usage,
-    lines: [
-      `citations=${query.citations.join(",") || "none"}`,
-      `evidenceState=${query.evidenceState ?? "unknown"}`,
-      `recommendedNextTool=${query.recommendedNextTool ?? "knowledge_base"}`,
-      `answerBasis=${query.answerBasis ?? "unknown"}`,
-      `saved=${Boolean(savedPath)}`,
-      `staged=${Boolean(stagedPath)}`,
-      `format=${outputFormat}`,
-      `rawSources=${query.relatedSourceIds.length}`
-    ]
-  });
+  if (shouldRecordSession) {
+    const provider = await getProviderForTask(rootDir, "queryProvider");
+    await recordSession(rootDir, {
+      operation: "query",
+      title: options.question,
+      startedAt,
+      finishedAt: new Date().toISOString(),
+      providerId: provider.id,
+      success: true,
+      relatedSourceIds: query.relatedSourceIds,
+      relatedPageIds: savedPageId ? [...query.relatedPageIds, savedPageId] : query.relatedPageIds,
+      relatedNodeIds: query.relatedNodeIds,
+      citations: query.citations,
+      tokenUsage: query.usage,
+      lines: [
+        `citations=${query.citations.join(",") || "none"}`,
+        `evidenceState=${query.evidenceState ?? "unknown"}`,
+        `recommendedNextTool=${query.recommendedNextTool ?? "knowledge_base"}`,
+        `answerBasis=${query.answerBasis ?? "unknown"}`,
+        `saved=${Boolean(savedPath)}`,
+        `staged=${Boolean(stagedPath)}`,
+        `format=${outputFormat}`,
+        `rawSources=${query.relatedSourceIds.length}`
+      ]
+    });
+  }
   if (options.memoryTaskId) {
     await updateMemoryTask(rootDir, options.memoryTaskId, {
       note: `Query: ${options.question}`,
@@ -7748,22 +7802,65 @@ export async function listSourceExtractionIssues(
     }
     const primarySourceId = page.sourceIds[0];
     const manifest = primarySourceId ? manifestsBySourceId.get(primarySourceId) : undefined;
+    if (!manifest) {
+      continue;
+    }
+    const sourcePath = manifest?.originalPath ?? manifest?.storedPath;
+    const sourcePathExists = sourcePath
+      ? await fileExists(path.isAbsolute(sourcePath) ? sourcePath : path.resolve(rootDir, sourcePath))
+      : undefined;
+    const replacement = manifest ? await findSourceReplacementCandidate(rootDir, manifest) : undefined;
     issues.push({
       pageId: page.id,
       title: page.title,
       path: page.path,
       sourceIds: page.sourceIds,
-      sourcePath: manifest?.originalPath ?? manifest?.storedPath,
+      sourcePath,
+      sourcePathExists,
+      replacementCandidatePath: replacement?.path,
+      replacementCandidateKind: replacement?.kind,
+      recommendedAction: replacement ? "Run `swarmvault source reload --all --no-brief` before recompiling the vault." : undefined,
       analysisMode,
       extractionStatus,
       needsOcr,
       allowEmpty,
       message: empty
-        ? "No extracted text is available. OCR, source replacement, manual conversion, or allow_empty review is required."
+        ? replacement
+          ? "No extracted text is available, but a same-stem replacement source was found. Re-sync managed sources so the vault stops using the stale manifest."
+          : "No extracted text is available. OCR, source replacement, manual conversion, or allow_empty review is required."
         : "Source is marked as requiring OCR or manual extraction review."
     });
   }
   return issues.sort((left, right) => left.path.localeCompare(right.path));
+}
+
+async function findSourceReplacementCandidate(
+  rootDir: string,
+  manifest: SourceManifest
+): Promise<{ path: string; kind: SourceManifest["sourceKind"] } | undefined> {
+  const sourcePath = manifest.originalPath ?? manifest.repoRelativePath ?? manifest.storedPath;
+  if (!sourcePath) {
+    return undefined;
+  }
+  const absoluteSourcePath = path.isAbsolute(sourcePath) ? sourcePath : path.resolve(rootDir, sourcePath);
+  const parsed = path.parse(absoluteSourcePath);
+  const candidateExtensions: Array<{ extension: string; kind: SourceManifest["sourceKind"] }> = [
+    { extension: ".md", kind: "markdown" },
+    { extension: ".markdown", kind: "markdown" },
+    { extension: ".txt", kind: "text" },
+    { extension: ".docx", kind: "docx" },
+    { extension: ".pdf", kind: "pdf" }
+  ];
+  for (const candidate of candidateExtensions) {
+    const candidatePath = path.join(parsed.dir, `${parsed.name}${candidate.extension}`);
+    if (path.resolve(candidatePath) === path.resolve(absoluteSourcePath)) {
+      continue;
+    }
+    if (await fileExists(candidatePath)) {
+      return { path: candidatePath, kind: candidate.kind };
+    }
+  }
+  return undefined;
 }
 
 async function rerankSearchResults(rootDir: string, query: string, results: SearchResult[], limit: number): Promise<SearchResult[]> {

@@ -20,4 +20,21 @@ describe("environment air tool routing", () => {
     expect(routing.finalNextTool).toBe("environment_data_mcp");
     expect(routing.reasons).toContain("time_location_air_quality_status_request");
   });
+
+  it("keeps authority-boundary questions in the knowledge base even when they mention statistics", () => {
+    const routing = classifyEnvAirToolRouting("月报中的城市排名能否作为某城市年度达标结论？");
+    expect(routing.finalNextTool).toBe("knowledge_base");
+    expect(routing.reasons).toContain("authority_boundary_question");
+  });
+
+  it("routes concrete percentile calculations to the environment data MCP", () => {
+    const routing = classifyEnvAirToolRouting("某市上周 O3 第90百分位是多少？");
+    expect(routing.finalNextTool).toBe("environment_data_mcp");
+  });
+
+  it("routes report drafting with data analysis framing to both tools", () => {
+    const routing = classifyEnvAirToolRouting("帮我写一段空气质量月报分析");
+    expect(routing.finalNextTool).toBe("both");
+    expect(routing.reasons).toContain("report_analysis_request");
+  });
 });

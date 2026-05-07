@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { loadVaultConfig } from "./config.js";
 import { applyStandardRelationOverrides } from "./domain/standard-relations.js";
 import { rebuildSearchIndex } from "./search.js";
@@ -10,6 +11,8 @@ const DEFAULT_RETRIEVAL_SHARD_SIZE = 25000;
 export const RETRIEVAL_INDEX_SCHEMA_VERSION = 3;
 const RETRIEVAL_LOCK_POLL_MS = 500;
 const RETRIEVAL_LOCK_TIMEOUT_MS = 10 * 60 * 1000;
+const RETRIEVAL_SCHEMA_BUSY_RETRY_MS = 150;
+const RETRIEVAL_SCHEMA_BUSY_RETRIES = 3;
 
 const RETRIEVAL_INDEX_REQUIRED_COLUMNS: Record<string, string[]> = {
   pages: [
@@ -99,6 +102,13 @@ function getDatabaseSync(): DatabaseSyncCtor {
   return builtin.DatabaseSync;
 }
 
+function sqliteImmutableReadOnlyUri(dbPath: string): string {
+  const url = pathToFileURL(path.resolve(dbPath));
+  url.searchParams.set("mode", "ro");
+  url.searchParams.set("immutable", "1");
+  return url.href;
+}
+
 async function inspectRetrievalIndex(
   dbPath: string,
   manifest: RetrievalManifest | null
@@ -112,9 +122,37 @@ async function inspectRetrievalIndex(
     warnings.push("Retrieval index file is empty.");
     return { schemaOk: false, warnings };
   }
+  for (let attempt = 0; attempt <= RETRIEVAL_SCHEMA_BUSY_RETRIES; attempt++) {
+    try {
+      inspectRetrievalIndexSchema(dbPath, warnings);
+      break;
+    } catch (error) {
+      if (isSqliteBusyError(error) && attempt < RETRIEVAL_SCHEMA_BUSY_RETRIES) {
+        await new Promise((resolve) => setTimeout(resolve, RETRIEVAL_SCHEMA_BUSY_RETRY_MS));
+        continue;
+      }
+      warnings.push(
+        isSqliteBusyError(error)
+          ? `retrieval_index_busy: SQLite database was busy while checking schema: ${error instanceof Error ? error.message : String(error)}`
+          : `Retrieval index schema check failed: ${error instanceof Error ? error.message : String(error)}`
+      );
+      break;
+    }
+  }
+  if (manifest?.indexSchemaHash && manifest.indexSchemaHash !== retrievalIndexSchemaHash()) {
+    warnings.push("Retrieval manifest schema hash does not match the current engine schema.");
+  }
+  if (manifest?.indexSchemaVersion && manifest.indexSchemaVersion !== RETRIEVAL_INDEX_SCHEMA_VERSION) {
+    warnings.push("Retrieval manifest schema version does not match the current engine schema.");
+  }
+  return { schemaOk: warnings.length === 0, warnings };
+}
+
+function inspectRetrievalIndexSchema(dbPath: string, warnings: string[]): void {
   const DatabaseSync = getDatabaseSync();
-  const db = withSuppressedSqliteExperimentalWarning(() => new DatabaseSync(dbPath, { readOnly: true }));
+  const db = withSuppressedSqliteExperimentalWarning(() => new DatabaseSync(sqliteImmutableReadOnlyUri(dbPath)));
   try {
+    db.exec("PRAGMA busy_timeout = 1000");
     const tableRows = db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table', 'view')").all() as Array<{ name?: unknown }>;
     const tables = new Set(tableRows.map((row) => String(row.name ?? "")));
     for (const [table, requiredColumns] of Object.entries(RETRIEVAL_INDEX_REQUIRED_COLUMNS)) {
@@ -130,18 +168,14 @@ async function inspectRetrievalIndex(
         }
       }
     }
-  } catch (error) {
-    warnings.push(`Retrieval index schema check failed: ${error instanceof Error ? error.message : String(error)}`);
   } finally {
     db.close();
   }
-  if (manifest?.indexSchemaHash && manifest.indexSchemaHash !== retrievalIndexSchemaHash()) {
-    warnings.push("Retrieval manifest schema hash does not match the current engine schema.");
-  }
-  if (manifest?.indexSchemaVersion && manifest.indexSchemaVersion !== RETRIEVAL_INDEX_SCHEMA_VERSION) {
-    warnings.push("Retrieval manifest schema version does not match the current engine schema.");
-  }
-  return { schemaOk: warnings.length === 0, warnings };
+}
+
+function isSqliteBusyError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /SQLITE_BUSY|database is locked|database is busy/i.test(message);
 }
 
 export function resolveRetrievalConfig(config: VaultConfig): RetrievalConfig {

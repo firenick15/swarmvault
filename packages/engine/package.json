@@ -9,6 +9,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./runtime": {
+      "types": "./dist/runtime.d.ts",
+      "import": "./dist/runtime.js"
     }
   },
   "files": [
@@ -80,7 +84,6 @@
     "turndown": "^7.2.1",
     "typescript": "^5.9.3",
     "vis-network": "^10.0.2",
-    "xlsx": "^0.18.5",
     "yaml": "^2.8.1",
     "youtube-transcript-plus": "^2.0.0",
     "zod": "^4.1.8"
@@ -94,6 +97,7 @@
     "@types/turndown": "^5.0.5",
     "graphology-types": "^0.24.8",
     "tsup": "^8.5.0",
-    "vitest": "^3.2.4"
+    "vitest": "^3.2.4",
+    "xlsx": "^0.18.5"
   }
 }

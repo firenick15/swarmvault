@@ -4,6 +4,7 @@ import matter from "gray-matter";
 import { z } from "zod";
 import { loadVaultConfig } from "./config.js";
 import { extractStandardReferences, standardIdentityKey } from "./domain/env-air.js";
+import { DEFAULT_ENV_AIR_PROFILE } from "./domain/env-air-profile.js";
 import { normalizeFindingSeverity } from "./findings.js";
 import { listManifests } from "./ingest.js";
 import { evaluateKnowledgeCandidateQuality } from "./knowledge-quality.js";
@@ -60,9 +61,11 @@ function isUnknown(value: unknown): boolean {
 }
 
 function sourceTitleLooksLikeAmendment(title: string, sourcePath?: string, standardCode?: unknown): boolean {
-  return /(修改单|amendment)/i.test(
-    [title, sourcePath ?? "", typeof standardCode === "string" ? standardCode : ""].filter(Boolean).join("\n")
-  );
+  const combined = [title, sourcePath ?? "", typeof standardCode === "string" ? standardCode : ""].filter(Boolean).join("\n");
+  if (/修改单.{0,12}编制说明|编制说明.{0,12}修改单/i.test(combined)) {
+    return false;
+  }
+  return /(修改单|amendment)/i.test(combined);
 }
 
 async function buildStandardInventory(rootDir: string, graph: GraphArtifact): Promise<StandardInventory> {
@@ -119,8 +122,12 @@ function finalizeDeepLintFindings(findings: LintFinding[], inventory: StandardIn
 
 function collapsedKnowledgeSlug(pathValue: string): { collapsed: boolean; severity: LintFinding["severity"]; slug: string } {
   const slug = path.basename(pathValue, ".md").toLowerCase();
+  const allowedShortSlugs = new Set(DEFAULT_ENV_AIR_PROFILE.shortSlugAllowlist.map((item) => item.toLowerCase().replace(/\./g, "")));
   if (slug === "item") {
     return { collapsed: true, severity: "error", slug };
+  }
+  if (allowedShortSlugs.has(slug.replace(/\./g, ""))) {
+    return { collapsed: false, severity: "info", slug };
   }
   if (/^(gb|hj|db)-?[a-z0-9-]*\d/i.test(slug)) {
     return { collapsed: false, severity: "info", slug };
