@@ -4,6 +4,7 @@ import { pathToFileURL } from "node:url";
 import matter from "gray-matter";
 import {
   buildEnvAirSearchText,
+  type EnvAirQueryPlan,
   extractStandardReferences,
   normalizeStandardCode,
   pollutantFocusTermsForQuery,
@@ -359,6 +360,20 @@ function sourceAliasQueryTerms(query: string): string[] {
     terms.add(match[0]);
   }
   return uniqueCompact([...terms]).slice(0, 36);
+}
+
+function sourceIdentityQueryTerms(plan: EnvAirQueryPlan): string[] {
+  const generic = new Set(["技术要求", "检测方法", "运行质控", "质量控制", "质量保证", "数据传输", "统计期", "评价城市", "城市数量"]);
+  return uniqueCompact([...plan.pinnedStandards, ...plan.expandedTerms])
+    .filter((term) => term.length >= 4 && term.length <= 64)
+    .filter((term) => !generic.has(term))
+    .filter((term) =>
+      /号令|令第|管理办法|现场监督检查办法|全国城市空气质量报告|城市空气质量排名|环境空气质量月报|环境空气质量公报|环境空气质量标准/u.test(
+        term
+      )
+    )
+    .filter((term) => /[\p{Script=Han}A-Za-z0-9]/u.test(term))
+    .slice(0, 24);
 }
 
 function normalizedStandardQuery(query: string): string {
@@ -1160,7 +1175,8 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
   const ftsQuery = toFtsQuery(normalizedQuery);
   const likeTerms = searchLikeTerms(normalizedQuery);
   const aliasTerms = sourceAliasQueryTerms(normalizedQuery);
-  if (!ftsQuery && likeTerms.length === 0) {
+  const identityTerms = sourceIdentityQueryTerms(domainPlan);
+  if (!ftsQuery && likeTerms.length === 0 && identityTerms.length === 0) {
     return [];
   }
   const currentBasisIntent =
@@ -1540,6 +1556,15 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
     for (const row of nextRows) {
       const pageId = String(row.pageId ?? "");
       const stage = String(row.retrievalStage ?? "");
+      if (stage === "standard_exact" && pageId && seenPageIds.has(pageId)) {
+        const existing = rows.find(
+          (item) => String(item.pageId ?? "") === pageId && !["structured_fact", "chunk_fts"].includes(String(item.retrievalStage ?? ""))
+        );
+        if (existing) {
+          Object.assign(existing, row);
+        }
+        continue;
+      }
       if (stage === "chunk_fts") {
         const current = chunkRowsByPage.get(pageId) ?? 0;
         const chunkBudget = qaQcIntent || statisticsIntent || domainPlan.pinnedStandards.length > 0 ? 3 : 1;
@@ -1773,6 +1798,42 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
   }
 
   try {
+    if (identityTerms.length) {
+      const rankParams: Array<number | string> = [];
+      const filterParams: Array<number | string> = [];
+      const whereParams: Array<number | string> = [];
+      const clauses = buildFilterClauses(filterParams, { relaxAuthority: true });
+      if (!options.kind) {
+        clauses.push("pages.kind IN ('source', 'module')");
+      }
+      const rankCases: string[] = [];
+      const whereClauses: string[] = [];
+      for (const [index, term] of identityTerms.entries()) {
+        const pattern = `%${term.toLowerCase()}%`;
+        const compactPattern = `%${compactAliasText(term)}%`;
+        rankCases.push(
+          "WHEN (LOWER(pages.title) LIKE ? OR LOWER(pages.search_terms) LIKE ? OR LOWER(REPLACE(pages.search_terms, ' ', '')) LIKE ? OR LOWER(pages.standard_code) LIKE ?) THEN ?"
+        );
+        rankParams.push(pattern, pattern, compactPattern, pattern, -40 + Math.min(index, 20));
+        whereClauses.push(
+          "(LOWER(pages.title) LIKE ? OR LOWER(pages.search_terms) LIKE ? OR LOWER(REPLACE(pages.search_terms, ' ', '')) LIKE ? OR LOWER(pages.standard_code) LIKE ?)"
+        );
+        whereParams.push(pattern, pattern, compactPattern, pattern);
+      }
+      clauses.push(`(${whereClauses.join(" OR ")})`);
+      const params = [...rankParams, ...filterParams, ...whereParams];
+      appendOrderParams(params);
+      params.push(Math.min(candidateLimit, 12));
+      const statement = db.prepare(`
+        ${selectedColumns(`CASE ${rankCases.join(" ")} ELSE -8 END`, "substr(pages.body, 1, 420)", "source_alias")}
+        FROM pages
+        WHERE ${clauses.join(" AND ")}
+        ${orderBy()}
+        LIMIT ?
+      `);
+      appendRows(statement.all(...params) as Array<Record<string, unknown>>);
+    }
+
     if (aliasTerms.length) {
       const params: Array<number | string> = [];
       const clauses = buildFilterClauses(params, { relaxAuthority: true });
@@ -1913,9 +1974,6 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
 
     if (hasExactStandards) {
       for (const exactStandard of exactStandards) {
-        if (rows.length >= candidateLimit) {
-          break;
-        }
         const params: Array<number | string> = [];
         const clauses = buildFilterClauses(params, {
           includeSuperseded: hasUserExplicitStandard && !currentBasisIntent,
@@ -1940,7 +1998,7 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
           exactStandard.year ?? ""
         );
         appendOrderParams(params);
-        params.push(Math.min(candidateLimit - rows.length, hasUserExplicitStandard ? 12 : 6));
+        params.push(hasUserExplicitStandard ? 12 : 6);
         const exactRankExpression = amendmentIntent
           ? "CASE WHEN pages.document_role = 'amendment' OR pages.title LIKE '%修改单%' OR pages.standard_code LIKE '%修改单%' THEN -4 WHEN pages.legal_status = 'current_effective' THEN -2 ELSE -1 END"
           : "CASE WHEN pages.legal_status = 'current_effective' THEN -2 ELSE -1 END";

@@ -4,7 +4,15 @@ import path from "node:path";
 import matter from "gray-matter";
 import { afterEach, describe, expect, it } from "vitest";
 import { applyStandardRelationOverrides } from "../src/domain/standard-relations.js";
-import { compileVault, extractStandardReferences, ingestInput, initVault, queryVault, searchTokens } from "../src/index.js";
+import {
+  compileVault,
+  extractStandardReferences,
+  ingestInput,
+  initVault,
+  normalizeEnvAirLegalStatus,
+  queryVault,
+  searchTokens
+} from "../src/index.js";
 import { rebuildSearchIndex, searchPages } from "../src/search.js";
 import type { GraphPage } from "../src/types.js";
 
@@ -312,6 +320,316 @@ describe("environment air retrieval", () => {
     expect(results[0]?.pageId).toBe("source:hj818");
     expect(["source_alias", "standard_exact"]).toContain(results[0]?.retrievalStage);
     expect(results.map((result) => result.pageId)).toContain("source:guide");
+  });
+
+  it("routes NO2 converter-efficiency QA/QC questions to HJ 818 before ambient NO2 limit tables", async () => {
+    const { wikiDir, dbPath } = await createTempWorkspace();
+    const hj818Page = graphPage(
+      "source:hj818",
+      "2018_环境空气气态污染物_SO2、NO2、O3、CO_连续自动监测系统运行和质控技术规范_HJ818-2018",
+      "sources/hj818.md"
+    );
+    const gb3095Page = graphPage("source:gb3095", "GB 3095-2026 环境空气质量标准", "sources/gb3095.md");
+    const hj654Page = graphPage("source:hj654", "HJ 654-2013 环境空气气态污染物连续自动监测系统技术要求及检测方法", "sources/hj654.md");
+    await writePage(
+      wikiDir,
+      hj818Page.path,
+      {
+        authority_layer: "method",
+        legal_status: "current_effective",
+        document_role: "qa_qc",
+        standard_code: "HJ 818-2018",
+        pollutants: ["SO2", "NO2", "O3", "CO"]
+      },
+      "# HJ 818-2018\n\n化学发光法NO2监测仪器至少每半年检查1次二氧化氮转换炉的转换效率，转换效率应≥96%，否则应维修或更换。"
+    );
+    await writePage(
+      wikiDir,
+      gb3095Page.path,
+      {
+        authority_layer: "core",
+        legal_status: "current_effective",
+        document_role: "standard",
+        standard_code: "GB 3095-2026",
+        pollutants: ["NO2"]
+      },
+      "# GB 3095-2026\n\nNO2 年平均、日平均、1小时平均浓度限值。"
+    );
+    await writePage(
+      wikiDir,
+      hj654Page.path,
+      {
+        authority_layer: "method",
+        legal_status: "current_effective",
+        document_role: "monitoring_method",
+        standard_code: "HJ 654-2013",
+        pollutants: ["SO2", "NO2", "O3", "CO"]
+      },
+      "# HJ 654-2013\n\nNO2分析仪器中NO2-NO转化器的转换效率应≥96%，规定检测方法。"
+    );
+    await rebuildSearchIndex(dbPath, [hj818Page, gb3095Page, hj654Page], wikiDir);
+
+    const results = searchPages(dbPath, "NO2 转换炉效率多久检查一次，合格要求是多少？", {
+      limit: 5,
+      authorityLayer: ["core", "method"],
+      includeDrafts: false,
+      includeSuperseded: false
+    });
+
+    expect(results[0]?.pageId).toBe("source:hj818");
+    expect(results.map((result) => result.pageId)).toContain("source:hj654");
+    expect(results[0]?.snippet).toContain("每半年");
+  });
+
+  it("routes common ambient monitoring and CEMS scenario aliases to the right standard families", async () => {
+    const { wikiDir, dbPath } = await createTempWorkspace();
+    const pages = [
+      {
+        page: graphPage("source:hj817", "HJ 817-2018 环境空气颗粒物连续自动监测系统运行和质控技术规范", "sources/hj817.md"),
+        data: { authority_layer: "method", legal_status: "current_effective", document_role: "qa_qc", standard_code: "HJ 817-2018" },
+        body: "# HJ 817-2018\n\nPM10和PM2.5颗粒物自动监测系统运行质控，规定零值负值处理、流量审核和平行性检查。"
+      },
+      {
+        page: graphPage("source:hj653", "HJ 653-2021 环境空气颗粒物连续自动监测系统技术要求及检测方法", "sources/hj653.md"),
+        data: {
+          authority_layer: "method",
+          legal_status: "current_effective",
+          document_role: "monitoring_method",
+          standard_code: "HJ 653-2021"
+        },
+        body: "# HJ 653-2021\n\n颗粒物自动监测系统技术要求及检测方法，规定参比方法比对、斜率、截距和相关系数。"
+      },
+      {
+        page: graphPage("source:hj654", "HJ 654-2013 环境空气气态污染物连续自动监测系统技术要求及检测方法", "sources/hj654.md"),
+        data: {
+          authority_layer: "method",
+          legal_status: "current_effective",
+          document_role: "monitoring_method",
+          standard_code: "HJ 654-2013"
+        },
+        body: "# HJ 654-2013\n\nSO2、NO2、O3、CO气态自动监测仪器技术要求、性能指标和检测方法。"
+      },
+      {
+        page: graphPage("source:hj75", "HJ 75-2017 固定污染源烟气排放连续监测技术规范", "sources/hj75.md"),
+        data: {
+          authority_layer: "method",
+          legal_status: "current_effective",
+          document_role: "monitoring_method",
+          standard_code: "HJ 75-2017"
+        },
+        body: "# HJ 75-2017\n\n固定污染源烟气CEMS运行维护、运行质控和连续监测技术规范。"
+      },
+      {
+        page: graphPage("source:hj212", "HJ 212-2025 污染物在线监控系统数据传输标准", "sources/hj212.md"),
+        data: { authority_layer: "method", legal_status: "current_effective", document_role: "standard", standard_code: "HJ 212-2025" },
+        body: "# HJ 212-2025\n\n污染物在线监控和CEMS数据传输、数采仪传输协议要求。"
+      }
+    ];
+    for (const item of pages) {
+      await writePage(wikiDir, item.page.path, item.data, item.body);
+    }
+    await rebuildSearchIndex(
+      dbPath,
+      pages.map((item) => item.page),
+      wikiDir
+    );
+
+    const cases = [
+      ["颗粒物自动站 PM2.5 负值怎么处理", "source:hj817"],
+      ["PM2.5 参比方法比对斜率截距相关系数", "source:hj653"],
+      ["气态自动监测仪器技术要求和检测方法", "source:hj654"],
+      ["CEMS 数据传输按哪个规范", "source:hj212"],
+      ["固定污染源 CEMS 运行维护和质控", "source:hj75"]
+    ] as const;
+
+    for (const [question, expectedPageId] of cases) {
+      const results = searchPages(dbPath, question, {
+        limit: 5,
+        authorityLayer: ["core", "method"],
+        includeDrafts: false,
+        includeSuperseded: false
+      });
+      expect(results[0]?.pageId).toBe(expectedPageId);
+    }
+  });
+
+  it("does not let draft replacement relations supersede current standards", async () => {
+    const { wikiDir } = await createTempWorkspace();
+    const standardPage = graphPage(
+      "source:hj818",
+      "2018_环境空气气态污染物_SO2、NO2、O3、CO_连续自动监测系统运行和质控技术规范_HJ818-2018",
+      "sources/hj818.md"
+    );
+    const draftPage = graphPage("source:ozone-draft", "环境空气臭氧传递标准逐级校准技术规范_征求意见稿", "sources/ozone-draft.md");
+    await writePage(
+      wikiDir,
+      standardPage.path,
+      {
+        authority_layer: "method",
+        legal_status: "current_effective",
+        document_role: "monitoring_method",
+        standard_code: "HJ 818-2018"
+      },
+      "# HJ 818-2018\n\n现行环境空气气态污染物连续自动监测系统运行和质控技术规范。"
+    );
+    await writePage(
+      wikiDir,
+      draftPage.path,
+      {
+        authority_layer: "evolution",
+        legal_status: "draft_consultation",
+        document_role: "draft",
+        standard_code: "HJ □□□-20□□",
+        replaces: ["HJ 818-2018"]
+      },
+      "# 征求意见稿\n\n本草案发布后拟替代 HJ 818-2018 附录A内容。"
+    );
+
+    const report = await applyStandardRelationOverrides(wikiDir, [standardPage, draftPage], new Date("2026-05-27"));
+    const parsed = matter(await fs.readFile(path.join(wikiDir, standardPage.path), "utf8"));
+
+    expect(report.skippedReplacementPages).toBe(1);
+    expect(parsed.data.legal_status).toBe("current_effective");
+    expect(parsed.data.replaced_by).toBeUndefined();
+  });
+
+  it("marks official partial replacements as amended instead of fully superseded", async () => {
+    const { wikiDir } = await createTempWorkspace();
+    const standardPage = graphPage(
+      "source:hj818",
+      "2018_环境空气气态污染物_SO2、NO2、O3、CO_连续自动监测系统运行和质控技术规范_HJ818-2018",
+      "sources/hj818.md"
+    );
+    const amendmentPage = graphPage("source:hj1319", "HJ 1319-2025 臭氧传递标准逐级校准技术规范", "sources/hj1319.md");
+    await writePage(
+      wikiDir,
+      standardPage.path,
+      {
+        authority_layer: "method",
+        legal_status: "current_effective",
+        document_role: "monitoring_method",
+        standard_code: "HJ 818-2018"
+      },
+      "# HJ 818-2018\n\n现行环境空气气态污染物连续自动监测系统运行和质控技术规范。"
+    );
+    await writePage(
+      wikiDir,
+      amendmentPage.path,
+      {
+        authority_layer: "method",
+        legal_status: "current_effective",
+        document_role: "standard",
+        standard_code: "HJ 1319-2025",
+        effective_date: "2025-01-01",
+        replaces: ["HJ 818-2018"]
+      },
+      "# HJ 1319-2025\n\n本标准替代 HJ 818-2018 附录A关于臭氧传递标准校准的内容。"
+    );
+
+    const report = await applyStandardRelationOverrides(wikiDir, [standardPage, amendmentPage], new Date("2026-05-27"));
+    const parsed = matter(await fs.readFile(path.join(wikiDir, standardPage.path), "utf8"));
+
+    expect(report.amendedPages).toBe(1);
+    expect(parsed.data.legal_status).toBe("amended");
+    expect(parsed.data.amended_by).toEqual(["HJ 1319-2025"]);
+    expect(parsed.data.replaced_by).toBeUndefined();
+  });
+
+  it("does not apply official standard replacement relations to reports or background materials sharing a standard code", async () => {
+    const { wikiDir } = await createTempWorkspace();
+    const oldStandard = graphPage("source:gb3095-2012", "GB 3095-2012 环境空气质量标准", "sources/gb3095-2012.md");
+    const monthlyReport = graphPage("source:monthly-2020-01", "2020年1月全国城市空气质量月报", "sources/monthly-2020-01.md");
+    const newStandard = graphPage("source:gb3095-2026", "GB 3095-2026 环境空气质量标准", "sources/gb3095-2026.md");
+    await writePage(
+      wikiDir,
+      oldStandard.path,
+      {
+        authority_layer: "core",
+        legal_status: "current_effective",
+        document_role: "standard",
+        standard_code: "GB 3095-2012"
+      },
+      "# GB 3095-2012\n\n环境空气质量标准。"
+    );
+    await writePage(
+      wikiDir,
+      monthlyReport.path,
+      {
+        authority_layer: "evidence",
+        legal_status: "time_scoped_evidence",
+        document_role: "statistics",
+        standard_code: "GB 3095-2012"
+      },
+      "# 2020年1月全国城市空气质量月报\n\n本月报按当期环境空气评价口径统计城市空气质量。"
+    );
+    await writePage(
+      wikiDir,
+      newStandard.path,
+      {
+        authority_layer: "core",
+        legal_status: "current_effective",
+        document_role: "standard",
+        standard_code: "GB 3095-2026",
+        effective_date: "2026-03-01",
+        replaces: ["GB 3095-2012"]
+      },
+      "# GB 3095-2026\n\n本标准代替 GB 3095-2012。"
+    );
+
+    const report = await applyStandardRelationOverrides(wikiDir, [oldStandard, monthlyReport, newStandard], new Date("2026-05-27"));
+    const oldFrontmatter = matter(await fs.readFile(path.join(wikiDir, oldStandard.path), "utf8")).data;
+    const reportFrontmatter = matter(await fs.readFile(path.join(wikiDir, monthlyReport.path), "utf8")).data;
+
+    expect(report.supersededPages).toBe(1);
+    expect(report.skippedReplacementPages).toBeGreaterThanOrEqual(1);
+    expect(oldFrontmatter.legal_status).toBe("superseded");
+    expect(oldFrontmatter.replaced_by).toEqual(["GB 3095-2026"]);
+    expect(reportFrontmatter.legal_status).toBe("time_scoped_evidence");
+    expect(reportFrontmatter.replaced_by).toBeUndefined();
+  });
+
+  it("normalizes replacement metadata without turning reports, guides, or explanations into current execution standards", () => {
+    const monthlyReport = normalizeEnvAirLegalStatus({
+      title: "2020年1月全国城市空气质量月报",
+      authorityLayer: "evidence",
+      legalForce: "statistical",
+      documentRole: "statistics",
+      legalStatus: "superseded",
+      replacedBy: ["GB 3095-2026"],
+      asOfDate: "2026-05-27"
+    });
+    const guide = normalizeEnvAirLegalStatus({
+      title: "臭氧污染防治技术指南",
+      authorityLayer: "evidence",
+      legalForce: "explanatory",
+      documentRole: "technical_guide",
+      legalStatus: "superseded",
+      replacedBy: ["GB 3095-2026"],
+      asOfDate: "2026-05-27"
+    });
+    const explanation = normalizeEnvAirLegalStatus({
+      title: "环境空气质量标准编制说明",
+      authorityLayer: "evolution",
+      legalForce: "explanatory",
+      documentRole: "compilation_explanation",
+      legalStatus: "superseded",
+      replacedBy: ["HJ □□□-20□□"],
+      asOfDate: "2026-05-27"
+    });
+    const oldStandard = normalizeEnvAirLegalStatus({
+      title: "GB 3095-2012 环境空气质量标准",
+      authorityLayer: "core",
+      legalForce: "mandatory",
+      documentRole: "standard",
+      legalStatus: "current_effective",
+      replacedBy: ["GB 3095-2026"],
+      asOfDate: "2026-05-27"
+    });
+
+    expect(monthlyReport.legalStatus).toBe("time_scoped_evidence");
+    expect(guide.legalStatus).toBe("time_scoped_evidence");
+    expect(explanation.legalStatus).toBe("explanation_only");
+    expect(oldStandard.legalStatus).toBe("superseded");
   });
 
   it("focuses HTML table evidence when pollutant labels are OCR/LaTeX spaced", async () => {

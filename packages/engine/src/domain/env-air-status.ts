@@ -50,6 +50,55 @@ function normalizedHaystack(input: LegalStatusNormalizationInput): string {
   return [input.title, input.path ?? "", input.documentRole ?? "", input.legalStatus ?? ""].join("\n").toLowerCase();
 }
 
+const BACKGROUND_DOCUMENT_ROLES = new Set([
+  "statistics",
+  "whitepaper",
+  "research_literature",
+  "technical_guide",
+  "official_explanation",
+  "compilation_explanation",
+  "local_reference",
+  "international_reference"
+]);
+
+const AUTHORITATIVE_REPLACEMENT_ROLES = new Set([
+  "law",
+  "regulation",
+  "policy",
+  "standard",
+  "technical_standard",
+  "technical_regulation",
+  "monitoring_method",
+  "qa_qc",
+  "emission_standard",
+  "amendment"
+]);
+
+function isBackgroundEvidence(documentRole: string | undefined, haystack: string): boolean {
+  if (documentRole && BACKGROUND_DOCUMENT_ROLES.has(documentRole)) {
+    return true;
+  }
+  return /月报|年报|公报|白皮书|蓝皮书|年度报告|研究|论文|综述|技术指南|指南|手册|statistics|whitepaper|white paper/.test(haystack);
+}
+
+function replacementCanSupersede(
+  input: LegalStatusNormalizationInput,
+  documentRole: string | undefined,
+  authorityLayer: string | undefined,
+  haystack: string
+): boolean {
+  if ((input.replacedBy?.length ?? 0) === 0 && !/废止|历史版本|superseded|replaced/.test(haystack)) {
+    return false;
+  }
+  if (isBackgroundEvidence(documentRole, haystack)) {
+    return false;
+  }
+  if (documentRole && AUTHORITATIVE_REPLACEMENT_ROLES.has(documentRole)) {
+    return true;
+  }
+  return (documentRole === "unknown" || !documentRole) && ["core", "method", "local"].includes(authorityLayer ?? "");
+}
+
 export function normalizeEnvAirLegalStatus(input: LegalStatusNormalizationInput): LegalStatusNormalizationResult {
   const originalLegalStatus = asLegalStatus(input.legalStatus);
   const reasons: string[] = [];
@@ -84,15 +133,15 @@ export function normalizeEnvAirLegalStatus(input: LegalStatusNormalizationInput)
     authorityLayer = authorityLayer === "unknown" ? "evidence" : authorityLayer;
     documentRole = documentRole === "unknown" ? "official_explanation" : documentRole;
     reasons.push("explanatory_or_compilation_material");
-  } else if ((input.replacedBy?.length ?? 0) > 0 || /废止|历史版本|superseded|replaced/.test(haystack)) {
-    legalStatus = "superseded";
-    legalForce = legalForce === "unknown" ? "superseded" : legalForce;
-    reasons.push("replacement_or_history_marker");
-  } else if (documentRole === "statistics" || /月报|年报|公报|白皮书|蓝皮书|年度报告|statistics|whitepaper|white paper/.test(haystack)) {
+  } else if (isBackgroundEvidence(documentRole, haystack)) {
     legalStatus = "time_scoped_evidence";
     legalForce = documentRole === "statistics" ? "statistical" : (legalForce ?? "explanatory");
     authorityLayer = authorityLayer === "unknown" ? "evidence" : authorityLayer;
     reasons.push("time_scoped_or_background_evidence");
+  } else if (replacementCanSupersede(input, documentRole, authorityLayer, haystack)) {
+    legalStatus = "superseded";
+    legalForce = legalForce === "unknown" ? "superseded" : legalForce;
+    reasons.push("replacement_or_history_marker");
   } else {
     const effectiveTime = dateTime(input.effectiveDate);
     const asOfTime = dateTime(input.asOfDate) ?? Date.now();

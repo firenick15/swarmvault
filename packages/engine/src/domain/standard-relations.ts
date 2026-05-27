@@ -8,7 +8,9 @@ import { extractStandardReferences, normalizeStandardCode } from "./env-air.js";
 export interface StandardRelationReport {
   inspectedPages: number;
   supersededPages: number;
+  amendedPages: number;
   futureReplacementPages: number;
+  skippedReplacementPages: number;
   warnings: string[];
 }
 
@@ -50,6 +52,110 @@ function normalizedReplacementCodes(value: unknown): string[] {
     .filter(Boolean);
 }
 
+function metadataString(record: StandardPageRecord, key: string): string {
+  const value = record.parsed.data[key];
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function hasPlaceholderStandardCode(value: string): boolean {
+  return /[□]{2,}|X{2,}|待定|TBD|20□□/i.test(value);
+}
+
+function isHumanVerified(record: StandardPageRecord): boolean {
+  return metadataString(record, "metadata_source") === "sidecar" && metadataString(record, "verification_state") === "human_verified";
+}
+
+function isAuthoritativeReplacementRecord(record: StandardPageRecord): boolean {
+  if (!record.standardCode || hasPlaceholderStandardCode(record.standardCode)) {
+    return false;
+  }
+  const legalStatus = metadataString(record, "legal_status");
+  const documentRole = metadataString(record, "document_role");
+  const authorityLayer = metadataString(record, "authority_layer");
+  if (["draft_consultation", "explanation_only", "time_scoped_evidence", "unknown"].includes(legalStatus)) {
+    return false;
+  }
+  if (
+    [
+      "draft",
+      "compilation_explanation",
+      "official_explanation",
+      "whitepaper",
+      "research_literature",
+      "statistics",
+      "technical_guide",
+      "local_reference",
+      "international_reference"
+    ].includes(documentRole)
+  ) {
+    return false;
+  }
+  return authorityLayer !== "evolution" || documentRole === "amendment";
+}
+
+const NON_AUTHORITATIVE_REPLACEMENT_TARGET_ROLES = new Set([
+  "draft",
+  "compilation_explanation",
+  "official_explanation",
+  "whitepaper",
+  "research_literature",
+  "statistics",
+  "technical_guide",
+  "local_reference",
+  "international_reference"
+]);
+
+const AUTHORITATIVE_REPLACEMENT_TARGET_ROLES = new Set([
+  "law",
+  "regulation",
+  "policy",
+  "standard",
+  "technical_standard",
+  "technical_regulation",
+  "monitoring_method",
+  "qa_qc",
+  "emission_standard",
+  "amendment"
+]);
+
+function hasBackgroundMaterialMarker(record: StandardPageRecord): boolean {
+  const haystack = `${record.page.title}\n${record.page.path}\n${record.parsed.content.slice(0, 1200)}`;
+  return /月报|年报|公报|白皮书|蓝皮书|研究|论文|综述|技术指南|指南|手册|编制说明|释义|解读|征求意见|草案|draft|consultation/i.test(
+    haystack
+  );
+}
+
+function isAuthoritativeReplacementTarget(record: StandardPageRecord): boolean {
+  if (!record.standardCode || hasPlaceholderStandardCode(record.standardCode)) {
+    return false;
+  }
+  const legalStatus = metadataString(record, "legal_status");
+  const documentRole = metadataString(record, "document_role");
+  const authorityLayer = metadataString(record, "authority_layer");
+  if (["draft_consultation", "explanation_only", "time_scoped_evidence"].includes(legalStatus)) {
+    return false;
+  }
+  if (NON_AUTHORITATIVE_REPLACEMENT_TARGET_ROLES.has(documentRole) || hasBackgroundMaterialMarker(record)) {
+    return false;
+  }
+  if (AUTHORITATIVE_REPLACEMENT_TARGET_ROLES.has(documentRole)) {
+    return true;
+  }
+  return (
+    (documentRole === "" || documentRole === "unknown") &&
+    ["core", "method", "local"].includes(authorityLayer) &&
+    !hasBackgroundMaterialMarker(record)
+  );
+}
+
+function isPartialReplacement(record: StandardPageRecord): boolean {
+  const haystack = `${record.page.title}\n${record.parsed.content.slice(0, 2400)}`;
+  if (/(全文|全部|整体)(代替|替代)|代替.*(全部|全文)/.test(haystack)) {
+    return false;
+  }
+  return /(部分(代替|替代)|替代.*(附录|条款|表\d+|第[一二三四五六七八九十0-9]+章)|附录[A-ZＡ-Ｚ]?\s*(内容)?)/.test(haystack);
+}
+
 export async function applyStandardRelationOverrides(
   wikiDir: string,
   pages: GraphPage[],
@@ -58,7 +164,9 @@ export async function applyStandardRelationOverrides(
   const report: StandardRelationReport = {
     inspectedPages: 0,
     supersededPages: 0,
+    amendedPages: 0,
     futureReplacementPages: 0,
+    skippedReplacementPages: 0,
     warnings: []
   };
   const records: StandardPageRecord[] = [];
@@ -98,18 +206,38 @@ export async function applyStandardRelationOverrides(
     if (!replacement.replaces.length) {
       continue;
     }
+    if (!isAuthoritativeReplacementRecord(replacement)) {
+      report.skippedReplacementPages += 1;
+      continue;
+    }
     const effectiveTime = parseDate(replacement.effectiveDate);
     const isFuture = typeof effectiveTime === "number" && effectiveTime > nowTime;
+    const partialReplacement = isPartialReplacement(replacement);
     for (const replacedCode of replacement.replaces) {
       for (const replaced of byCode.get(replacedCode) ?? []) {
+        if (replacement.absolutePath === replaced.absolutePath || !isAuthoritativeReplacementTarget(replaced)) {
+          report.skippedReplacementPages += 1;
+          continue;
+        }
+        if (isHumanVerified(replaced)) {
+          report.warnings.push(
+            `${replaced.page.path}: human-verified status was not overridden by ${replacement.standardCode}; update sidecar metadata if the replacement is confirmed.`
+          );
+          continue;
+        }
         const data = replaced.parsed.data;
-        const relationField = isFuture ? "future_replaced_by" : "replaced_by";
+        const relationField = isFuture ? "future_replaced_by" : partialReplacement ? "amended_by" : "replaced_by";
         const existing = new Set(asStringArray(data[relationField]));
         existing.add(replacement.standardCode);
         data[relationField] = [...existing].sort();
         if (!isFuture) {
-          data.legal_status = "superseded";
-          report.supersededPages += 1;
+          if (partialReplacement) {
+            data.legal_status = "amended";
+            report.amendedPages += 1;
+          } else {
+            data.legal_status = "superseded";
+            report.supersededPages += 1;
+          }
         } else {
           report.futureReplacementPages += 1;
         }
