@@ -369,7 +369,7 @@ function sourceIdentityQueryTerms(plan: EnvAirQueryPlan): string[] {
     .filter((term) => !generic.has(term))
     .filter(
       (term) =>
-        /号令|令第|管理办法|现场监督检查办法|现场检查|自动监控|在线监控|在线监控数据|污染源自动监控|CEMS离线|弄虚作假|全国城市空气质量报告|城市空气质量排名|环境空气质量月报|环境空气质量公报|环境空气质量标准/u.test(
+        /号令|令第|管理办法|现场监督检查办法|现场检查|自动监控|在线监控|在线监控数据|污染源自动监控|全国城市空气质量报告|城市空气质量排名|环境空气质量月报|环境空气质量公报|环境空气质量标准/u.test(
           term
         ) || /重污染天气|应急减排|应急预警|应急响应|绩效分级|秋冬季攻坚/u.test(term)
     )
@@ -1695,12 +1695,10 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
       }
     }
     if (
-      /(在线监控|自动监控|污染源自动监控|在线设备|在线数据|数据异常|采样探头|CEMS|离线|现场|执法|处罚|违法|程序证据|风险提示|弄虚作假)/u.test(
+      /(在线监控|自动监控|污染源自动监控|在线设备|在线数据|数据异常|采样探头|CEMS|离线|现场|执法|处罚|违法|证据|风险|弄虚作假)/u.test(
         userQueryText
       ) &&
-      /(执法现场|现场检查|检查清单|检查事项|现场|处罚|违法|直接认定|直接作为|程序证据|风险提示|采样探头|截图|证据|离线|数据异常|弄虚作假)/u.test(
-        userQueryText
-      ) &&
+      /(现场检查|检查清单|检查事项|现场|处罚|违法|直接认定|直接作为|采样探头|截图|证据|风险|离线|数据异常|弄虚作假)/u.test(userQueryText) &&
       !/(管理职责|职责主体|管理办法|主体责任)/u.test(userQueryText)
     ) {
       const inspectionSource = /19号令|第19号|现场监督检查办法/u.test(`${standardCode} ${title}`);
@@ -1714,9 +1712,7 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
     }
     if (
       /(在线监控|自动监控|污染源自动监控|在线设备|自动监控设备|企业自行监测|运维单位|排污单位|运维责任)/u.test(userQueryText) &&
-      /(管理职责|职责主体|管理办法|主体责任|故障|报告|停运|拆除|备案|联网|设备更换|频次|承担管理责任|管理责任|维护到位|运维责任)/u.test(
-        userQueryText
-      )
+      /(管理职责|职责主体|管理办法|主体责任|故障|报告|停运|拆除|备案|联网|设备更换|频次|管理责任|维护|运维责任)/u.test(userQueryText)
     ) {
       const managementSource = /28号令|第28号|总局令第28号|污染源自动监控管理办法/u.test(`${standardCode} ${title}`);
       const inspectionSource = /19号令|第19号|现场监督检查办法/u.test(`${standardCode} ${title}`);

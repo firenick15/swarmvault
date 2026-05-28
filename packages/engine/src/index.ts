@@ -22,6 +22,7 @@ export {
   classifyEnvAirToolRouting,
   classifyRecommendedNextTool,
   compactStandardCode,
+  decomposeEnvAirQueryIntent,
   ENV_AIR_STANDARD_CATALOG,
   envAirSearchTerms,
   extractStandardReferences,

@@ -15,6 +15,7 @@ export type RecommendedNextTool = "knowledge_base" | "environment_data_mcp" | "b
 export interface EnvAirQueryPlan {
   normalizedQuery: string;
   standardRefs: StandardReference[];
+  decomposedIntent: EnvAirDecomposedIntent;
   expandedTerms: string[];
   pinnedStandards: string[];
   standardClusters: string[];
@@ -34,6 +35,14 @@ export interface EnvAirQueryPlan {
     reason?: string;
     resultCount?: number;
   }>;
+}
+
+export interface EnvAirDecomposedIntent {
+  objectScopes: string[];
+  pollutants: string[];
+  businessActions: string[];
+  evidenceNeeds: string[];
+  authorityNeeds: string[];
 }
 
 const STANDARD_REFERENCE_PATTERN =
@@ -271,6 +280,174 @@ function pollutantFocus(query: string, profile: EnvAirProfile = DEFAULT_ENV_AIR_
   return uniqueCompact(pollutants);
 }
 
+function hasAnyPattern(text: string, patterns: RegExp[]): boolean {
+  return patterns.some((pattern) => pattern.test(text));
+}
+
+export function decomposeEnvAirQueryIntent(query: string, profile: EnvAirProfile = DEFAULT_ENV_AIR_PROFILE): EnvAirDecomposedIntent {
+  const normalized = query.replace(STANDARD_DASH_PATTERN, "-").trim();
+  const pollutants = pollutantFocus(normalized, profile);
+  const objectScopes: string[] = [];
+  const businessActions: string[] = [];
+  const evidenceNeeds: string[] = [];
+  const authorityNeeds: string[] = [];
+
+  const mentionsFixedSource = hasAnyPattern(normalized, [/固定污染源/u, /固定源/u, /烟气/u, /\bCEMS\b/iu, /排口/u, /烟囱/u]);
+  const mentionsPollutionSourceAutoMonitoring = hasAnyPattern(normalized, [
+    /污染源自动监控/u,
+    /自动监控设施/u,
+    /在线监控/u,
+    /在线监测/u,
+    /在线设备/u,
+    /在线数据/u,
+    /排污单位/u,
+    /运维单位/u,
+    /数采仪/u,
+    /采样探头/u
+  ]);
+  const mentionsAmbientAutoMonitoring =
+    hasAnyPattern(normalized, [/环境空气/u, /自动站/u, /空气站/u, /国控站/u, /省控站/u, /站点/u, /连续自动监测/u, /自动监测系统/u]) &&
+    !mentionsFixedSource;
+
+  if (mentionsAmbientAutoMonitoring) objectScopes.push("ambient_air_auto_monitoring");
+  if (mentionsFixedSource) objectScopes.push("fixed_source_cems");
+  if (mentionsPollutionSourceAutoMonitoring) objectScopes.push("pollution_source_auto_monitoring");
+  if (hasAnyPattern(normalized, [/AQI/iu, /IAQI/iu, /空气质量指数/u, /首要污染物/u, /空气质量级别/u, /日报/u, /实时报/u])) {
+    objectScopes.push("ambient_aqi");
+  }
+  if (hasAnyPattern(normalized, [/达标评价/u, /年评价/u, /空气质量评价/u, /评价技术/u, /第\s*90\s*百分位/u, /百分位/u])) {
+    objectScopes.push("ambient_quality_assessment");
+  }
+  if (hasAnyPattern(normalized, [/重污染天气/u, /污染过程/u, /应急预警/u, /应急响应/u, /应急减排/u, /绩效分级/u, /秋冬季/u])) {
+    objectScopes.push("heavy_pollution_weather");
+  }
+
+  if (pollutants.some((item) => item === "PM2.5" || item === "PM10") || /颗粒物/u.test(normalized)) {
+    objectScopes.push("particulate_monitoring");
+  }
+  if (pollutants.some((item) => ["SO2", "NO2", "O3", "CO", "NOx"].includes(item)) || /气态污染物|二氧化氮|臭氧/u.test(normalized)) {
+    objectScopes.push("gas_monitoring");
+  }
+
+  if (hasAnyPattern(normalized, [/安装/u, /验收/u, /调试/u, /试运行/u, /到货/u, /新建/u])) {
+    businessActions.push("installation_acceptance");
+  }
+  if (
+    hasAnyPattern(normalized, [
+      /运行/u,
+      /质控/u,
+      /质量控制/u,
+      /质量保证/u,
+      /校准/u,
+      /零点/u,
+      /跨度/u,
+      /量程/u,
+      /漂移/u,
+      /转换炉/u,
+      /转换器/u,
+      /负值/u,
+      /零值/u,
+      /有效数据/u,
+      /平行性/u,
+      /流量/u,
+      /维护/u
+    ])
+  ) {
+    businessActions.push("operation_qaqc");
+  }
+  if (hasAnyPattern(normalized, [/技术要求/u, /检测方法/u, /性能/u, /测试/u, /检测项目/u, /性能指标/u, /采购检测/u, /仪器检测/u])) {
+    businessActions.push("technical_test_method");
+  }
+  if (hasAnyPattern(normalized, [/参比/u, /重量法/u, /手工比对/u, /手工采样/u, /滤膜/u, /称量/u])) {
+    businessActions.push("reference_method");
+  }
+  if (hasAnyPattern(normalized, [/数据传输/u, /传输协议/u, /数据链路/u, /上传/u, /联网/u, /数采仪/u, /协议/u, /报文/u, /通信/u])) {
+    businessActions.push("data_transmission");
+  }
+  if (hasAnyPattern(normalized, [/现场/u, /检查/u, /执法/u, /处罚/u, /违法/u, /认定/u, /证据/u, /弄虚作假/u, /直接/u])) {
+    businessActions.push("enforcement_inspection");
+  }
+  if (
+    hasAnyPattern(normalized, [
+      /管理/u,
+      /职责/u,
+      /责任/u,
+      /运维/u,
+      /停运/u,
+      /停用/u,
+      /停机/u,
+      /停了/u,
+      /拆除/u,
+      /故障/u,
+      /报告/u,
+      /备案/u,
+      /更换/u,
+      /恢复/u
+    ])
+  ) {
+    businessActions.push("management_responsibility");
+  }
+  if (hasAnyPattern(normalized, [/月报/u, /公报/u, /排名/u, /统计/u, /同比/u, /环比/u, /168\s*城/u, /337\s*城/u, /339\s*城/u])) {
+    businessActions.push("statistics_reporting");
+  }
+
+  if (
+    hasAnyPattern(normalized, [
+      /包括哪些/u,
+      /有哪些/u,
+      /完整清单/u,
+      /全部项目/u,
+      /所有项目/u,
+      /项目清单/u,
+      /测试项目/u,
+      /测试项/u,
+      /检测项目/u,
+      /检测项/u,
+      /检查项目/u,
+      /检查项/u,
+      /验收项目/u,
+      /质控项目/u,
+      /性能指标/u,
+      /评价指标/u,
+      /监测项目/u,
+      /要点/u,
+      /步骤/u,
+      /看什么/u,
+      /查什么/u,
+      /测什么/u
+    ])
+  ) {
+    evidenceNeeds.push("list_complete");
+  }
+  if (hasAnyPattern(normalized, [/多久/u, /频次/u, /多长时间/u, /几次/u, /周期/u, /每年/u, /每月/u, /每周/u, /每日/u, /每半年/u])) {
+    evidenceNeeds.push("frequency");
+  }
+  if (hasAnyPattern(normalized, [/限值/u, /标准值/u, /一级/u, /二级/u, /浓度限值/u, /超标/u, /达标/u])) {
+    evidenceNeeds.push("limit_or_compliance");
+  }
+  if (hasAnyPattern(normalized, [/程序/u, /流程/u, /手续/u, /备案/u, /报告/u, /恢复/u, /责任/u])) {
+    evidenceNeeds.push("procedure_or_responsibility");
+  }
+  if (inferAuthorityBoundaryIntent(normalized, profile)) {
+    authorityNeeds.push("authority_boundary");
+  }
+  if (inferCurrentBasisIntent(normalized, profile)) {
+    authorityNeeds.push("current_effective_basis");
+  }
+
+  if (!objectScopes.length && hasAnyPattern(normalized, [/环境空气/u, /空气质量/u, /污染物/u, /监测/u])) {
+    objectScopes.push("ambient_air");
+  }
+
+  return {
+    objectScopes: uniqueCompact(objectScopes),
+    pollutants,
+    businessActions: uniqueCompact(businessActions),
+    evidenceNeeds: uniqueCompact(evidenceNeeds),
+    authorityNeeds: uniqueCompact(authorityNeeds)
+  };
+}
+
 export function pollutantAliasGroupsForQuery(query: string, pollutants: string[] = []): string[][] {
   const requested = uniqueCompact([...pollutantFocus(query), ...pollutants.map(normalizePollutantName)]);
   return requested
@@ -329,6 +506,7 @@ export function buildEnvAirQueryPlan(
     .replace(/\bpm\s*1\s*0\b/gi, "PM10")
     .trim();
   const standardRefs = extractStandardReferences(normalizedQuery);
+  const decomposedIntent = decomposeEnvAirQueryIntent(normalizedQuery, profile);
   const pollutants = pollutantFocus(normalizedQuery, profile);
   const expandedTerms: string[] = [];
   const pinnedStandards: string[] = [];
@@ -373,6 +551,245 @@ export function buildEnvAirQueryPlan(
     }
     matchedIntentRules.push(rule.id);
   }
+
+  const hasScope = (scope: string): boolean => decomposedIntent.objectScopes.includes(scope);
+  const hasAction = (action: string): boolean => decomposedIntent.businessActions.includes(action);
+  const hasNeed = (need: string): boolean => decomposedIntent.evidenceNeeds.includes(need);
+  const addSignal = (input: {
+    signal: string;
+    standards?: string[];
+    clusters?: string[];
+    terms?: string[];
+    factBoosts?: Record<string, number>;
+    documentBoosts?: Record<string, number>;
+    evidenceBoosts?: Record<string, number>;
+    chunkBoosts?: Record<string, number>;
+  }): void => {
+    rankingSignals.push(input.signal);
+    expandedTerms.push(...(input.terms ?? []));
+    pinnedStandards.push(...(input.standards ?? []));
+    standardClusters.push(...(input.clusters ?? []));
+    pinnedStandards.push(...standardsForClusters(profile, input.clusters ?? []));
+    mergeBoosts(factTypeBoosts, input.factBoosts);
+    mergeBoosts(documentRoleBoosts, input.documentBoosts);
+    mergeBoosts(evidenceRoleBoosts, input.evidenceBoosts);
+    mergeBoosts(chunkTermBoosts, input.chunkBoosts);
+  };
+
+  if (hasNeed("list_complete")) {
+    addSignal({
+      signal: "list_complete_question",
+      factBoosts: { technical_parameter: 6, method_step: 5, validity_rule: 4 },
+      documentBoosts: { standard: 5, monitoring_method: 5, qa_qc: 4, technical_regulation: 4 },
+      evidenceBoosts: { current_authority: 4, method: 5 },
+      chunkBoosts: { 表: 5, 清单: 4, 项目: 5, 指标: 4, 要求: 3 }
+    });
+  }
+
+  if (hasScope("ambient_aqi")) {
+    addSignal({
+      signal: "decomposed_ambient_aqi",
+      standards: ["HJ 633", "HJ 633-2026"],
+      clusters: ["ambient_quality_core"],
+      terms: ["环境空气质量指数", "AQI", "IAQI", "首要污染物", "日报和实时报"],
+      factBoosts: { formula: 4, technical_parameter: 3 },
+      documentBoosts: { standard: 5, technical_regulation: 5, statistics: 1 }
+    });
+  }
+  if (hasScope("ambient_quality_assessment")) {
+    addSignal({
+      signal: "decomposed_ambient_quality_assessment",
+      standards: ["HJ 663", "HJ 663-2026"],
+      clusters: ["ambient_quality_core"],
+      terms: ["环境空气质量评价技术规范", "达标评价", "评价项目和评价方法"],
+      factBoosts: { validity_rule: 5, formula: 3, limit_value: 2 },
+      documentBoosts: { standard: 5, technical_regulation: 4, statistics: 1 }
+    });
+  }
+  if (hasNeed("limit_or_compliance") && (decomposedIntent.pollutants.length > 0 || hasScope("ambient_air"))) {
+    addSignal({
+      signal: "decomposed_ambient_limit_or_compliance",
+      standards: ["GB 3095", "GB 3095-2026"],
+      clusters: ["ambient_quality_core"],
+      terms: ["环境空气质量标准", "环境空气质量标准限值"],
+      factBoosts: { limit_value: 6, formula: 2 },
+      documentBoosts: { standard: 6, statistics: 1 }
+    });
+  }
+
+  if (hasScope("ambient_air_auto_monitoring") || hasScope("particulate_monitoring") || hasScope("gas_monitoring")) {
+    if (hasScope("particulate_monitoring")) {
+      if (hasAction("reference_method")) {
+        addSignal({
+          signal: "decomposed_particulate_reference_method",
+          standards: ["HJ 618", "HJ 618-2011", "HJ 653"],
+          clusters: ["ambient_manual_sampling_analysis"],
+          terms: ["重量法", "参比方法", "手工采样", "滤膜称量"],
+          factBoosts: { method_step: 5, technical_parameter: 4 },
+          documentBoosts: { monitoring_method: 5, standard: 4 }
+        });
+      }
+      if (hasAction("installation_acceptance")) {
+        addSignal({
+          signal: "decomposed_particulate_installation_acceptance",
+          standards: ["HJ 655"],
+          clusters: ["ambient_auto_monitoring_acceptance"],
+          terms: ["颗粒物连续自动监测系统安装和验收技术规范", "安装验收", "验收检查"],
+          factBoosts: { technical_parameter: 4, method_step: 4 },
+          documentBoosts: { monitoring_method: 5, qa_qc: 4 }
+        });
+      }
+      if (hasAction("technical_test_method") || (hasNeed("list_complete") && !hasAction("operation_qaqc"))) {
+        addSignal({
+          signal: "decomposed_particulate_technical_test_method",
+          standards: ["HJ 653"],
+          terms: ["颗粒物连续自动监测系统技术要求及检测方法", "性能指标", "检测方法"],
+          factBoosts: { technical_parameter: 7, method_step: 5 },
+          documentBoosts: { monitoring_method: 6, standard: 4 },
+          chunkBoosts: { 性能指标: 6, 检测项目: 6, 检测方法: 4 }
+        });
+      }
+      if (hasAction("operation_qaqc") && !hasAction("reference_method")) {
+        addSignal({
+          signal: "decomposed_particulate_operation_qaqc",
+          standards: ["HJ 817"],
+          clusters: ["ambient_auto_monitoring_operation_qaqc"],
+          terms: ["颗粒物连续自动监测系统运行和质控技术规范", "运行质控", "质量控制"],
+          factBoosts: { technical_parameter: 5, validity_rule: 5, method_step: 4 },
+          documentBoosts: { qa_qc: 6, monitoring_method: 4 }
+        });
+      }
+    }
+    if (hasScope("gas_monitoring")) {
+      if (hasAction("installation_acceptance")) {
+        addSignal({
+          signal: "decomposed_gas_installation_acceptance",
+          standards: ["HJ 193", "HJ 654"],
+          clusters: ["ambient_auto_monitoring_acceptance"],
+          terms: ["气态污染物连续自动监测系统安装验收", "调试检测"],
+          factBoosts: { technical_parameter: 4, method_step: 4 },
+          documentBoosts: { monitoring_method: 5, qa_qc: 4 }
+        });
+      }
+      if (hasAction("technical_test_method")) {
+        addSignal({
+          signal: "decomposed_gas_technical_test_method",
+          standards: ["HJ 654"],
+          terms: ["气态污染物连续自动监测系统技术要求及检测方法", "气态仪器性能指标"],
+          factBoosts: { technical_parameter: 6, method_step: 5 },
+          documentBoosts: { monitoring_method: 6, standard: 4 }
+        });
+      }
+      if (hasAction("operation_qaqc") || /转换炉|转换器|零跨|零点|跨度/u.test(normalizedQuery)) {
+        addSignal({
+          signal: "decomposed_gas_operation_qaqc",
+          standards: ["HJ 818", "HJ 654"],
+          clusters: ["ambient_auto_monitoring_operation_qaqc"],
+          terms: ["气态污染物连续自动监测系统运行和质控技术规范", "运行质控", "转换炉效率", "零点跨度"],
+          factBoosts: { technical_parameter: 6, validity_rule: 4, method_step: 4 },
+          documentBoosts: { qa_qc: 6, monitoring_method: 4 }
+        });
+      }
+      if (/化学发光法|氮氧化物|NOx/iu.test(normalizedQuery)) {
+        addSignal({
+          signal: "decomposed_gas_measurement_method",
+          standards: ["HJ 1043"],
+          clusters: ["ambient_gas_measurement_methods"],
+          terms: ["氮氧化物自动测定", "化学发光法"],
+          factBoosts: { method_step: 5, technical_parameter: 4 },
+          documentBoosts: { monitoring_method: 5 }
+        });
+      }
+    }
+  }
+
+  if (hasScope("fixed_source_cems")) {
+    if (hasAction("data_transmission")) {
+      addSignal({
+        signal: "decomposed_fixed_source_cems_data_transmission",
+        standards: ["HJ 212", "HJ 212-2025"],
+        clusters: ["fixed_source_cems"],
+        terms: ["污染物在线监控系统数据传输标准", "数据传输", "数采仪"],
+        factBoosts: { technical_parameter: 5, method_step: 4 },
+        documentBoosts: { standard: 5, technical_regulation: 4 },
+        chunkBoosts: { 数据传输: 6, 数采仪: 5, 传输协议: 5 }
+      });
+    } else if (hasAction("technical_test_method")) {
+      addSignal({
+        signal: "decomposed_fixed_source_cems_technical_test_method",
+        standards: ["HJ 76", "HJ 76-2017"],
+        clusters: ["fixed_source_cems"],
+        terms: ["固定污染源烟气排放连续监测系统技术要求及检测方法", "CEMS技术要求"],
+        factBoosts: { technical_parameter: 6, method_step: 5 },
+        documentBoosts: { monitoring_method: 5, standard: 5 }
+      });
+    } else if (hasAction("operation_qaqc") || hasAction("management_responsibility")) {
+      addSignal({
+        signal: "decomposed_fixed_source_cems_operation_qaqc",
+        standards: ["HJ 75", "HJ 75-2017"],
+        clusters: ["fixed_source_cems"],
+        terms: ["固定污染源烟气排放连续监测技术规范", "CEMS运行维护", "运行质控"],
+        factBoosts: { technical_parameter: 5, validity_rule: 5, method_step: 4 },
+        documentBoosts: { monitoring_method: 5, standard: 5 }
+      });
+      if (hasAction("management_responsibility")) {
+        addSignal({
+          signal: "decomposed_fixed_source_cems_management_boundary",
+          standards: ["国家环保总局令第28号"],
+          clusters: ["pollution_source_auto_monitoring_enforcement"],
+          terms: ["污染源自动监控管理办法", "自动监控设施管理", "停运故障管理"],
+          factBoosts: { status_rule: 5, method_step: 4 },
+          documentBoosts: { regulation: 6, law: 5, technical_regulation: 3 },
+          evidenceBoosts: { current_authority: 6, method: 2 }
+        });
+      }
+    } else {
+      addSignal({
+        signal: "decomposed_fixed_source_cems",
+        standards: ["HJ 75", "HJ 76", "HJ 212"],
+        clusters: ["fixed_source_cems"],
+        terms: ["固定污染源", "CEMS", "烟气连续监测"]
+      });
+    }
+  }
+
+  if (hasScope("pollution_source_auto_monitoring") && hasAction("data_transmission")) {
+    addSignal({
+      signal: "decomposed_pollution_source_data_transmission",
+      standards: ["HJ 212", "HJ 212-2025"],
+      clusters: ["fixed_source_cems"],
+      terms: ["污染物在线监控系统数据传输标准", "数据传输", "报文", "通信", "数采仪"],
+      factBoosts: { technical_parameter: 5, method_step: 4 },
+      documentBoosts: { standard: 5, technical_regulation: 4 },
+      evidenceBoosts: { current_authority: 4, method: 5 },
+      chunkBoosts: { 数据传输: 6, 报文: 5, 通信: 5, 数采仪: 5, 传输协议: 5 }
+    });
+  }
+
+  if (hasScope("pollution_source_auto_monitoring")) {
+    const wantsInspection = hasAction("enforcement_inspection");
+    const wantsManagement = hasAction("management_responsibility") || !wantsInspection;
+    addSignal({
+      signal: "decomposed_pollution_source_auto_monitoring",
+      standards: [...(wantsInspection ? ["环境保护部令第19号"] : []), ...(wantsManagement ? ["国家环保总局令第28号"] : [])],
+      clusters: ["pollution_source_auto_monitoring_enforcement"],
+      terms: ["污染源自动监控", "现场监督检查", "管理办法"],
+      factBoosts: { status_rule: 4, method_step: 4, technical_parameter: 2 },
+      documentBoosts: { regulation: 6, law: 5, technical_regulation: 4 },
+      evidenceBoosts: { current_authority: 6, method: 2 }
+    });
+  }
+
+  if (hasScope("heavy_pollution_weather")) {
+    addSignal({
+      signal: "decomposed_heavy_pollution_weather",
+      clusters: ["heavy_pollution_weather_policy"],
+      terms: ["重污染天气", "应急预警", "应急减排", "绩效分级", "秋冬季攻坚"],
+      documentBoosts: { policy: 5, technical_guide: 4, regulation: 4, research_literature: 1, statistics: 1 },
+      evidenceBoosts: { current_authority: 4, method: 3, research: 1, statistics: 1 }
+    });
+  }
+
   const temporalIntent = inferEnvAirTemporalIntent(normalizedQuery, options, profile);
   if (temporalIntent.mode === "evaluation_period") {
     rankingSignals.push("evaluation_period_question");
@@ -383,6 +800,7 @@ export function buildEnvAirQueryPlan(
   return {
     normalizedQuery,
     standardRefs,
+    decomposedIntent,
     expandedTerms: uniqueCompact(expandedTerms),
     pinnedStandards: uniqueCompact(pinnedStandards),
     standardClusters: uniqueCompact(standardClusters),

@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { applyStandardRelationOverrides } from "../src/domain/standard-relations.js";
 import {
   compileVault,
+  decomposeEnvAirQueryIntent,
   extractStandardReferences,
   ingestInput,
   initVault,
@@ -78,6 +79,22 @@ async function updateConfig(
 }
 
 describe("environment air retrieval", () => {
+  it("decomposes business wording into source-scope and action signals without source aliases", () => {
+    const fixedSource = decomposeEnvAirQueryIntent("烟气在线设备协议传不上去，应该先查哪类规范？");
+    expect(fixedSource.objectScopes).toContain("fixed_source_cems");
+    expect(fixedSource.businessActions).toContain("data_transmission");
+
+    const ambientAcceptance = decomposeEnvAirQueryIntent("新到的颗粒物自动站验收材料，厂家报告该看哪些测试项？");
+    expect(ambientAcceptance.objectScopes).toContain("particulate_monitoring");
+    expect(ambientAcceptance.businessActions).toContain("installation_acceptance");
+    expect(ambientAcceptance.evidenceNeeds).toContain("list_complete");
+
+    const enforcement = decomposeEnvAirQueryIntent("企业在线设备停了，现场核查和责任边界分别看哪类依据？");
+    expect(enforcement.objectScopes).toContain("pollution_source_auto_monitoring");
+    expect(enforcement.businessActions).toContain("enforcement_inspection");
+    expect(enforcement.businessActions).toContain("management_responsibility");
+  });
+
   it("keeps Chinese business terms and environmental standard references searchable", () => {
     const tokens = searchTokens("GB 3095-2012 环境空气 PM2.5 和臭氧限值");
     expect(tokens).toContain("gb");
