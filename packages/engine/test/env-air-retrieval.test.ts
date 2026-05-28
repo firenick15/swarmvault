@@ -265,7 +265,7 @@ describe("environment air retrieval", () => {
     expect(results[0]?.retrievalStage).toBe("source_alias");
   });
 
-  it("uses generated normalized status notices when frontmatter legal status is stale", async () => {
+  it("keeps frontmatter legal status authoritative over stale generated status notices", async () => {
     const { wikiDir, dbPath } = await createTempWorkspace();
     const standardPage = graphPage(
       "source:hj818",
@@ -317,9 +317,76 @@ describe("environment air retrieval", () => {
       includeSuperseded: false
     });
 
+    const hj818 = results.find((result) => result.pageId === "source:hj818");
+    expect(hj818?.legalStatus).toBe("superseded");
     expect(results[0]?.pageId).toBe("source:hj818");
-    expect(["source_alias", "standard_exact"]).toContain(results[0]?.retrievalStage);
-    expect(results.map((result) => result.pageId)).toContain("source:guide");
+  });
+
+  it("retrieves table evidence for list-complete monitoring test item questions", async () => {
+    const { wikiDir, dbPath } = await createTempWorkspace();
+    const currentPage = graphPage(
+      "source:hj653-2021",
+      "HJ 653-2021 环境空气颗粒物连续自动监测系统技术要求及检测方法",
+      "sources/hj653-2021.md"
+    );
+    const oldPage = graphPage("source:hj653-2013", "HJ 653-2013 环境空气颗粒物连续自动监测系统技术要求及检测方法", "sources/hj653-2013.md");
+    await writePage(
+      wikiDir,
+      currentPage.path,
+      {
+        authority_layer: "method",
+        legal_status: "current_effective",
+        document_role: "monitoring_method",
+        standard_code: "HJ 653-2021",
+        pollutants: ["PM10", "PM2.5"]
+      },
+      [
+        "# HJ 653-2021",
+        "",
+        "## 表 3 PM10 和 PM2.5 自动监测系统性能指标要求",
+        "",
+        "| 检测项目 | 技术要求 | 检测方法 |",
+        "|---|---|---|",
+        "| 检出限 | <=2 ug/m3 | 7.1 |",
+        "| 校准膜示值误差 | ±2% | 7.2 |",
+        "| 温度测量示值误差 | ±2 ℃ | 7.3 |",
+        "| 大气压测量示值误差 | ±1 kPa | 7.4 |",
+        "| 湿度测量示值误差 | ±5% RH | 7.5 |",
+        "| 断电影响测试 | 断电影响条件下进行流量测试，应符合流量测试指标要求 | 7.7 |",
+        "| 大气压影响测试 | 不同大气压条件下进行流量测试，应符合流量测试指标要求 | 7.9 |",
+        "| 参比方法比对测试 | 斜率、截距、相关系数要求 | 7.11 |",
+        "| 有效数据率 | >=90% | 7.12 |"
+      ].join("\n")
+    );
+    await writePage(
+      wikiDir,
+      oldPage.path,
+      {
+        authority_layer: "method",
+        legal_status: "superseded",
+        document_role: "monitoring_method",
+        standard_code: "HJ 653-2013",
+        pollutants: ["PM10", "PM2.5"]
+      },
+      "# HJ 653-2013\n\n## 表 3 PM10 和 PM2.5 连续监测系统检测项目\n\n| 检测项目 | 要求 |\n|---|---|\n| 校准膜重现性 | ±2% |"
+    );
+    await rebuildSearchIndex(dbPath, [currentPage, oldPage], wikiDir);
+
+    const results = searchPages(dbPath, "PM2.5和PM10连续监测系统性能测试项目包括哪些？", {
+      limit: 5,
+      authorityLayer: ["core", "method"],
+      includeDrafts: false,
+      includeSuperseded: false
+    });
+
+    expect(results[0]?.pageId).toBe("source:hj653-2021");
+    expect(results[0]?.chunkKind).toBe("table");
+    expect(results[0]?.snippet).toContain("校准膜示值误差");
+    expect(results[0]?.snippet).toContain("湿度测量示值误差");
+    expect(results[0]?.snippet).toContain("断电影响测试");
+    expect(results[0]?.snippet).toContain("大气压影响测试");
+    expect(results[0]?.snippet).toContain("有效数据率");
+    expect(results.map((result) => result.pageId)).not.toContain("source:hj653-2013");
   });
 
   it("routes NO2 converter-efficiency QA/QC questions to HJ 818 before ambient NO2 limit tables", async () => {
@@ -387,7 +454,12 @@ describe("environment air retrieval", () => {
       {
         page: graphPage("source:hj817", "HJ 817-2018 环境空气颗粒物连续自动监测系统运行和质控技术规范", "sources/hj817.md"),
         data: { authority_layer: "method", legal_status: "current_effective", document_role: "qa_qc", standard_code: "HJ 817-2018" },
-        body: "# HJ 817-2018\n\nPM10和PM2.5颗粒物自动监测系统运行质控，规定零值负值处理、流量审核和平行性检查。"
+        body: "# HJ 817-2018\n\nPM10和PM2.5颗粒物自动监测系统运行质控，规定零值负值处理、流量审核、环境参数检查和平行性检查。"
+      },
+      {
+        page: graphPage("source:hj818", "HJ 818-2018 环境空气气态污染物连续自动监测系统运行和质控技术规范", "sources/hj818.md"),
+        data: { authority_layer: "method", legal_status: "current_effective", document_role: "qa_qc", standard_code: "HJ 818-2018" },
+        body: "# HJ 818-2018\n\nSO2、NO2、O3、CO气态污染物自动监测系统运行质控，规定臭氧零跨检查、时段要求和NO2转换炉效率检查。"
       },
       {
         page: graphPage("source:hj653", "HJ 653-2021 环境空气颗粒物连续自动监测系统技术要求及检测方法", "sources/hj653.md"),
@@ -398,6 +470,26 @@ describe("environment air retrieval", () => {
           standard_code: "HJ 653-2021"
         },
         body: "# HJ 653-2021\n\n颗粒物自动监测系统技术要求及检测方法，规定参比方法比对、斜率、截距和相关系数。"
+      },
+      {
+        page: graphPage("source:hj655", "HJ 655-2013 环境空气颗粒物连续自动监测系统安装和验收技术规范", "sources/hj655.md"),
+        data: {
+          authority_layer: "method",
+          legal_status: "current_effective",
+          document_role: "monitoring_method",
+          standard_code: "HJ 655-2013"
+        },
+        body: "# HJ 655-2013\n\n新建颗粒物自动监测系统安装验收，规定站房、采样系统、仪器设备、联网、试运行和比对调试等验收检查清单。"
+      },
+      {
+        page: graphPage("source:hj618", "HJ 618-2011 环境空气 PM10 和 PM2.5 的测定 重量法", "sources/hj618.md"),
+        data: {
+          authority_layer: "method",
+          legal_status: "current_effective",
+          document_role: "monitoring_method",
+          standard_code: "HJ 618-2011"
+        },
+        body: "# HJ 618-2011\n\n环境空气PM10和PM2.5重量法参比方法，规定手工采样、滤膜恒温恒湿平衡、样品处理和称量质控步骤。"
       },
       {
         page: graphPage("source:hj654", "HJ 654-2013 环境空气气态污染物连续自动监测系统技术要求及检测方法", "sources/hj654.md"),
@@ -423,6 +515,56 @@ describe("environment air retrieval", () => {
         page: graphPage("source:hj212", "HJ 212-2025 污染物在线监控系统数据传输标准", "sources/hj212.md"),
         data: { authority_layer: "method", legal_status: "current_effective", document_role: "standard", standard_code: "HJ 212-2025" },
         body: "# HJ 212-2025\n\n污染物在线监控和CEMS数据传输、数采仪传输协议要求。"
+      },
+      {
+        page: graphPage("source:gb3095", "GB 3095-2026 环境空气质量标准", "sources/gb3095.md"),
+        data: {
+          authority_layer: "core",
+          legal_status: "current_effective",
+          document_role: "standard",
+          standard_code: "GB 3095-2026"
+        },
+        body: "# GB 3095-2026\n\n环境空气质量标准规定污染物基本项目、平均时间和浓度限值，PM2.5、O3、NO2等应按标准限值表评价。"
+      },
+      {
+        page: graphPage("source:hj633", "HJ 633-2026 环境空气质量指数 AQI 技术规定", "sources/hj633.md"),
+        data: {
+          authority_layer: "method",
+          legal_status: "current_effective",
+          document_role: "standard",
+          standard_code: "HJ 633-2026"
+        },
+        body: "# HJ 633-2026\n\n环境空气质量指数AQI技术规定，规定IAQI、AQI、空气质量级别、评价项目和首要污染物确定方法。"
+      },
+      {
+        page: graphPage("source:order19", "中华人民共和国环境保护部令", "sources/order19.md"),
+        data: {
+          authority_layer: "core",
+          legal_status: "current_effective",
+          document_role: "regulation",
+          standard_code: "环境保护部令第19号"
+        },
+        body: "# 19号令\n\n污染源自动监控设施现场监督检查办法规定执法现场查在线监控设备、现场检查清单、事实证据和处理程序。"
+      },
+      {
+        page: graphPage("source:order28", "污染源自动监控管理办法 国家环保总局令第28号", "sources/order28.md"),
+        data: {
+          authority_layer: "core",
+          legal_status: "current_effective",
+          document_role: "regulation",
+          standard_code: "国家环保总局令第28号"
+        },
+        body: "# 28号令\n\n污染源自动监控管理办法规定排污单位、运维单位和生态环境主管部门等主体的管理职责清单。"
+      },
+      {
+        page: graphPage("source:heavy", "关于优化重污染天气应对工作的指导意见", "sources/heavy.md"),
+        data: {
+          authority_layer: "core",
+          legal_status: "current_effective",
+          document_role: "policy",
+          standard_code: "环大气〔2024〕6号"
+        },
+        body: "# 重污染天气\n\n重污染天气应急材料包括应急预警、应急响应、应急减排清单和绩效分级检查要点。"
       }
     ];
     for (const item of pages) {
@@ -436,10 +578,19 @@ describe("environment air retrieval", () => {
 
     const cases = [
       ["颗粒物自动站 PM2.5 负值怎么处理", "source:hj817"],
+      ["站点颗粒物数据质控要检查哪些环境参数", "source:hj817"],
+      ["臭氧自动监测运行质控有哪些检查项目和时段要求", "source:hj818"],
       ["PM2.5 参比方法比对斜率截距相关系数", "source:hj653"],
+      ["现场新建颗粒物自动监测系统验收，检查清单该怎么列", "source:hj655"],
+      ["颗粒物重量法样品处理和称量质控包括哪些要点", "source:hj618"],
       ["气态自动监测仪器技术要求和检测方法", "source:hj654"],
+      ["空气质量标准限值表里 PM2.5、O3、NO2 对应哪些平均时间", "source:gb3095"],
+      ["AQI评价项目包括哪些，首要污染物怎么确定", "source:hj633"],
       ["CEMS 数据传输按哪个规范", "source:hj212"],
-      ["固定污染源 CEMS 运行维护和质控", "source:hj75"]
+      ["固定污染源 CEMS 运行维护和质控", "source:hj75"],
+      ["执法现场查在线监控设备，检查清单应包括哪些方面", "source:order19"],
+      ["污染源自动监控管理职责清单包括哪些主体", "source:order28"],
+      ["重污染天气绩效分级检查要点有哪些", "source:heavy"]
     ] as const;
 
     for (const [question, expectedPageId] of cases) {
@@ -451,6 +602,15 @@ describe("environment air retrieval", () => {
       });
       expect(results[0]?.pageId).toBe(expectedPageId);
     }
+
+    const legalRoleResults = searchPages(dbPath, "现场检查办法和自动监控管理办法职责怎么分？", {
+      limit: 10,
+      authorityLayer: ["core", "method"],
+      includeDrafts: false,
+      includeSuperseded: false
+    }).map((result) => result.pageId);
+    expect(legalRoleResults).toContain("source:order19");
+    expect(legalRoleResults).toContain("source:order28");
   });
 
   it("does not let draft replacement relations supersede current standards", async () => {

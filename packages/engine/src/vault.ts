@@ -5183,6 +5183,11 @@ async function executeQuery(
         "Only recommend environment_data_mcp when the user asks for actual monitoring data, station/city/time-window values, rankings,同比/环比, abnormal time-series diagnosis, or process analysis. Do not recommend it for pure standard limits, formulas, methods, version relationships, or authority-boundary questions.",
         "Do not apply knowledge-base standard limit values directly to proxy metrics or derived values produced by a data MCP unless the evidence states that the calculation and averaging period are the same compliance metric.",
         "For report-writing answers, separate standard basis, monitoring data, statistical conclusion, professional interpretation, and caveats.",
+        ...(queryPlan.rankingSignals.includes("list_complete_question")
+          ? [
+              "For list-complete questions such as includes/which items/test items/check items/QC items/performance indicators, enumerate every relevant row or item present in table/list evidence. Do not collapse table rows into vague groups. Preserve original item names where possible, distinguish source roles such as technical requirements, installation acceptance, operation QA/QC, reference method, and data-validity rules, and state partial coverage instead of claiming a complete list when the retrieved evidence is incomplete."
+            ]
+          : []),
         "If evidence is insufficient, say so instead of filling gaps from general knowledge.",
         outputFormatInstruction(format)
       ].join(" ")

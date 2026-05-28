@@ -367,10 +367,11 @@ function sourceIdentityQueryTerms(plan: EnvAirQueryPlan): string[] {
   return uniqueCompact([...plan.pinnedStandards, ...plan.expandedTerms])
     .filter((term) => term.length >= 4 && term.length <= 64)
     .filter((term) => !generic.has(term))
-    .filter((term) =>
-      /号令|令第|管理办法|现场监督检查办法|全国城市空气质量报告|城市空气质量排名|环境空气质量月报|环境空气质量公报|环境空气质量标准/u.test(
-        term
-      )
+    .filter(
+      (term) =>
+        /号令|令第|管理办法|现场监督检查办法|全国城市空气质量报告|城市空气质量排名|环境空气质量月报|环境空气质量公报|环境空气质量标准/u.test(
+          term
+        ) || /重污染天气|应急减排|应急预警|应急响应|绩效分级|秋冬季攻坚/u.test(term)
     )
     .filter((term) => /[\p{Script=Han}A-Za-z0-9]/u.test(term))
     .slice(0, 24);
@@ -425,6 +426,10 @@ interface SearchChunk {
 
 function classifyChunkKind(text: string): SearchChunk["kind"] {
   const trimmed = text.trim();
+  const markdownTableLineCount = trimmed.split(/\r?\n/).filter((line) => line.includes("|") && /\|.*\|/.test(line)).length;
+  if (markdownTableLineCount >= 2 || /<table[\s>]/i.test(trimmed)) {
+    return "table";
+  }
   if (/^#{1,6}\s/.test(trimmed)) {
     if (/(^#{1,6}\s*表\s*[0-9一二三四五六七八九十]|浓度限值|限值表)/.test(trimmed)) {
       return "table";
@@ -433,12 +438,6 @@ function classifyChunkKind(text: string): SearchChunk["kind"] {
       return "formula";
     }
     return "heading";
-  }
-  if (trimmed.includes("|") && /\|.*\|/.test(trimmed)) {
-    return "table";
-  }
-  if (/<table[\s>]/i.test(trimmed)) {
-    return "table";
   }
   if (/[=＝]/.test(trimmed) && /(公式|计算|浓度|限值|平均|mg\/m3|μg\/m3|ug\/m3|μg\/m³|ug\/m³)/i.test(trimmed)) {
     return "formula";
@@ -547,8 +546,14 @@ function focusedTableRowsSnippet(text: string, focusTerms: string[], maxChars = 
   return "";
 }
 
-function focusedChunkSnippet(text: string, focusTerms: string[], maxChars = 1800): string {
+function focusedChunkSnippet(text: string, focusTerms: string[], maxChars = 1800, options: { preserveTableRows?: boolean } = {}): string {
   const sourceText = sourceExcerptBody(text).trim();
+  if (
+    options.preserveTableRows &&
+    (/<table[\s>]/i.test(sourceText) || sourceText.includes("|") || /(^|\n)\s*表\s*[0-9A-Z一二三四五六七八九十]/u.test(sourceText))
+  ) {
+    return sourceText.slice(0, maxChars).trim();
+  }
   if (/<table[\s>]/i.test(sourceText) || sourceText.includes("|")) {
     const tableSnippet = focusedTableRowsSnippet(sourceText, focusTerms, maxChars);
     if (tableSnippet) {
@@ -573,6 +578,31 @@ function focusedChunkSnippet(text: string, focusTerms: string[], maxChars = 1800
   }
   const start = Math.max(0, firstPosition - 80);
   return sourceText.slice(start, start + maxChars).trim();
+}
+
+function listCompletenessItemHitCount(text: string): number {
+  const labels = [
+    "示值误差",
+    "影响测试",
+    "流量测试",
+    "参比方法比对",
+    "有效数据率",
+    "平行性",
+    "检出限",
+    "校准",
+    "比对",
+    "验收",
+    "质控",
+    "评价项目",
+    "监测项目"
+  ];
+  const hits = new Set<string>();
+  for (const label of labels) {
+    if (text.includes(label)) {
+      hits.add(label);
+    }
+  }
+  return hits.size;
 }
 
 function hasUsefulAmbientLimitSnippet(snippet: string, query: string): boolean {
@@ -621,7 +651,7 @@ function inferEnvAirMetadata(input: {
   const sourcePath = input.sourcePath.replace(/\\/g, "/");
   const combined = `${input.title}\n${sourcePath}\n${sourceExcerptBody(input.body).slice(0, 1200)}`;
   const statusNoticeLegalStatus = generatedStatusNoticeLegalStatus(input.body);
-  if (statusNoticeLegalStatus && statusNoticeLegalStatus !== legalStatus) {
+  if (!legalStatus && statusNoticeLegalStatus) {
     legalStatus = statusNoticeLegalStatus;
   }
 
@@ -1165,6 +1195,7 @@ export function mergeSearchResults(
 export function searchPages(dbPath: string, query: string, limitOrOptions: number | SearchQueryOptions = 5): SearchResult[] {
   const options = typeof limitOrOptions === "number" ? { limit: limitOrOptions } : limitOrOptions;
   const domainPlan = buildDomainQueryPlan(query, options.domainProfile);
+  const userQueryText = domainPlan.normalizedQuery;
   const expandedQuery = [
     domainPlan.normalizedQuery,
     ...domainPlan.expandedTerms,
@@ -1197,22 +1228,53 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
     (/(PM2\.5|PM10|O3|SO2|NO2|CO|颗粒物|臭氧|二氧化硫|二氧化氮|一氧化碳)/iu.test(normalizedQuery) &&
       /(限值|标准值|浓度限值|一级|二级|年平均|日平均|24\s*小时|1\s*小时|8\s*小时)/u.test(normalizedQuery));
   const assessmentValidityIntent = domainPlan.rankingSignals.includes("ambient_air_assessment_validity_question");
+  const aqiIntent =
+    domainPlan.rankingSignals.includes("aqi_reporting_question") || domainPlan.rankingSignals.includes("ambient_aqi_list_question");
   const amendmentIntent = /修改单|amendment/i.test(normalizedQuery);
   const qaQcIntent =
     domainPlan.standardClusters.includes("ambient_auto_monitoring_operation_qaqc") ||
     domainPlan.rankingSignals.includes("qaqc_question") ||
     /(质控|质量控制|质量保证|有效数据|负值|零点|量程|转换炉效率|平行性|比对)/u.test(normalizedQuery);
   const statisticsIntent = domainPlan.standardClusters.includes("ambient_statistics_reporting") || options.intent === "statistics";
+  const listCompleteIntent =
+    domainPlan.rankingSignals.includes("list_complete_question") ||
+    /(包括哪些|有哪些|完整清单|全部项目|所有项目|测试项目|检测项目|检查项目|验收项目|质控项目|质量控制项目|性能指标|评价指标|监测项目|清单|要点|步骤)/u.test(
+      normalizedQuery
+    );
   const rankingChunkTerms = uniqueCompact([
     ...Object.keys(domainPlan.chunkTermBoosts ?? {}),
     ...domainPlan.expandedTerms,
+    ...(listCompleteIntent
+      ? [
+          "检测项目",
+          "测试项目",
+          "性能指标",
+          "指标要求",
+          "验收项目",
+          "质控项目",
+          "检查项目",
+          "评价指标",
+          "监测项目",
+          "表 1",
+          "表1",
+          "表 2",
+          "表2",
+          "表 3",
+          "表3",
+          "清单",
+          "项目",
+          "示值误差",
+          "参比方法",
+          "有效数据率"
+        ]
+      : []),
     ...(qaQcIntent ? ["质控", "质量控制", "有效数据", "负值", "零点", "量程", "转换炉效率", "平行性", "比对测试"] : []),
     ...(statisticsIntent ? ["公报", "月报", "年报", "统计", "城市", "评价城市", "统计期"] : [])
   ]);
   const DatabaseSync = getDatabaseSync();
   const db = withSuppressedSqliteExperimentalWarning(() => new DatabaseSync(sqliteImmutableReadOnlyUri(dbPath)));
   const limit = options.limit ?? 5;
-  const candidateLimit = Math.max(limit * 3, limit + 5);
+  const candidateLimit = listCompleteIntent ? Math.max(limit * 8, limit + 30) : Math.max(limit * 3, limit + 5);
   const seen = new Set<string>();
   const seenPageIds = new Set<string>();
   const chunkRowsByPage = new Map<string, number>();
@@ -1552,10 +1614,21 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
     );
   }
 
-  function appendRows(nextRows: Array<Record<string, unknown>>): void {
+  function appendRows(
+    nextRows: Array<Record<string, unknown>>,
+    options: { allowOverflowStages?: Set<string>; maxAdded?: number } = {}
+  ): void {
+    let added = 0;
     for (const row of nextRows) {
       const pageId = String(row.pageId ?? "");
       const stage = String(row.retrievalStage ?? "");
+      const allowOverflow = options.allowOverflowStages?.has(stage) ?? false;
+      if (options.maxAdded && added >= options.maxAdded) {
+        break;
+      }
+      if (!allowOverflow && rows.length >= candidateLimit) {
+        break;
+      }
       if (stage === "standard_exact" && pageId && seenPageIds.has(pageId)) {
         const existing = rows.find(
           (item) => String(item.pageId ?? "") === pageId && !["structured_fact", "chunk_fts"].includes(String(item.retrievalStage ?? ""))
@@ -1567,11 +1640,18 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
       }
       if (stage === "chunk_fts") {
         const current = chunkRowsByPage.get(pageId) ?? 0;
-        const chunkBudget = qaQcIntent || statisticsIntent || domainPlan.pinnedStandards.length > 0 ? 3 : 1;
+        const chunkBudget = listCompleteIntent ? 5 : qaQcIntent || statisticsIntent || domainPlan.pinnedStandards.length > 0 ? 3 : 1;
         if (current >= chunkBudget) {
           continue;
         }
         chunkRowsByPage.set(pageId, current + 1);
+      }
+      if (listCompleteIntent && stage === "structured_fact") {
+        const factText = String(row.factRawText ?? "");
+        const itemHits = listCompletenessItemHitCount(factText);
+        if (factText.length < 240 && itemHits < 3) {
+          continue;
+        }
       }
       const rowKey =
         stage === "structured_fact"
@@ -1587,7 +1667,8 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
         seenPageIds.add(pageId);
       }
       rows.push(row);
-      if (rows.length >= candidateLimit) {
+      added += 1;
+      if (!allowOverflow && rows.length >= candidateLimit) {
         break;
       }
     }
@@ -1596,12 +1677,56 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
   function crossStagePriority(row: Record<string, unknown>): number {
     const title = String(row.title ?? "");
     const standardCode = String(row.standardCode ?? "");
+    const standardIdentity = String(row.standardIdentity ?? "");
     const documentRole = String(row.documentRole ?? "");
     const evidenceRole = String(row.evidenceRole ?? "");
     const authorityLayer = String(row.authorityLayer ?? "");
     const retrievalStage = String(row.retrievalStage ?? "");
+    const chunkKind = String(row.chunkKind ?? "");
+    if (/(重污染天气|应急预警|应急响应|应急减排|绩效分级|秋冬季攻坚)/u.test(userQueryText)) {
+      const heavySource = /(重污染天气|应急预警|应急响应|应急减排|绩效分级|秋冬季攻坚)/u.test(`${standardCode} ${title}`);
+      if (heavySource && ["policy", "technical_guide", "regulation", "official_explanation"].includes(documentRole)) {
+        return -138;
+      }
+      if (["monitoring_method", "qa_qc", "standard"].includes(documentRole) && !heavySource) {
+        return 35;
+      }
+    }
+    if (
+      /(在线监控|自动监控|污染源自动监控)/u.test(userQueryText) &&
+      /(执法现场|现场检查|检查清单|检查事项)/u.test(userQueryText) &&
+      !/(管理职责|职责主体|管理办法|主体责任)/u.test(userQueryText)
+    ) {
+      const inspectionSource = /19号令|第19号|现场监督检查办法/u.test(`${standardCode} ${title}`);
+      const managementSource = /28号令|第28号|总局令第28号|污染源自动监控管理办法/u.test(`${standardCode} ${title}`);
+      if (inspectionSource) {
+        return -145;
+      }
+      if (managementSource) {
+        return -138;
+      }
+    }
+    if (/(在线监控|自动监控|污染源自动监控)/u.test(userQueryText) && /(管理职责|职责主体|管理办法|主体责任)/u.test(userQueryText)) {
+      const managementSource = /28号令|第28号|总局令第28号|污染源自动监控管理办法/u.test(`${standardCode} ${title}`);
+      const inspectionSource = /19号令|第19号|现场监督检查办法/u.test(`${standardCode} ${title}`);
+      if (managementSource) {
+        return -145;
+      }
+      if (inspectionSource) {
+        return -138;
+      }
+    }
     if (retrievalStage === "source_alias") {
       return -110;
+    }
+    if (aqiIntent && /HJ\s*633|HJ633/u.test(`${standardIdentity} ${standardCode} ${title}`)) {
+      return -140;
+    }
+    if (aqiIntent && /GB\s*3095|GB3095/u.test(`${standardIdentity} ${standardCode} ${title}`)) {
+      return -35;
+    }
+    if (ambientLimitIntent && /GB\s*3095|GB3095|环境空气质量标准/u.test(`${standardIdentity} ${standardCode} ${title}`)) {
+      return retrievalStage === "structured_fact" ? -124 : chunkKind === "table" ? -136 : -132;
     }
     if (hasExactStandards && retrievalStage === "standard_exact") {
       if (amendmentIntent && (documentRole === "amendment" || title.includes("修改单") || standardCode.includes("修改单"))) {
@@ -1642,21 +1767,41 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
       const factText = [row.factRawText, row.factSubject, row.factObjectValue, row.pollutants, row.averagingPeriod, row.value, row.unit]
         .filter(Boolean)
         .join(" ");
+      const ambientQualityStandardSource = /GB\s*3095|GB3095|环境空气质量标准/u.test([standardCode, title].join(" "));
       const usefulLimitFact =
         includesFocusTerm(factText, pollutantFocusTermsForQuery(normalizedQuery)) &&
         requiredAmbientPeriodGroups(normalizedQuery).every((group) => includesFocusTerm(factText, group)) &&
         /[0-9]/.test(factText) &&
         /(一级|二级|限值|μg|µg|ug|mg|年平均|日平均|24小时平均|1小时平均|日最大8小时平均)/iu.test(factText);
-      return usefulLimitFact ? -130 : -65;
+      return usefulLimitFact && ambientQualityStandardSource ? -130 : usefulLimitFact ? -50 : -65;
     }
     if ((assessmentValidityIntent || retrievalStage === "structured_fact") && retrievalStage === "structured_fact") {
+      if (listCompleteIntent) {
+        const factText = String(row.factRawText ?? "");
+        const itemHits = listCompletenessItemHitCount(factText);
+        return factText.length > 240 && itemHits >= 3 ? -112 : -55;
+      }
       return -95;
+    }
+    if (
+      listCompleteIntent &&
+      retrievalStage === "chunk_fts" &&
+      (String(row.chunkKind ?? "") === "table" || String(row.chunkKind ?? "") === "formula") &&
+      (authorityLayer === "core" || authorityLayer === "method" || evidenceRole === "method" || evidenceRole === "current_authority")
+    ) {
+      return -108;
     }
     if (assessmentValidityIntent && (evidenceRole === "current_authority" || authorityLayer === "core" || authorityLayer === "method")) {
       if (documentRole === "standard" || retrievalStage === "structured_fact") {
         return -92;
       }
       return -72;
+    }
+    if (aqiIntent && /HJ\s*633|HJ633/u.test(`${standardIdentity} ${standardCode} ${title}`)) {
+      return -122;
+    }
+    if (aqiIntent && /GB\s*3095|GB3095/u.test(`${standardIdentity} ${standardCode} ${title}`)) {
+      return -35;
     }
     if (ambientLimitIntent && (evidenceRole === "current_authority" || authorityLayer === "core" || authorityLayer === "method")) {
       if (documentRole === "standard" || retrievalStage === "structured_fact") {
@@ -1707,6 +1852,9 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
         return false;
       }
       if (!row.chunkId) {
+        return true;
+      }
+      if (listCompleteIntent) {
         return true;
       }
       if (isAmbientLimitTarget) {
@@ -1762,6 +1910,16 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
                   amendmentTerms.reduce((score, term) => score + (text.includes(term) ? 2 : 0), 0) +
                   (hasUsefulAmendmentSnippet(sourceExcerptBody(text)) ? 8 : 0)
                 : rankingChunkTerms.reduce((score, term) => score + (text.includes(term) ? 2 : 0), 0) +
+                  (listCompleteIntent &&
+                  /(表\s*[0-9A-Z一二三四五六七八九十]|检测项目|测试项目|性能指标|指标要求|验收项目|质控项目|检查项目|评价指标|监测项目)/u.test(
+                    text
+                  )
+                    ? 12
+                    : 0) +
+                  (listCompleteIntent &&
+                  /(示值误差|影响测试|流量测试|参比方法比对|有效数据率|平行性|检出限|漂移|校准|比对|准确度|精密度)/u.test(text)
+                    ? 8
+                    : 0) +
                   (qaQcIntent && /(质控|质量控制|有效数据|负值|零点|量程|转换炉效率|平行性)/u.test(text) ? 8 : 0) +
                   (statisticsIntent && /(公报|月报|年报|统计|城市|评价城市)/u.test(text) ? 6 : 0);
           const kindScore = kind === "table" || kind === "formula" ? 2 : kind === "paragraph" ? 1 : kind === "heading" ? -1 : 0;
@@ -1791,7 +1949,9 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
             ? ambientTerms
             : amendmentIntent
               ? ["将", "修改为", "结果表示", "按式", "式中"]
-              : rankingChunkTerms
+              : rankingChunkTerms,
+        listCompleteIntent ? 5000 : 1800,
+        { preserveTableRows: listCompleteIntent }
       );
       row.retrievalStage = row.retrievalStage ?? "chunk_fts";
     }
@@ -1812,18 +1972,18 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
         const pattern = `%${term.toLowerCase()}%`;
         const compactPattern = `%${compactAliasText(term)}%`;
         rankCases.push(
-          "WHEN (LOWER(pages.title) LIKE ? OR LOWER(pages.search_terms) LIKE ? OR LOWER(REPLACE(pages.search_terms, ' ', '')) LIKE ? OR LOWER(pages.standard_code) LIKE ?) THEN ?"
+          "WHEN (LOWER(pages.title) LIKE ? OR LOWER(pages.search_terms) LIKE ? OR LOWER(REPLACE(pages.search_terms, ' ', '')) LIKE ? OR LOWER(pages.standard_code) LIKE ? OR LOWER(pages.body) LIKE ?) THEN ?"
         );
-        rankParams.push(pattern, pattern, compactPattern, pattern, -40 + Math.min(index, 20));
+        rankParams.push(pattern, pattern, compactPattern, pattern, pattern, -40 + Math.min(index, 20));
         whereClauses.push(
-          "(LOWER(pages.title) LIKE ? OR LOWER(pages.search_terms) LIKE ? OR LOWER(REPLACE(pages.search_terms, ' ', '')) LIKE ? OR LOWER(pages.standard_code) LIKE ?)"
+          "(LOWER(pages.title) LIKE ? OR LOWER(pages.search_terms) LIKE ? OR LOWER(REPLACE(pages.search_terms, ' ', '')) LIKE ? OR LOWER(pages.standard_code) LIKE ? OR LOWER(pages.body) LIKE ?)"
         );
-        whereParams.push(pattern, pattern, compactPattern, pattern);
+        whereParams.push(pattern, pattern, compactPattern, pattern, pattern);
       }
       clauses.push(`(${whereClauses.join(" OR ")})`);
       const params = [...rankParams, ...filterParams, ...whereParams];
       appendOrderParams(params);
-      params.push(Math.min(candidateLimit, 12));
+      params.push(Math.min(Math.max(candidateLimit, identityTerms.length + 4), 24));
       const statement = db.prepare(`
         ${selectedColumns(`CASE ${rankCases.join(" ")} ELSE -8 END`, "substr(pages.body, 1, 420)", "source_alias")}
         FROM pages
@@ -1831,7 +1991,10 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
         ${orderBy()}
         LIMIT ?
       `);
-      appendRows(statement.all(...params) as Array<Record<string, unknown>>);
+      appendRows(statement.all(...params) as Array<Record<string, unknown>>, {
+        allowOverflowStages: new Set(["source_alias"]),
+        maxAdded: Math.min(identityTerms.length + 8, 24)
+      });
     }
 
     if (aliasTerms.length) {
@@ -2207,7 +2370,9 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
     rankingSignals: domainPlan.rankingSignals,
     snippet:
       String(row.retrievalStage ?? "") === "structured_fact"
-        ? renderStructuredFactSnippet({ rawText: String(row.factRawText ?? ""), pollutant: String(row.pollutants ?? "") })
+        ? listCompleteIntent
+          ? String(row.factRawText ?? "").slice(0, 5000)
+          : renderStructuredFactSnippet({ rawText: String(row.factRawText ?? ""), pollutant: String(row.pollutants ?? "") })
         : String(row.snippet ?? ""),
     rank: Number(row.rank ?? 0)
   }));
