@@ -454,12 +454,12 @@ describe("environment air retrieval", () => {
       {
         page: graphPage("source:hj817", "HJ 817-2018 环境空气颗粒物连续自动监测系统运行和质控技术规范", "sources/hj817.md"),
         data: { authority_layer: "method", legal_status: "current_effective", document_role: "qa_qc", standard_code: "HJ 817-2018" },
-        body: "# HJ 817-2018\n\nPM10和PM2.5颗粒物自动监测系统运行质控，规定零值负值处理、流量审核、环境参数检查和平行性检查。"
+        body: "# HJ 817-2018\n\nPM10和PM2.5颗粒物自动监测系统运行质控，规定零值负值处理、流量审核、环境参数检查、平行性检查和更换仪器后的数据一致性检查。"
       },
       {
         page: graphPage("source:hj818", "HJ 818-2018 环境空气气态污染物连续自动监测系统运行和质控技术规范", "sources/hj818.md"),
         data: { authority_layer: "method", legal_status: "current_effective", document_role: "qa_qc", standard_code: "HJ 818-2018" },
-        body: "# HJ 818-2018\n\nSO2、NO2、O3、CO气态污染物自动监测系统运行质控，规定臭氧零跨检查、时段要求和NO2转换炉效率检查。"
+        body: "# HJ 818-2018\n\nSO2、NO2、O3、CO气态污染物自动监测系统运行质控，规定零值负值处理、零点漂移、量程漂移、校准周期、臭氧零跨检查、时段要求和NO2转换炉效率检查。"
       },
       {
         page: graphPage("source:hj653", "HJ 653-2021 环境空气颗粒物连续自动监测系统技术要求及检测方法", "sources/hj653.md"),
@@ -544,7 +544,7 @@ describe("environment air retrieval", () => {
           document_role: "regulation",
           standard_code: "环境保护部令第19号"
         },
-        body: "# 19号令\n\n污染源自动监控设施现场监督检查办法规定执法现场查在线监控设备、现场检查清单、事实证据和处理程序。"
+        body: "# 19号令\n\n污染源自动监控设施现场监督检查办法规定污染源自动监控现场检查依据、执法现场查在线监控设备、在线数据异常、CEMS离线时段现场检查、弄虚作假认定、现场检查清单、事实证据、程序证据和处理程序，不能只凭截图直接下处罚结论，不能用设备技术标准替代现场检查依据。"
       },
       {
         page: graphPage("source:order28", "污染源自动监控管理办法 国家环保总局令第28号", "sources/order28.md"),
@@ -554,7 +554,7 @@ describe("environment air retrieval", () => {
           document_role: "regulation",
           standard_code: "国家环保总局令第28号"
         },
-        body: "# 28号令\n\n污染源自动监控管理办法规定排污单位、运维单位和生态环境主管部门等主体的管理职责清单。"
+        body: "# 28号令\n\n污染源自动监控管理办法规定排污单位、运维单位和生态环境主管部门等主体的管理职责清单，涉及停运、拆除、故障报告、设备更换备案联网、运维责任和排污单位管理责任。"
       },
       {
         page: graphPage("source:heavy", "关于优化重污染天气应对工作的指导意见", "sources/heavy.md"),
@@ -564,7 +564,7 @@ describe("environment air retrieval", () => {
           document_role: "policy",
           standard_code: "环大气〔2024〕6号"
         },
-        body: "# 重污染天气\n\n重污染天气应急材料包括应急预警、应急响应、应急减排清单和绩效分级检查要点。"
+        body: "# 重污染天气\n\n重污染天气和重污染过程应急材料包括应急预警、预警材料、应急响应、应急减排清单和绩效分级检查要点。"
       }
     ];
     for (const item of pages) {
@@ -582,15 +582,28 @@ describe("environment air retrieval", () => {
       ["臭氧自动监测运行质控有哪些检查项目和时段要求", "source:hj818"],
       ["PM2.5 参比方法比对斜率截距相关系数", "source:hj653"],
       ["现场新建颗粒物自动监测系统验收，检查清单该怎么列", "source:hj655"],
+      ["颗粒物自动监测新站验收，系统性能和现场验收分别怎么找依据", "source:hj655"],
       ["颗粒物重量法样品处理和称量质控包括哪些要点", "source:hj618"],
+      ["SO2 小时值偶尔负，能不能直接删", "source:hj818"],
+      ["气态仪器零点漂移、量程漂移、校准周期这些怎么按运行质控说", "source:hj818"],
+      ["换了颗粒物仪器，数据一致性要不要做", "source:hj817"],
       ["气态自动监测仪器技术要求和检测方法", "source:hj654"],
       ["空气质量标准限值表里 PM2.5、O3、NO2 对应哪些平均时间", "source:gb3095"],
       ["AQI评价项目包括哪些，首要污染物怎么确定", "source:hj633"],
       ["CEMS 数据传输按哪个规范", "source:hj212"],
       ["固定污染源 CEMS 运行维护和质控", "source:hj75"],
       ["执法现场查在线监控设备，检查清单应包括哪些方面", "source:order19"],
+      ["污染源自动监控设施现场检查的依据，不要只给我设备技术标准", "source:order19"],
+      ["在线数据超标能不能直接作为处罚依据", "source:order19"],
+      ["只有一张截图和在线数据，程序证据不全，结论怎么写稳妥", "source:order19"],
+      ["先查企业 CEMS 离线时段，再判断需要哪些现场检查依据", "source:order19"],
+      ["在线监控数据异常，能不能直接认定弄虚作假", "source:order19"],
       ["污染源自动监控管理职责清单包括哪些主体", "source:order28"],
-      ["重污染天气绩效分级检查要点有哪些", "source:heavy"]
+      ["运维单位没维护到位，企业是不是就不用承担管理责任", "source:order28"],
+      ["企业要拆在线设备，说先拆后备案行不行", "source:order28"],
+      ["自动监控设备更换后备案和联网要求怎么找依据", "source:order28"],
+      ["重污染天气绩效分级检查要点有哪些", "source:heavy"],
+      ["查重污染过程小时浓度，同时说明预警材料不能替代标准限值", "source:heavy"]
     ] as const;
 
     for (const [question, expectedPageId] of cases) {
@@ -600,7 +613,7 @@ describe("environment air retrieval", () => {
         includeDrafts: false,
         includeSuperseded: false
       });
-      expect(results[0]?.pageId).toBe(expectedPageId);
+      expect(results[0]?.pageId, question).toBe(expectedPageId);
     }
 
     const legalRoleResults = searchPages(dbPath, "现场检查办法和自动监控管理办法职责怎么分？", {
