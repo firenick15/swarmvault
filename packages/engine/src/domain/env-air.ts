@@ -296,8 +296,6 @@ export function decomposeEnvAirQueryIntent(query: string, profile: EnvAirProfile
   const mentionsPollutionSourceAutoMonitoring = hasAnyPattern(normalized, [
     /污染源自动监控/u,
     /自动监控设施/u,
-    /自动监控管理/u,
-    /自动监控系统/u,
     /在线监控/u,
     /在线监测/u,
     /在线设备/u,
