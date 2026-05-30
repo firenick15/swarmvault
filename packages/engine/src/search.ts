@@ -1241,6 +1241,17 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
     /(包括哪些|有哪些|完整清单|全部项目|所有项目|测试项目|检测项目|检查项目|验收项目|质控项目|质量控制项目|性能指标|评价指标|监测项目|清单|要点|步骤)/u.test(
       normalizedQuery
     );
+  const fixedSourceCemsIntent =
+    domainPlan.standardClusters.includes("fixed_source_cems") ||
+    domainPlan.rankingSignals.some((signal) => signal.includes("fixed_source_cems"));
+  const pollutionSourceAutoMonitoringIntent =
+    domainPlan.standardClusters.includes("pollution_source_auto_monitoring_enforcement") ||
+    domainPlan.rankingSignals.includes("pollution_source_auto_monitoring_enforcement") ||
+    domainPlan.rankingSignals.includes("decomposed_pollution_source_auto_monitoring");
+  const fixedSourceRegulatoryIntent =
+    fixedSourceCemsIntent ||
+    pollutionSourceAutoMonitoringIntent ||
+    /(固定污染源|固定源|CEMS|污染源自动监控|自动监控设施|自动监控|在线监控|排污单位|运维单位|数采仪)/iu.test(normalizedQuery);
   const rankingChunkTerms = uniqueCompact([
     ...Object.keys(domainPlan.chunkTermBoosts ?? {}),
     ...domainPlan.expandedTerms,
@@ -1674,6 +1685,59 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
     }
   }
 
+  function fixedSourceApplicabilityPriority(row: Record<string, unknown>): number | null {
+    if (!fixedSourceRegulatoryIntent) {
+      return null;
+    }
+    const title = String(row.title ?? "");
+    const standardCode = String(row.standardCode ?? "");
+    const standardIdentity = String(row.standardIdentity ?? "");
+    const documentRole = String(row.documentRole ?? "");
+    const authorityLayer = String(row.authorityLayer ?? "");
+    const evidenceRole = String(row.evidenceRole ?? "");
+    const haystack = `${standardIdentity} ${standardCode} ${title}`;
+    const wantsTransmission = /数据传输|传输协议|数据链路|数采仪|联网|上传|通讯|通信/u.test(userQueryText);
+    const wantsInspection = /现场|检查|采样探头|违法|处罚|证据|程序|弄虚作假|直接认定|直接写/u.test(userQueryText);
+    const wantsManagement = /管理|责任|职责|运维|停运|停用|拆除|故障|报告|备案|更换|恢复|平台|第三方|排污单位/u.test(userQueryText);
+    const wantsTechnicalRequirement = /技术要求|检测方法|仪器|性能|检测|指标/u.test(userQueryText);
+    const isInspectionRule = /19号令|第19号|现场监督检查办法/u.test(haystack);
+    const isManagementRule = /污染源自动监控管理办法|国家环保总局令第28号|总局令28号|总局令第28号/u.test(haystack);
+    const isHj212 = /HJ\s*212|HJ212|污染物.*自动监测.*数据传输|污染物在线监控.*数据传输|污染物自动监测监控系统数据传输/u.test(haystack);
+    const isHj75 = /HJ\s*75|HJ75|固定污染源烟气排放连续监测技术规范/u.test(haystack);
+    const isHj76 = /HJ\s*76|HJ76|固定污染源烟气排放连续监测系统技术要求/u.test(haystack);
+    const isFixedSourceMaterial = /固定污染源|固定源|烟气|CEMS|污染源自动监控|自动监控设施|在线监控|污染物在线监控/u.test(haystack);
+    const isAmbientAutoMaterial = /环境空气.*自动|HJ\s*655|HJ655|HJ\s*193|HJ193|HJ\s*654|HJ654|HJ\s*817|HJ817|HJ\s*818|HJ818/u.test(
+      haystack
+    );
+    if (isInspectionRule && (wantsInspection || (pollutionSourceAutoMonitoringIntent && !wantsManagement && !wantsTransmission))) {
+      return -172;
+    }
+    if (isManagementRule && (wantsManagement || pollutionSourceAutoMonitoringIntent)) {
+      return -170;
+    }
+    if (isHj212 && (wantsTransmission || (pollutionSourceAutoMonitoringIntent && /数据|传输|联网|数采仪|平台/u.test(userQueryText)))) {
+      return -166;
+    }
+    if (isHj76 && fixedSourceCemsIntent && wantsTechnicalRequirement) {
+      return -164;
+    }
+    if ((isHj75 || isHj76) && fixedSourceCemsIntent) {
+      return wantsInspection || wantsManagement || wantsTransmission ? -160 : -150;
+    }
+    if (
+      isFixedSourceMaterial &&
+      (["regulation", "law", "technical_regulation", "monitoring_method", "standard"].includes(documentRole) ||
+        ["core", "method"].includes(authorityLayer) ||
+        ["current_authority", "method"].includes(evidenceRole))
+    ) {
+      return -132;
+    }
+    if (isAmbientAutoMaterial && (fixedSourceCemsIntent || pollutionSourceAutoMonitoringIntent)) {
+      return 90;
+    }
+    return null;
+  }
+
   function crossStagePriority(row: Record<string, unknown>): number {
     const title = String(row.title ?? "");
     const standardCode = String(row.standardCode ?? "");
@@ -1683,6 +1747,10 @@ export function searchPages(dbPath: string, query: string, limitOrOptions: numbe
     const authorityLayer = String(row.authorityLayer ?? "");
     const retrievalStage = String(row.retrievalStage ?? "");
     const chunkKind = String(row.chunkKind ?? "");
+    const fixedSourcePriority = fixedSourceApplicabilityPriority(row);
+    if (fixedSourcePriority !== null) {
+      return fixedSourcePriority;
+    }
     if (/(重污染天气|重污染过程|污染过程|应急预警|应急响应|应急减排|绩效分级|秋冬季攻坚|预警材料)/u.test(userQueryText)) {
       const heavySource = /(重污染天气|重污染过程|应急预警|应急响应|应急减排|绩效分级|秋冬季攻坚|预警材料)/u.test(
         `${standardCode} ${title}`
